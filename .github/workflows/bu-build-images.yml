@@ -1,0 +1,104 @@
+# BU build of the four gateway images on native runners, one job per
+# (service, arch). Milestone 1: build and smoke-test only, nothing is pushed.
+# Upstream's release-images.yml is left untouched (it is guarded to the
+# upstream repository and builds under QEMU); this file is BU's. See BU-AGENTS.md.
+name: BU build images
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream release this branch is based on (baked in as BUILD_VERSION)
+        required: true
+        default: "1.30.0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.service }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      # A leg that fails only on arm64 is an arch problem; keep the amd64 log
+      # of the same service next to it.
+      fail-fast: false
+      matrix:
+        service: [auth-server, registry, mcpgw, metrics-service]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            machine: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            machine: aarch64
+          - service: auth-server
+            context: .
+            dockerfile: docker/Dockerfile.auth
+          - service: registry
+            context: .
+            dockerfile: docker/Dockerfile.registry
+          - service: mcpgw
+            context: .
+            dockerfile: docker/Dockerfile.mcp-server
+            extra_build_args: SERVER_DIR=servers/mcpgw
+          - service: metrics-service
+            context: metrics-service
+            dockerfile: metrics-service/Dockerfile
+
+    env:
+      IMAGE: bu-mcp-gateway-registry/${{ matrix.service }}:smoke
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Native runner, single platform, loaded into the local daemon so the
+      # smoke step can run the exact image that was built.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}
+          build-args: |
+            BUILD_VERSION=${{ inputs.version }}
+            ${{ matrix.extra_build_args }}
+          cache-from: type=gha,scope=${{ matrix.service }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.service }}-${{ matrix.arch }},mode=max
+
+      # The container must report the runner's arch, and every installed
+      # Python distribution that ships a compiled extension must import.
+      # App entry modules are not imported: they validate env at import time.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          got=$(docker run --rm --entrypoint uname "$IMAGE" -m)
+          echo "uname -m: $got"
+          [ "$got" = "${{ matrix.machine }}" ]
+          docker run --rm --entrypoint /app/.venv/bin/python \
+            -e EXPECT_MACHINE="${{ matrix.machine }}" \
+            -v "$PWD/.github/bu/smoke.py:/smoke.py:ro" \
+            "$IMAGE" /smoke.py
+          if [ "${{ matrix.service }}" = registry ]; then
+            docker run --rm --entrypoint nginx "$IMAGE" -v
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.service }} ${{ matrix.arch }}: ${{ job.status }}"
+            docker image inspect "$IMAGE" --format 'size={{.Size}} arch={{.Architecture}} os={{.Os}}' 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
