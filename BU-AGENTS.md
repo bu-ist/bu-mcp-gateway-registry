@@ -9,7 +9,9 @@ BU builds all four gateway images from it because upstream never publishes
 ## Branches
 
 - `main` mirrors upstream `main`. Never commit to it.
-- `bu` is the build branch: an upstream release tag plus BU commits on top.
+- `bu` is the build branch and the repository default (GitHub only dispatches
+  workflows that exist on the default branch): an upstream release tag plus
+  BU commits on top.
   On a new upstream release, rebase `bu` onto the new tag; BU commits stay a
   short, readable stack (`git log <tag>..bu`).
 
