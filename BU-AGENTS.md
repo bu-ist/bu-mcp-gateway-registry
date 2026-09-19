@@ -4,21 +4,25 @@
 [agentic-community/mcp-gateway-registry](https://github.com/agentic-community/mcp-gateway-registry).
 BU builds all four gateway images from it because upstream never publishes
 `metrics-service`. Decisions and history live in the notes
-(`bu/projects/bu-mcp-gateway-registry/`), not here.
+(`bu/projects/arm64-migration/gateway-images.md`), not here.
 
 ## Branches
 
-- `main` mirrors upstream `main`. Never commit to it.
+- `main` mirrors upstream `main`. Fast-forward only, never commit to it. It
+  is a reference, not a build input.
 - `bu` is the build branch and the repository default (GitHub only dispatches
-  workflows that exist on the default branch): an upstream release tag plus
-  BU commits on top.
-  On a new upstream release, rebase `bu` onto the new tag; BU commits stay a
-  short, readable stack (`git log <tag>..bu`).
+  workflows that exist on the default branch). It is never rebased or
+  force-pushed: Actions runs and image labels point at `bu` shas.
+- New upstream release: `git fetch upstream --tags`, fast-forward `main`,
+  then `git merge <tag>` into `bu` (the tag, not `main`, which carries
+  unreleased commits). Resolve conflicts in BU-patched files by hand, dispatch
+  the build, tag the result `<tag>-bu.1`. BU changes remain visible with
+  `git log --first-parent upstream/main..bu` or by diffing against the tag.
 
 ## What BU owns
 
 Only these paths. Do not edit upstream files, workflows or instruction files;
-that is what keeps the rebase clean.
+that is what keeps the merges clean.
 
 - `.github/workflows/bu-*.yml` and `.github/bu/`
 - `BU-*.md`
