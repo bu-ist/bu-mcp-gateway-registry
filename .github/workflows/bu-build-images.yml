@@ -1,7 +1,8 @@
 # BU build of the four gateway images on native runners, one job per
-# (service, arch). Milestone 1: build and smoke-test only, nothing is pushed.
-# Upstream's release-images.yml is left untouched (it is guarded to the
-# upstream repository and builds under QEMU); this file is BU's. See BU-AGENTS.md.
+# (service, arch): build, smoke-test, and with `publish` push each leg to ECR
+# by digest and stitch the two into one multi-arch tag. Upstream's
+# release-images.yml is left untouched (it is guarded to the upstream
+# repository and builds under QEMU); this file is BU's. See BU-AGENTS.md.
 name: BU build images
 
 on:
@@ -12,15 +13,38 @@ on:
         required: true
         default: "1.30.0"
         type: string
+      publish:
+        description: Push to ECR and tag. Off = build and smoke only.
+        required: false
+        default: false
+        type: boolean
+      tag:
+        description: Tag to publish, <version>-bu.<n>, e.g. 1.30.0-bu.1. Required with publish. Immutable in ECR.
+        required: false
+        default: ""
+        type: string
+      aws_account:
+        description: ECR account. 023495890451 = non-prod, 651414516725 = prod.
+        required: false
+        default: "023495890451"
+        type: string
 
 permissions:
   contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ inputs.aws_account }}.dkr.ecr.us-east-1.amazonaws.com
+  AWS_ROLE: arn:aws:iam::${{ inputs.aws_account }}:role/github-actions-ecr-role
 
 jobs:
   build:
     name: ${{ matrix.service }} (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write # OIDC to the ECR push role; unused without publish
     strategy:
       # A leg that fails only on arm64 is an arch problem; keep the amd64 log
       # of the same service next to it.
@@ -51,8 +75,17 @@ jobs:
 
     env:
       IMAGE: bu-mcp-gateway-registry/${{ matrix.service }}:smoke
+      REPO: ${{ inputs.aws_account }}.dkr.ecr.us-east-1.amazonaws.com/mcp/${{ matrix.service }}
 
     steps:
+      - name: Check inputs
+        if: inputs.publish
+        run: |
+          case "${{ inputs.tag }}" in
+            "${{ inputs.version }}"-bu.[0-9]*) ;;
+            *) echo "tag must be ${{ inputs.version }}-bu.<n>, got '${{ inputs.tag }}'"; exit 1 ;;
+          esac
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -95,10 +128,121 @@ jobs:
             docker run --rm --entrypoint nginx "$IMAGE" -v
           fi
 
+      - name: AWS credentials
+        if: inputs.publish
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ECR login
+        if: inputs.publish
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Same build, cache hit, pushed untagged by digest. Only smoked images
+      # get here. Untagged digests that never make it into a tag are reaped by
+      # the repository lifecycle policy after 7 days.
+      - name: Push by digest
+        if: inputs.publish
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.REPO }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ inputs.tag }}
+          build-args: |
+            BUILD_VERSION=${{ inputs.version }}
+            ${{ matrix.extra_build_args }}
+          cache-from: type=gha,scope=${{ matrix.service }}-${{ matrix.arch }}
+
+      - name: Save digest
+        if: inputs.publish
+        run: |
+          mkdir -p digests
+          echo "${{ steps.push.outputs.digest }}" > "digests/${{ matrix.arch }}"
+
+      - name: Upload digest
+        if: inputs.publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.service }}-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Summary
         if: always()
         run: |
           {
             echo "## ${{ matrix.service }} ${{ matrix.arch }}: ${{ job.status }}"
             docker image inspect "$IMAGE" --format 'size={{.Size}} arch={{.Architecture}} os={{.Os}}' 2>/dev/null || true
+            [ -n "${{ steps.push.outputs.digest }}" ] && echo "pushed ${{ env.REPO }}@${{ steps.push.outputs.digest }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # One manifest list per service from the two digests. ECR tags are
+  # immutable, so publishing an existing tag fails here instead of overwriting.
+  publish:
+    if: inputs.publish
+    needs: build
+    name: tag ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [auth-server, registry, mcpgw, metrics-service]
+    env:
+      REPO: ${{ inputs.aws_account }}.dkr.ecr.us-east-1.amazonaws.com/mcp/${{ matrix.service }}
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.service }}-*
+          path: digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ECR login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create manifest list
+        run: |
+          set -euo pipefail
+          ls digests
+          [ -s digests/amd64 ] && [ -s digests/arm64 ]
+          docker buildx imagetools create \
+            -t "$REPO:${{ inputs.tag }}" \
+            "$REPO@$(cat digests/amd64)" \
+            "$REPO@$(cat digests/arm64)"
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$REPO:${{ inputs.tag }}" | tee inspect.txt
+          grep -q 'linux/amd64' inspect.txt
+          grep -q 'linux/arm64' inspect.txt
+          {
+            echo "## $REPO:${{ inputs.tag }}"
+            echo '```'
+            cat inspect.txt
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
