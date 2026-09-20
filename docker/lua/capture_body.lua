@@ -1,42 +1,47 @@
--- capture_body.lua: Read request body and encode it in X-Body header for auth_request
-local cjson = require "cjson"
+-- capture_body.lua: read the request body and forward it in X-Body for the /validate auth_request.
+--
+-- BU change (see the fork's BU-AGENTS.md). Upstream forwards the whole body. Behind linkerd that breaks
+-- every large tool call: bodies over nginx's 16 KB buffer spill to disk and /validate refuses them
+-- (413 -> 500); bodies of ~11-16 KB push the header block past the linkerd proxy's 16 KB HTTP/1 header
+-- limit (431/500). Measured in ai-eks-nonprod 2026-09-18 on office-docs.
+--
+-- Bodies up to X_BODY_MAX behave as upstream. Larger ones send no X-Body and no X-Body-Uninspectable:
+-- /validate still authenticates the caller and checks server access, and the tool-level scope check
+-- runs at the auth-server's /mcp-proxy/ hop on the real forwarded body (_authorize_forwarded_mcp_body),
+-- which upstream already runs for every request. Only X-Tool-Name (metrics and rate-limit attribution)
+-- is lost for those calls.
+--
+-- Drop this change when upstream stops refusing uninspectable bodies at /validate. On each upstream
+-- merge, diff against the new upstream file and re-run the size sweep.
 
--- Strip any client-supplied copies of the headers this script owns so a
--- caller cannot forge the scope-decision inputs the auth server trusts.
+local X_BODY_MAX = 8 * 1024  -- bytes; other headers use ~4 KB of linkerd's 16 KB header limit
+
+-- Strip any client-supplied copies of the headers this script owns so a caller cannot forge the
+-- scope-decision inputs the auth server trusts. (Unchanged from upstream.)
 ngx.req.clear_header("X-Body")
 ngx.req.clear_header("X-Body-Uninspectable")
 
--- Read the request body
 ngx.req.read_body()
 local body_data = ngx.req.get_body_data()
 
-if body_data then
-    -- Strip newlines to prevent breaking HTTP header format
-    -- (JSON whitespace is insignificant per RFC 8259, so this is safe)
-    local clean_body = body_data:gsub("[\r\n]+", " ")
-    -- Set the X-Body header with the cleaned body data
-    ngx.req.set_header("X-Body", clean_body)
-    ngx.log(ngx.INFO, "Captured request body (" .. string.len(body_data) .. " bytes) for auth validation")
-else
-    -- get_body_data() returns nil in two cases:
-    --   1. There is genuinely no request body (e.g. an empty POST).
-    --   2. The body was larger than client_body_buffer_size and nginx spilled
-    --      it to a temp file instead of keeping it in memory.
-    --
-    -- Case 2 is a scope-check bypass risk: the auth server would see no X-Body,
-    -- default the method to the unprivileged "initialize", and authorize on
-    -- that -- while the full (potentially privileged) body is still forwarded
-    -- upstream. Detect the spill-to-file case and flag it so /validate can fail
-    -- closed rather than authorizing an uninspectable body. (The auth-server
-    -- mcp-proxy hop also re-authorizes the exact forwarded body; this header is
-    -- defense-in-depth at the edge.)
-    local body_file = ngx.req.get_body_file()
-    if body_file then
-        ngx.req.set_header("X-Body-Uninspectable", "1")
-        ngx.log(ngx.WARN,
-            "Request body spilled to temp file (" .. tostring(body_file) ..
-            "); marking uninspectable for fail-closed scope validation")
+if body_data == nil then
+    if ngx.req.get_body_file() then
+        ngx.log(ngx.INFO, "Request body spilled to a temp file; not forwarded in X-Body, "
+            .. "tool authorization deferred to the auth-server /mcp-proxy/ hop")
     else
         ngx.log(ngx.INFO, "No request body found")
     end
+    return
 end
+
+local size = #body_data
+if size > X_BODY_MAX then
+    ngx.log(ngx.INFO, "Request body (" .. size .. " bytes) exceeds X_BODY_MAX (" .. X_BODY_MAX
+        .. "); not forwarded in X-Body, tool authorization deferred to the auth-server /mcp-proxy/ hop")
+    return
+end
+
+-- Strip newlines to keep the header well-formed (JSON whitespace is insignificant per RFC 8259).
+local clean_body = body_data:gsub("[\r\n]+", " ")
+ngx.req.set_header("X-Body", clean_body)
+ngx.log(ngx.INFO, "Captured request body (" .. size .. " bytes) for auth validation")
