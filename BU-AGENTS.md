@@ -28,6 +28,11 @@ that is what keeps the merges clean.
 - `BU-*.md`
 - Deliberate source patches, one commit each, with the reason in the message.
 
+Upstream workflows that run on a schedule fire here too, because `bu` is the
+default branch. Do not edit them; disable them in the repository's Actions
+settings (`gh workflow disable <file>`). Disabled so far: `dependency-update.yml`
+(2026-09-21, it pushed a lockfile branch and failed on a missing label).
+
 ## Images and tags
 
 Four images, upstream's names: `auth-server`, `registry` (nginx lives inside
