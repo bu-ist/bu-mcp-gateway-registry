@@ -6607,6 +6607,12 @@ async def _read_bounded(
 # servers that need an upstream credential use the egress vault.
 _INTERNAL_INGRESS_RELAY_SERVERS: frozenset[str] = frozenset({"airegistry-tools"})
 
+# BU: operator-listed servers that receive the client's Authorization header
+# (delegated user tokens, e.g. ms-365). X-Authorization stays stripped.
+_BU_INGRESS_RELAY_SERVERS: frozenset[str] = frozenset(
+    s.strip().lower() for s in settings.ingress_relay_servers.split(",") if s.strip()
+)
+
 # Proxy-context headers describe the client -> Gateway hop (scheme, host, port,
 # path prefix as seen by nginx/an ingress LB) and must not be copied onto the
 # separate Gateway -> upstream MCP server hop; an upstream that trusts them can
@@ -7668,6 +7674,8 @@ async def mcp_proxy(
         dict(request.headers),
         relay_authorization=relay_ingress_auth,
     )
+    if registered_server in _BU_INGRESS_RELAY_SERVERS and "authorization" in request.headers:
+        forward_headers["Authorization"] = request.headers["authorization"]
 
     # Re-authorize the caller's scopes against the EXACT body we are about to act
     # on, BEFORE any outbound work (egress vend or upstream forward). /validate

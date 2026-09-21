@@ -1573,6 +1573,10 @@ class Settings(BaseSettings):
         ),
     )
 
+    # BU: servers that receive the client's Authorization header (e.g. ms-365
+    # with the user's Graph token). Comma-separated registered server names.
+    ingress_relay_servers: str = Field(default="")
+
     # Per-User Egress Credential Vault (third-party OBO support)
     egress_auth_enabled: bool = Field(
         default=False,
