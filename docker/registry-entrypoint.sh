@@ -478,5 +478,27 @@ else
     echo "WARN: /etc/logrotate.d/nginx-mcp missing or logrotate not installed; nginx logs will grow unbounded."
 fi
 
-# Keep the container running indefinitely
-tail -f /dev/null
+# BU: stop cleanly on SIGTERM. This script is PID 1, and PID 1 ignores SIGTERM
+# unless it installs a handler, so without this trap Kubernetes waits out the
+# whole grace period and SIGKILLs nginx and uvicorn mid-request. nginx quits
+# first (it stops accepting and finishes in-flight requests, some of which call
+# uvicorn), then uvicorn runs its shutdown.
+graceful_stop() {
+    echo "SIGTERM received: stopping nginx, then the registry..."
+    local nginx_pid
+    nginx_pid="$(cat /run/nginx/nginx.pid 2>/dev/null || true)"
+    nginx -s quit || true
+    while [ -n "$nginx_pid" ] && kill -0 "$nginx_pid" 2>/dev/null; do
+        sleep 0.2
+    done
+    kill -TERM "$UVICORN_PID" 2>/dev/null || true
+    wait "$UVICORN_PID" || true
+    echo "Registry stopped."
+    exit 0
+}
+trap graceful_stop TERM INT
+
+# Keep the container running indefinitely. Wait on a background tail: bash runs
+# a trap only between commands, so a foreground tail would block it forever.
+tail -f /dev/null &
+wait $!
