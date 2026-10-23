@@ -1,6 +1,6 @@
-# BU build of the four gateway images on native runners, one job per
-# (service, arch): build, smoke-test, and with `publish` push each leg to ECR
-# by digest and stitch the two into one multi-arch tag. Upstream's
+# BU build of the four gateway images for arm64 on native runners, one job per
+# service: build, smoke-test, and with `publish` push to ECR by digest and tag
+# it. arm64 only: every BU EKS cluster runs the gateway on arm64 nodes. Upstream's
 # release-images.yml is left untouched (it is guarded to the upstream
 # repository and builds under QEMU); this file is BU's. See BU-AGENTS.md.
 name: BU build images
@@ -46,16 +46,11 @@ jobs:
       contents: read
       id-token: write # OIDC to the ECR push role; unused without publish
     strategy:
-      # A leg that fails only on arm64 is an arch problem; keep the amd64 log
-      # of the same service next to it.
       fail-fast: false
       matrix:
         service: [auth-server, registry, mcpgw, metrics-service]
-        arch: [amd64, arm64]
+        arch: [arm64]
         include:
-          - arch: amd64
-            runner: ubuntu-latest
-            machine: x86_64
           - arch: arm64
             runner: ubuntu-24.04-arm
             machine: aarch64
@@ -186,7 +181,7 @@ jobs:
             [ -n "${{ steps.push.outputs.digest }}" ] && echo "pushed ${{ env.REPO }}@${{ steps.push.outputs.digest }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # One manifest list per service from the two digests. ECR tags are
+  # One manifest list per service from the arm64 digest. ECR tags are
   # immutable, so publishing an existing tag fails here instead of overwriting.
   publish:
     if: inputs.publish
@@ -228,17 +223,15 @@ jobs:
         run: |
           set -euo pipefail
           ls digests
-          [ -s digests/amd64 ] && [ -s digests/arm64 ]
+          [ -s digests/arm64 ]
           docker buildx imagetools create \
             -t "$REPO:${{ inputs.tag }}" \
-            "$REPO@$(cat digests/amd64)" \
             "$REPO@$(cat digests/arm64)"
 
       - name: Verify
         run: |
           set -euo pipefail
           docker buildx imagetools inspect "$REPO:${{ inputs.tag }}" | tee inspect.txt
-          grep -q 'linux/amd64' inspect.txt
           grep -q 'linux/arm64' inspect.txt
           {
             echo "## $REPO:${{ inputs.tag }}"
