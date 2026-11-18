@@ -178,7 +178,9 @@ jobs:
           {
             echo "## ${{ matrix.service }} ${{ matrix.arch }}: ${{ job.status }}"
             docker image inspect "$IMAGE" --format 'size={{.Size}} arch={{.Architecture}} os={{.Os}}' 2>/dev/null || true
-            [ -n "${{ steps.push.outputs.digest }}" ] && echo "pushed ${{ env.REPO }}@${{ steps.push.outputs.digest }}"
+            if [ -n "${{ steps.push.outputs.digest }}" ]; then
+              echo "pushed ${{ env.REPO }}@${{ steps.push.outputs.digest }}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   # One manifest list per service from the arm64 digest. ECR tags are
