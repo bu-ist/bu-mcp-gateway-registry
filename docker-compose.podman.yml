@@ -69,6 +69,14 @@ services:
       # private IPs (e.g. docker-network hostnames); mirrors docker-compose.yml.
       - SSRF_ALLOWED_HOSTS=${SSRF_ALLOWED_HOSTS:-}
       - SSRF_ALLOWED_CIDRS=${SSRF_ALLOWED_CIDRS:-}
+      # CIMD (Client ID Metadata Document) publisher -- registry-consumed; default off.
+      - CIMD_PUBLISHER_ENABLED=${CIMD_PUBLISHER_ENABLED:-false}
+      - CIMD_CACHE_TTL=${CIMD_CACHE_TTL:-3600}
+      - CIMD_CLIENT_NAME=${CIMD_CLIENT_NAME:-AI Registry Tools}
+      - CIMD_REDIRECT_URIS=${CIMD_REDIRECT_URIS:-}
+      - CIMD_SCOPE=${CIMD_SCOPE:-}
+      - CIMD_LOGO_URI=${CIMD_LOGO_URI:-}
+      - CIMD_CONTACTS=${CIMD_CONTACTS:-}
       # Registry Card Configuration
       - REGISTRY_URL=${REGISTRY_URL:-http://localhost}
       # Request-source trust (audit client IP + OAuth external-URL host allowlist)
@@ -94,6 +102,10 @@ services:
       - GATEWAY_PROXY_PREFIX=${GATEWAY_PROXY_PREFIX:-gateway}
       - GATEWAY_GENERIC_STREAM_READ_TIMEOUT_SECONDS=${GATEWAY_GENERIC_STREAM_READ_TIMEOUT_SECONDS:-3600}
       - SECRET_KEY=${SECRET_KEY}
+      # __Host- session cookie; needs HTTPS and no SESSION_COOKIE_DOMAIN. Same value on auth-server.
+      - SESSION_COOKIE_HOST_PREFIX=${SESSION_COOKIE_HOST_PREFIX:-false}
+      # Browser session lifetime in seconds; must be positive. Same value on auth-server.
+      - SESSION_MAX_AGE_SECONDS=${SESSION_MAX_AGE_SECONDS:-28800}
       # Per-user egress credential vault (off by default)
       - EGRESS_AUTH_ENABLED=${EGRESS_AUTH_ENABLED:-false}
       - SECRET_STORE_BACKEND=${SECRET_STORE_BACKEND:-openbao}
@@ -101,9 +113,38 @@ services:
       - EGRESS_TOKEN_REFRESH_SKEW_SECONDS=${EGRESS_TOKEN_REFRESH_SKEW_SECONDS:-300}
       - EGRESS_STATE_TTL_SECONDS=${EGRESS_STATE_TTL_SECONDS:-600}
       - EGRESS_OBO_ALLOWED_AUDIENCES=${EGRESS_OBO_ALLOWED_AUDIENCES:-}
+      # Opt-in OBO exchanged-token cache. Off by default.
+      - EGRESS_OBO_CACHE_ENABLED=${EGRESS_OBO_CACHE_ENABLED:-false}
+      - EGRESS_OBO_CACHE_MAX_TTL_SECONDS=${EGRESS_OBO_CACHE_MAX_TTL_SECONDS:-300}
+      - EGRESS_OBO_CACHE_EXPIRY_SKEW_SECONDS=${EGRESS_OBO_CACHE_EXPIRY_SKEW_SECONDS:-30}
       - EGRESS_OAUTH_TRUSTED_IDP_HOSTS=${EGRESS_OAUTH_TRUSTED_IDP_HOSTS:-}
       - EGRESS_CREDENTIAL_ENCRYPTION_KEY=${EGRESS_CREDENTIAL_ENCRYPTION_KEY:-}
       - EGRESS_CREDENTIAL_ENCRYPTION_REQUIRE_ENCRYPTED=${EGRESS_CREDENTIAL_ENCRYPTION_REQUIRE_ENCRYPTED:-false}
+      # Egress httpx client connection pooling (shared by url_guard). Keep
+      # keepalive_expiry below the shortest upstream/LB idle timeout.
+      - EGRESS_HTTP_POOL_MAX_CONNECTIONS=${EGRESS_HTTP_POOL_MAX_CONNECTIONS:-100}
+      - EGRESS_HTTP_POOL_MAX_KEEPALIVE=${EGRESS_HTTP_POOL_MAX_KEEPALIVE:-20}
+      - EGRESS_HTTP_POOL_KEEPALIVE_EXPIRY_SECONDS=${EGRESS_HTTP_POOL_KEEPALIVE_EXPIRY_SECONDS:-30}
+      - EGRESS_HTTP_POOL_CONNECT_RETRIES=${EGRESS_HTTP_POOL_CONNECT_RETRIES:-1}
+      # Forward-proxy egress for the SSRF-guarded clients (issue #1832). OFF by
+      # default; enabling it relaxes IP-rebind pinning for targets that resolve
+      # exclusively to public addresses. Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY
+      # through extra_env/registry.env and extra_env/auth-server.env.
+      # The CA bundle is only needed when the proxy re-signs TLS with an internal
+      # CA, and the PEM must exist INSIDE the container, so mount it as well:
+      #   volumes:
+      #     - ./certs/corporate-ca.pem:/etc/ssl/mcp-gateway/ca-bundle.pem:ro
+      - EGRESS_FORWARD_PROXY_ENABLED=${EGRESS_FORWARD_PROXY_ENABLED:-false}
+      # Close boto3's IMDS credential fallback (issue #1839). Helm and
+      # Terraform/ECS default this to "true" because task roles and IRSA supply
+      # credentials there, so IMDS is only a fallback. Compose defaults to
+      # "false" because an EC2-hosted Compose deployment often uses the instance
+      # role as its real credential source for Amazon Bedrock and AgentCore, and
+      # "true" would break it. Set it to "true" if you do not need the instance
+      # role. botocore only treats the literal "true" as disabled, so "false" is
+      # exactly equivalent to leaving it unset.
+      - AWS_EC2_METADATA_DISABLED=${AWS_EC2_METADATA_DISABLED:-false}
+      - EGRESS_FORWARD_PROXY_CA_BUNDLE=${EGRESS_FORWARD_PROXY_CA_BUNDLE:-}
       - AUTH_SERVER_NGINX_MARKER_SECRET=${AUTH_SERVER_NGINX_MARKER_SECRET:-}
       - AWS_SECRETS_REGION=${AWS_SECRETS_REGION:-}
       - SECRETS_MANAGER_KMS_KEY_ID=${SECRETS_MANAGER_KMS_KEY_ID:-}
@@ -115,6 +156,11 @@ services:
       - OPENBAO_KV_MOUNT=${OPENBAO_KV_MOUNT:-secret}
       - OPENBAO_AUTH_METHOD=${OPENBAO_AUTH_METHOD:-token}
       - OPENBAO_ROLE=${OPENBAO_ROLE:-}
+      - OPENBAO_AUTH_MOUNT=${OPENBAO_AUTH_MOUNT:-}
+      # AppRole credentials for OPENBAO_AUTH_METHOD=approle. Empty defaults keep
+      # the token and kubernetes paths unaffected (issue #1771).
+      - OPENBAO_ROLE_ID=${OPENBAO_ROLE_ID:-}
+      - OPENBAO_SECRET_ID=${OPENBAO_SECRET_ID:-}
       # Static token for OPENBAO_AUTH_METHOD=token; matches the dev OpenBao root
       # token. Required for token auth (kubernetes auth is EKS-only).
       - OPENBAO_TOKEN=${OPENBAO_TOKEN:?Set OPENBAO_TOKEN in .env (a strong random value; do not reuse the old dev-root-token default)}
@@ -173,6 +219,9 @@ services:
       - ENTRA_CLIENT_ID=${ENTRA_CLIENT_ID}
       - ENTRA_CLIENT_SECRET=${ENTRA_CLIENT_SECRET}
       - ENTRA_ENABLED=${ENTRA_ENABLED:-false}
+      # Sovereign-cloud login host for the registry's OWN client_credentials
+      # grant (headless backend discovery/health against obo_exchange servers).
+      - ENTRA_LOGIN_BASE_URL=${ENTRA_LOGIN_BASE_URL:-https://login.microsoftonline.com}
       # PingFederate configuration
       - PINGFEDERATE_BASE_URL=${PINGFEDERATE_BASE_URL:-}
       - PINGFEDERATE_EXTERNAL_URL=${PINGFEDERATE_EXTERNAL_URL:-}
@@ -203,6 +252,8 @@ services:
       - SECURITY_SCAN_ENABLED=${SECURITY_SCAN_ENABLED:-true}
       - SECURITY_SCAN_ON_REGISTRATION=${SECURITY_SCAN_ON_REGISTRATION:-true}
       - SECURITY_BLOCK_UNSAFE_SERVERS=${SECURITY_BLOCK_UNSAFE_SERVERS:-true}
+      - SECURITY_ALLOW_UNSAFE_SERVERS=${SECURITY_ALLOW_UNSAFE_SERVERS:-false}
+      - SECURITY_BLOCK_ON_SCAN_FAILURE=${SECURITY_BLOCK_ON_SCAN_FAILURE:-true}
       - SECURITY_ANALYZERS=${SECURITY_ANALYZERS:-yara}
       - SECURITY_SCAN_TIMEOUT=${SECURITY_SCAN_TIMEOUT:-60}
       - SECURITY_ADD_PENDING_TAG=${SECURITY_ADD_PENDING_TAG:-true}
@@ -249,6 +300,16 @@ services:
       - EMBEDDINGS_API_KEY=${EMBEDDINGS_API_KEY}
       - EMBEDDINGS_API_BASE=${EMBEDDINGS_API_BASE}
       - EMBEDDINGS_AWS_REGION=${EMBEDDINGS_AWS_REGION:-us-east-1}
+      - EMBEDDINGS_RESPONSE_FORMAT=${EMBEDDINGS_RESPONSE_FORMAT:-openai}
+      - EMBEDDINGS_REQUEST_TIMEOUT_SECONDS=${EMBEDDINGS_REQUEST_TIMEOUT_SECONDS:-30}
+      - EMBEDDINGS_MAX_RETRIES=${EMBEDDINGS_MAX_RETRIES:-2}
+      - EMBEDDINGS_RETRY_MAX_INPUT_CHARS=${EMBEDDINGS_RETRY_MAX_INPUT_CHARS:-}
+      # Extra headers on embeddings requests, one 'Name: value' per slot (litellm only)
+      - EMBEDDINGS_EXTRA_HEADER_1=${EMBEDDINGS_EXTRA_HEADER_1}
+      - EMBEDDINGS_EXTRA_HEADER_2=${EMBEDDINGS_EXTRA_HEADER_2}
+      - EMBEDDINGS_EXTRA_HEADER_3=${EMBEDDINGS_EXTRA_HEADER_3}
+      - EMBEDDINGS_EXTRA_HEADER_4=${EMBEDDINGS_EXTRA_HEADER_4}
+      - EMBEDDINGS_EXTRA_HEADER_5=${EMBEDDINGS_EXTRA_HEADER_5}
       # Embeddings IdP Auth (only when EMBEDDINGS_AUTH_MODE=idp)
       - EMBEDDINGS_AUTH_MODE=${EMBEDDINGS_AUTH_MODE}
       - EMBEDDINGS_IDP_TOKEN_ENDPOINT=${EMBEDDINGS_IDP_TOKEN_ENDPOINT}
@@ -265,9 +326,10 @@ services:
       - ANS_API_TIMEOUT_SECONDS=${ANS_API_TIMEOUT_SECONDS:-30}
       - ANS_SYNC_INTERVAL_HOURS=${ANS_SYNC_INTERVAL_HOURS:-6}
       - ANS_VERIFICATION_CACHE_TTL_SECONDS=${ANS_VERIFICATION_CACHE_TTL_SECONDS:-3600}
-      # Podman/local: allow the dashboard to call /api/* using the session cookie
-      # (disables nginx auth_request for /api/*; FastAPI still enforces auth)
-      - NGINX_DISABLE_API_AUTH_REQUEST=${NGINX_DISABLE_API_AUTH_REQUEST:-true}
+      # Keep nginx auth_request on /api/ (the default on every surface).
+      # Set to true only for local testing: /api/ then accepts only the
+      # session cookie, so Bearer-token API callers get 401.
+      - NGINX_DISABLE_API_AUTH_REQUEST=${NGINX_DISABLE_API_AUTH_REQUEST:-false}
       # Federation static token auth
       - FEDERATION_STATIC_TOKEN_AUTH_ENABLED=${FEDERATION_STATIC_TOKEN_AUTH_ENABLED:-false}
       - FEDERATION_STATIC_TOKEN=${FEDERATION_STATIC_TOKEN:-}
@@ -291,6 +353,13 @@ services:
       - BATCH_MAX_REQUEST_BYTES=${BATCH_MAX_REQUEST_BYTES:-4194304}
       # Caller-supplied asset id (Issue #1276)
       - ALLOW_CALLER_SUPPLIED_ASSET_ID=${ALLOW_CALLER_SUPPLIED_ASSET_ID:-false}
+      # Registration duplicate-check advisory (Issue #1696)
+      - DEDUP_REGISTRATION_HINT_ENABLED=${DEDUP_REGISTRATION_HINT_ENABLED:-true}
+      # Unset by default: the registry picks the threshold calibrated for the
+      # configured embeddings model (0.45 for all-MiniLM-L6-v2, 0.85 for
+      # text-embedding-ada-002). Set a value only to override that.
+      - DEDUP_SCORE_THRESHOLD=${DEDUP_SCORE_THRESHOLD:-}
+      - DEDUP_MAX_SUGGESTIONS=${DEDUP_MAX_SUGGESTIONS:-3}
       # Registration Gate (Admission Control)
       - REGISTRATION_GATE_ENABLED=${REGISTRATION_GATE_ENABLED:-false}
       - REGISTRATION_GATE_URL=${REGISTRATION_GATE_URL:-}
@@ -366,6 +435,8 @@ services:
       - ${HOME}/mcp-gateway/security_scans:/app/security_scans
       - ${HOME}/mcp-gateway/federation.json:/app/config/federation.json
       - ${HOME}/mcp-gateway/ssl:/etc/ssl:ro
+      # UI branding folder (manifest.json, theme.css, logos), read-only; see docs/ui-branding.md
+      - ${MCP_BRANDING_DIR:-./branding}:/app/branding:ro
       # Application log files (bind mount to host for Splunk ingestion, Issue #987)
       - /var/log/containers/ai-registry:/var/log/containers/ai-registry
     depends_on:
@@ -441,6 +512,10 @@ services:
       - TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS:-1}
       - TRUSTED_EXTERNAL_HOSTS=${TRUSTED_EXTERNAL_HOSTS:-}
       - SECRET_KEY=${SECRET_KEY}
+      # __Host- session cookie; needs HTTPS and no SESSION_COOKIE_DOMAIN. Same value on registry.
+      - SESSION_COOKIE_HOST_PREFIX=${SESSION_COOKIE_HOST_PREFIX:-false}
+      # Browser session lifetime in seconds; must be positive. Same value on registry.
+      - SESSION_MAX_AGE_SECONDS=${SESSION_MAX_AGE_SECONDS:-28800}
       # MCP access-token lifetime (hours). auth-server mints + clamps to the
       # configured max (bounded to a 7-day ceiling in code). Must match the
       # registry's values. Issue #1477.
@@ -451,13 +526,71 @@ services:
       # heuristic; set it to harden against open-redirect via a controlled subdomain.
       - OAUTH2_ALLOWED_REDIRECT_URIS=${OAUTH2_ALLOWED_REDIRECT_URIS:-}
       # Per-user egress credential vault: auth-server only needs the feature flag,
-      # the internal vend URL, and the nginx marker secret (it does NOT touch the
-      # secret store, so no SECRET_STORE/AWS/OPENBAO vars here).
+      # the internal vend URL, and the nginx marker secret. With the opt-in OBO
+      # token cache it also becomes a secret-store client, so it
+      # needs the same SECRET_STORE/AWS/OPENBAO vars as the registry (added below).
       - EGRESS_AUTH_ENABLED=${EGRESS_AUTH_ENABLED:-false}
       - EGRESS_REGISTRY_INTERNAL_URL=${EGRESS_REGISTRY_INTERNAL_URL:-http://registry:8091}
       # OBO (same-IdP) token exchange against a self-hosted IdP: allowlist its
       # private-resolving token endpoint. Must match the registry's value.
       - EGRESS_OAUTH_TRUSTED_IDP_HOSTS=${EGRESS_OAUTH_TRUSTED_IDP_HOSTS:-}
+      # Egress httpx client connection pooling (shared by url_guard). Keep
+      # keepalive_expiry below the shortest upstream/LB idle timeout.
+      - EGRESS_HTTP_POOL_MAX_CONNECTIONS=${EGRESS_HTTP_POOL_MAX_CONNECTIONS:-100}
+      - EGRESS_HTTP_POOL_MAX_KEEPALIVE=${EGRESS_HTTP_POOL_MAX_KEEPALIVE:-20}
+      - EGRESS_HTTP_POOL_KEEPALIVE_EXPIRY_SECONDS=${EGRESS_HTTP_POOL_KEEPALIVE_EXPIRY_SECONDS:-30}
+      - EGRESS_HTTP_POOL_CONNECT_RETRIES=${EGRESS_HTTP_POOL_CONNECT_RETRIES:-1}
+      # SSRF guard for the generic proxy (PROXY_PROFILE): an operator CIDR may
+      # admit a reserved IPv4 address (e.g. Istio ServiceEntry VIPs in
+      # 240.240.0.0/16). Same value as the registry and mcpgw. #2018
+      - SSRF_ALLOWED_CIDRS=${SSRF_ALLOWED_CIDRS:-}
+      # Forward-proxy egress for the SSRF-guarded clients (issue #1832). OFF by
+      # default; enabling it relaxes IP-rebind pinning for targets that resolve
+      # exclusively to public addresses. Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY
+      # through extra_env/registry.env and extra_env/auth-server.env.
+      # The CA bundle is only needed when the proxy re-signs TLS with an internal
+      # CA, and the PEM must exist INSIDE the container, so mount it as well:
+      #   volumes:
+      #     - ./certs/corporate-ca.pem:/etc/ssl/mcp-gateway/ca-bundle.pem:ro
+      - EGRESS_FORWARD_PROXY_ENABLED=${EGRESS_FORWARD_PROXY_ENABLED:-false}
+      # Close boto3's IMDS credential fallback (issue #1839). Helm and
+      # Terraform/ECS default this to "true" because task roles and IRSA supply
+      # credentials there, so IMDS is only a fallback. Compose defaults to
+      # "false" because an EC2-hosted Compose deployment often uses the instance
+      # role as its real credential source for Amazon Bedrock and AgentCore, and
+      # "true" would break it. Set it to "true" if you do not need the instance
+      # role. botocore only treats the literal "true" as disabled, so "false" is
+      # exactly equivalent to leaving it unset.
+      - AWS_EC2_METADATA_DISABLED=${AWS_EC2_METADATA_DISABLED:-false}
+      - EGRESS_FORWARD_PROXY_CA_BUNDLE=${EGRESS_FORWARD_PROXY_CA_BUNDLE:-}
+      # Opt-in OBO exchanged-token cache. Off by default. When
+      # enabled, auth-server reuses still-valid exchanged tokens from the per-user
+      # SecretStore, which is why it now needs the secret-store backend config
+      # below (previously registry-only).
+      - EGRESS_OBO_CACHE_ENABLED=${EGRESS_OBO_CACHE_ENABLED:-false}
+      - EGRESS_OBO_CACHE_MAX_TTL_SECONDS=${EGRESS_OBO_CACHE_MAX_TTL_SECONDS:-300}
+      - EGRESS_OBO_CACHE_EXPIRY_SKEW_SECONDS=${EGRESS_OBO_CACHE_EXPIRY_SKEW_SECONDS:-30}
+      # Application-layer encryption of cached OBO tokens. Same key and strict
+      # flag as the registry; only read when EGRESS_OBO_CACHE_ENABLED=true.
+      - EGRESS_CREDENTIAL_ENCRYPTION_KEY=${EGRESS_CREDENTIAL_ENCRYPTION_KEY:-}
+      - EGRESS_CREDENTIAL_ENCRYPTION_REQUIRE_ENCRYPTED=${EGRESS_CREDENTIAL_ENCRYPTION_REQUIRE_ENCRYPTED:-false}
+      - SECRET_STORE_BACKEND=${SECRET_STORE_BACKEND:-openbao}
+      - AWS_SECRETS_REGION=${AWS_SECRETS_REGION:-}
+      - SECRETS_MANAGER_KMS_KEY_ID=${SECRETS_MANAGER_KMS_KEY_ID:-}
+      - SECRETS_MANAGER_PATH_PREFIX=${SECRETS_MANAGER_PATH_PREFIX:-mcp/egress}
+      # Default to the in-stack OpenBao container (dev mode). Override for an
+      # external vault.
+      - OPENBAO_ADDR=${OPENBAO_ADDR:-http://openbao:8200}
+      - OPENBAO_NAMESPACE=${OPENBAO_NAMESPACE:-}
+      - OPENBAO_KV_MOUNT=${OPENBAO_KV_MOUNT:-secret}
+      - OPENBAO_AUTH_METHOD=${OPENBAO_AUTH_METHOD:-token}
+      - OPENBAO_ROLE=${OPENBAO_ROLE:-}
+      # Static token for OPENBAO_AUTH_METHOD=token. Only needed when
+      # EGRESS_OBO_CACHE_ENABLED=true; empty by default so the auth-server holds
+      # no vault credential. Compose has no namespace scoping, so whatever token
+      # is set here (typically the dev root token) can read every stored
+      # credential.
+      - OPENBAO_TOKEN=${AUTH_SERVER_OPENBAO_TOKEN:-}
       - AUTH_SERVER_NGINX_MARKER_SECRET=${AUTH_SERVER_NGINX_MARKER_SECRET:-}
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
@@ -510,6 +643,12 @@ services:
       - ENTRA_CLIENT_ID=${ENTRA_CLIENT_ID}
       - ENTRA_CLIENT_SECRET=${ENTRA_CLIENT_SECRET}
       - ENTRA_ENABLED=${ENTRA_ENABLED:-false}
+      - ENTRA_LOGIN_BASE_URL=${ENTRA_LOGIN_BASE_URL:-https://login.microsoftonline.com}
+      - ENTRA_GRAPH_BASE_URL=${ENTRA_GRAPH_BASE_URL:-}
+      - ENTRA_GRAPH_RESOURCE_URL=${ENTRA_GRAPH_RESOURCE_URL:-}
+      - ENTRA_BROWSER_USER_READ_ENABLED=${ENTRA_BROWSER_USER_READ_ENABLED:-false}
+      - ENTRA_GROUP_RECOVERY_ENABLED=${ENTRA_GROUP_RECOVERY_ENABLED:-true}
+      - ENTRA_GROUP_CACHE_TTL_SECONDS=${ENTRA_GROUP_CACHE_TTL_SECONDS:-300}
       # Okta configuration
       - OKTA_DOMAIN=${OKTA_DOMAIN:-}
       - OKTA_CLIENT_ID=${OKTA_CLIENT_ID:-}
@@ -646,6 +785,16 @@ services:
       - OTEL_METRIC_EXPORT_INTERVAL_MS=${OTEL_METRIC_EXPORT_INTERVAL_MS:-15000}
       - OTEL_EXPORTER_PROMETHEUS_HOST=${OTEL_EXPORTER_PROMETHEUS_HOST:-0.0.0.0}
       - OTEL_EXPORTER_PROMETHEUS_PORT=${OTEL_EXPORTER_PROMETHEUS_PORT:-9464}
+      # Egress httpx client connection pooling (mcpgw registry API + Keycloak
+      # M2M hops). Keep keepalive_expiry below the shortest upstream/LB idle
+      # timeout. Set identically to the registry/auth-server values.
+      - EGRESS_HTTP_POOL_MAX_CONNECTIONS=${EGRESS_HTTP_POOL_MAX_CONNECTIONS:-100}
+      - EGRESS_HTTP_POOL_MAX_KEEPALIVE=${EGRESS_HTTP_POOL_MAX_KEEPALIVE:-20}
+      - EGRESS_HTTP_POOL_KEEPALIVE_EXPIRY_SECONDS=${EGRESS_HTTP_POOL_KEEPALIVE_EXPIRY_SECONDS:-30}
+      - EGRESS_HTTP_POOL_CONNECT_RETRIES=${EGRESS_HTTP_POOL_CONNECT_RETRIES:-1}
+      # SSRF guard: an operator CIDR may admit a reserved address (e.g. Istio
+      # ServiceEntry VIPs in 240.240.0.0/16). Same value as the registry. #2018
+      - SSRF_ALLOWED_CIDRS=${SSRF_ALLOWED_CIDRS:-}
     env_file:
       - path: ${MCP_EXTRA_ENV_DIR:-./extra_env}/mcpgw.env
         required: false
@@ -697,7 +846,7 @@ services:
   # Prometheus for metrics collection
   prometheus:
     # Pinned (not :latest) to match the main compose stack.
-    image: prom/prometheus:v3.11.3
+    image: prom/prometheus:v3.15.1
     ports:
       # Loopback-only: Prometheus UI is a local-dev convenience, not a public surface.
       - "${HOST_BIND_IP:-127.0.0.1}:9090:9090"
@@ -841,6 +990,16 @@ services:
       - PING_IDENTITY_DEVOPS_KEY=${PING_IDENTITY_DEVOPS_KEY}
       - SERVER_PROFILE_URL=https://github.com/pingidentity/pingidentity-server-profiles.git
       - SERVER_PROFILE_PATH=getting-started/pingfederate
+      # Bootstrap the console administrator from the operator-supplied
+      # PF_ADMIN_PASS instead of the Ping vendor default. This profile
+      # (getting-started) interpolates PING_IDENTITY_PASSWORD straight into
+      # instance/bulk-config/data.json.subst, where baseline routes it through
+      # administrativeAccounts_items_Administrator_password -- different
+      # mechanism, same operator-settable variable. Empty is NOT neutral: both
+      # profiles' env_vars apply ${PING_IDENTITY_PASSWORD:=2FederateM0re}, and
+      # `:=` substitutes on null, so build_and_run.sh rejects an empty
+      # PF_ADMIN_PASS when PINGFEDERATE_ENABLED is true.
+      - PING_IDENTITY_PASSWORD=${PF_ADMIN_PASS:-}
     ports:
       # Loopback-only: PingFederate runtime + admin console stay on the host.
       - "${HOST_BIND_IP:-127.0.0.1}:9031:9031"

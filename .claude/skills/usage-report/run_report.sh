@@ -2,7 +2,7 @@
 #
 # run_report.sh - Half A of the usage-report pipeline (everything up to commentary).
 #
-# Runs: telemetry export (bastion) -> all 14 charts -> telemetry + liveness
+# Runs: telemetry export (bastion) -> all 15 charts -> telemetry + liveness
 # analysis -> deterministic report render -> commentary manifest extract.
 #
 # Stops at the LLM hinge: it prints the path to commentary-manifest.json. The
@@ -189,11 +189,6 @@ _generate_charts_no_metrics() {
         --csv-out "$DATE_DIR/daily-reporters-$REPORT_DATE.csv" \
         --exclude-incomplete-day "$REPORT_DATE"
 
-    "$PY" "$SCRIPT_DIR/generate_install_forecast.py" \
-        --csv-dir "$OUTPUT_DIR" \
-        --output "$DATE_DIR/install-forecast-$REPORT_DATE.png" \
-        --summary-json "$DATE_DIR/install-forecast-$REPORT_DATE.json"
-
     "$PY" "$SCRIPT_DIR/generate_detection_by_version_chart.py" \
         --csv "$CSV" \
         --output "$DATE_DIR/detection-by-version-$REPORT_DATE.png" \
@@ -225,6 +220,14 @@ _generate_charts_with_metrics() {
         --output "$DATE_DIR/instance-lifetime-by-compute-$REPORT_DATE.png" \
         --box-output "$DATE_DIR/instance-lifetime-box-by-compute-$REPORT_DATE.png"
 
+    # The forecast builds its series from every metrics-*.json snapshot, so it
+    # must run after analysis writes today's file. Run earlier, it forecast
+    # from the previous report's install count.
+    "$PY" "$SCRIPT_DIR/generate_install_forecast.py" \
+        --csv-dir "$OUTPUT_DIR" \
+        --output "$DATE_DIR/install-forecast-$REPORT_DATE.png" \
+        --summary-json "$DATE_DIR/install-forecast-$REPORT_DATE.json"
+
     "$PY" "$SCRIPT_DIR/generate_lifetime_buckets_chart.py" \
         --csv-dir "$OUTPUT_DIR" \
         --output "$DATE_DIR/lifetime-buckets-$REPORT_DATE.png" \
@@ -234,6 +237,11 @@ _generate_charts_with_metrics() {
         --metrics "$metrics" \
         --liveness "$liveness" \
         --output "$DATE_DIR/adoption-funnel-$REPORT_DATE.png"
+
+    "$PY" "$SCRIPT_DIR/generate_auth_path_chart.py" \
+        --csv "$CSV" \
+        --output "$DATE_DIR/auth-path-mix-$REPORT_DATE.png" \
+        --metrics "$metrics"
 }
 
 
@@ -273,11 +281,11 @@ _run_analysis() {
 
 
 # ---------------------------------------------------------------------------
-# Chart completeness gate: fail before rendering if any of the 14 are missing
+# Chart completeness gate: fail before rendering if any of the 15 are missing
 # ---------------------------------------------------------------------------
 
 _verify_charts() {
-    echo ">>> Verifying all 14 mandatory charts are present..."
+    echo ">>> Verifying all 15 mandatory charts are present..."
     local charts=(
         "registry-installs-timeseries-$REPORT_DATE.png"
         "instance-distribution-$REPORT_DATE.png"
@@ -293,6 +301,7 @@ _verify_charts() {
         "adoption-funnel-$REPORT_DATE.png"
         "detection-by-version-$REPORT_DATE.png"
         "prod-internal-timeseries-$REPORT_DATE.png"
+        "auth-path-mix-$REPORT_DATE.png"
     )
     local missing=0
     for c in "${charts[@]}"; do
@@ -305,7 +314,7 @@ _verify_charts() {
         echo "ERROR: $missing mandatory chart(s) missing; aborting before render." >&2
         exit 1
     fi
-    echo "  All 14 charts present."
+    echo "  All 15 charts present."
 }
 
 

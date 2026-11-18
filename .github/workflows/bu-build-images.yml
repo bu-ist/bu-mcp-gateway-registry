@@ -11,7 +11,7 @@ on:
       version:
         description: Upstream release this branch is based on (baked in as BUILD_VERSION)
         required: true
-        default: "1.30.0"
+        default: "1.37.0"
         type: string
       publish:
         description: Push to ECR and tag. Off = build and smoke only.
@@ -19,7 +19,7 @@ on:
         default: false
         type: boolean
       tag:
-        description: Tag to publish, <version>-bu.<n>, e.g. 1.30.0-bu.1. Required with publish. Immutable in ECR.
+        description: Tag to publish, <version>-bu.<n>, e.g. 1.37.0-bu.1. Required with publish. Immutable in ECR.
         required: false
         default: ""
         type: string
@@ -178,7 +178,9 @@ jobs:
           {
             echo "## ${{ matrix.service }} ${{ matrix.arch }}: ${{ job.status }}"
             docker image inspect "$IMAGE" --format 'size={{.Size}} arch={{.Architecture}} os={{.Os}}' 2>/dev/null || true
-            [ -n "${{ steps.push.outputs.digest }}" ] && echo "pushed ${{ env.REPO }}@${{ steps.push.outputs.digest }}"
+            if [ -n "${{ steps.push.outputs.digest }}" ]; then
+              echo "pushed ${{ env.REPO }}@${{ steps.push.outputs.digest }}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   # One manifest list per service from the arm64 digest. ECR tags are

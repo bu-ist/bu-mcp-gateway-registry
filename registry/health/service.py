@@ -11,6 +11,15 @@ from fastapi import WebSocket
 from registry.constants import DeploymentType, HealthStatus
 
 from ..common.log_redaction import redact_url
+from ..common.mcp_protocol import (
+    META_CLIENT_CAPABILITIES_KEY,
+    META_CLIENT_INFO_KEY,
+    META_PROTOCOL_VERSION_KEY,
+    MODERN_ERROR_CODES,
+    MODERN_PROTOCOL_VERSION,
+)
+from ..core.backend_oauth import RESOLVED_BEARER_KEY as _BACKEND_OAUTH_TOKEN_KEY
+from ..core.backend_oauth import with_bearer as _with_backend_oauth
 from ..core.config import settings
 from ..core.endpoint_utils import get_endpoint_url_from_server_info
 from ..exceptions import UrlValidationError
@@ -19,10 +28,163 @@ from ..utils.url_guard import (
     PROXY_PROFILE,
     guarded_async_client,
     proxy_profile_for_entity_target,
+    shared_guarded_async_client,
     validate_url,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# One name, one predicate, used by BOTH health paths. The periodic loop
+# (_check_single_service) and the on-demand refresh (perform_immediate_health_check)
+# each resolve credentials and set status independently, so a check written into only
+# one of them is a check the UI can miss: the loop said unhealthy while a refresh
+# still reported "Healthy, 45 tools".
+DISCOVERY_IDENTITY_UNCONNECTED = "unhealthy: discovery identity designated but not connected"
+
+
+# MCP 2026-07-28 health probe. A modern server has no initialize handshake, so
+# the probe first sends server/discover (an RPC every 2026-07-28 server MUST
+# implement). A DiscoverResult, or one of the error codes the 2026-07-28 spec
+# defines, proves a live modern server. Any other answer means a handshake-era
+# server (or no answer at all), and the probe falls back to initialize + ping.
+# Spec: https://modelcontextprotocol.io/specification/2026-07-28/server/discover
+MODERN_MCP_PROTOCOL_VERSION: str = MODERN_PROTOCOL_VERSION
+# HeaderMismatch, MissingRequiredClientCapability, UnsupportedProtocolVersion.
+MODERN_MCP_ERROR_CODES: frozenset[int] = MODERN_ERROR_CODES
+# A DiscoverResult is a few hundred bytes. Stop reading well before a server
+# that streams forever could make the probe hold memory.
+MAX_DISCOVER_RESPONSE_BYTES: int = 65536
+# How long to remember that a server answered server/discover as a
+# handshake-era server. Until the entry expires, its health checks skip
+# server/discover and go straight to initialize + ping. After it expires the
+# probe asks again, so a server that upgrades to 2026-07-28 is picked up.
+LEGACY_MCP_ERA_CACHE_SECONDS: int = 3600
+# registry/utils/url_guard.py starts the reason of every resolver failure with this.
+DNS_FAILURE_REASON_PREFIX: str = "DNS resolution"
+HEALTH_PROBE_CLIENT_NAME: str = "mcp-gateway-registry"
+HEALTH_PROBE_CLIENT_VERSION: str = "2.0.0"
+
+
+def _is_dns_failure(
+    error: UrlValidationError,
+) -> bool:
+    """Whether the URL guard refused a URL only because its host did not resolve."""
+    return str(getattr(error, "reason", "")).startswith(DNS_FAILURE_REASON_PREFIX)
+
+
+def _health_server_path(
+    server_info: dict,
+) -> str | None:
+    """The server's registry path, used as the handshake-era cache key."""
+    return server_info.get("path") or server_info.get("service_path")
+
+
+def _parse_jsonrpc_response(
+    body: bytes,
+) -> dict | None:
+    """Parse a JSON-RPC response from a plain JSON or SSE-framed body.
+
+    Args:
+        body: Raw response bytes (possibly truncated).
+
+    Returns:
+        The first JSON object that carries "result" or "error", else None.
+    """
+    text = body.decode("utf-8", errors="replace").strip()
+    if text.startswith("{"):
+        candidates = [text]
+    else:
+        candidates = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
+    for candidate in candidates:
+        try:
+            message = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(message, dict) and ("result" in message or "error" in message):
+            return message
+    return None
+
+
+def _is_modern_mcp_answer(
+    message: dict | None,
+) -> bool:
+    """Whether a server/discover answer came from a 2026-07-28 MCP server.
+
+    Per the spec, a modern server either returns a DiscoverResult (with a
+    supportedVersions list) or a recognized modern JSON-RPC error. A
+    handshake-era server returns something else, typically -32601 or a
+    -32600 "no session" error.
+
+    Args:
+        message: The parsed JSON-RPC response, or None.
+
+    Returns:
+        True when the answer identifies a live modern server.
+    """
+    if not message:
+        return False
+    result = message.get("result")
+    if isinstance(result, dict):
+        versions = result.get("supportedVersions")
+        return isinstance(versions, list) and any(isinstance(v, str) for v in versions)
+    error = message.get("error")
+    if isinstance(error, dict):
+        return error.get("code") in MODERN_MCP_ERROR_CODES
+    return False
+
+
+def _server_discover_request() -> tuple[dict[str, str], str]:
+    """Build the extra headers and the body for a server/discover probe.
+
+    Returns:
+        (headers to add, JSON body). The headers mirror the body as the
+        2026-07-28 Streamable HTTP transport requires.
+    """
+    body = {
+        "jsonrpc": "2.0",
+        "id": "health-discover",
+        "method": "server/discover",
+        "params": {
+            "_meta": {
+                META_PROTOCOL_VERSION_KEY: MODERN_MCP_PROTOCOL_VERSION,
+                META_CLIENT_INFO_KEY: {
+                    "name": HEALTH_PROBE_CLIENT_NAME,
+                    "version": HEALTH_PROBE_CLIENT_VERSION,
+                },
+                META_CLIENT_CAPABILITIES_KEY: {},
+            }
+        },
+    }
+    headers = {
+        "MCP-Protocol-Version": MODERN_MCP_PROTOCOL_VERSION,
+        "Mcp-Method": "server/discover",
+    }
+    return headers, json.dumps(body)
+
+
+def _discovery_identity_unconnected(server_info: dict) -> bool:
+    """Whether a designated discovery identity resolved no credential.
+
+    Call AFTER the resolver has run: "designated but not connected" is only knowable
+    once with_bearer has tried and stashed nothing.
+
+    Naming this state beats probing it. The server needs a credential to answer at
+    all, so the probe fails, the tool fetch returns nothing, and ``num_tools`` KEEPS
+    ITS PREVIOUS VALUE -- one deployment read "active, 45 tools" for five hours after
+    the vault lost the token, with the only evidence in a log line.
+
+    Mirrors ``resolve_discovery_bearer``'s own precondition, ``auth_scheme == "none"``
+    included. That resolver deliberately bows out when an explicit static scheme
+    exists, because the operator-chosen credential wins, so a server holding BOTH a
+    designation and a stored bearer resolves no discovery token and is perfectly
+    healthy. Gating on the designation alone would mark every one of those unhealthy.
+    """
+    return bool(
+        (server_info.get("oauth_discovery") or {}).get("enabled")
+        and (server_info.get("auth_scheme") or "none") == "none"
+        and not server_info.get(_BACKEND_OAUTH_TOKEN_KEY)
+    )
 
 
 class HighPerformanceWebSocketManager:
@@ -214,6 +376,10 @@ class HealthMonitoringService:
         self._cache_timestamp = 0
         self._cache_ttl = settings.websocket_cache_ttl_seconds
 
+        # Servers known to answer server/discover as handshake-era servers:
+        # server path -> (endpoint probed, expiry as a time() timestamp).
+        self._legacy_mcp_endpoints: dict[str, tuple[str, float]] = {}
+
     async def _check_secret_key_persistence(self):
         """Warn if servers have encrypted credentials but SECRET_KEY is auto-generated."""
         if os.environ.get("SECRET_KEY"):
@@ -351,7 +517,6 @@ class HealthMonitoringService:
 
     async def _perform_health_checks(self):
         """Perform health checks on all enabled services."""
-        import httpx
 
         from ..services.server_service import server_service
 
@@ -373,45 +538,43 @@ class HealthMonitoringService:
         HEALTH_CHECK_BATCH_SIZE = 10
         HEALTH_CHECK_BATCH_DELAY_SECONDS = 0.5
 
-        async with (
-            guarded_async_client(
-                profile=PROXY_PROFILE,
-                timeout=httpx.Timeout(settings.health_check_timeout_seconds),
-            ) as client,
-            guarded_async_client(
-                profile=BUILTIN_AIREGISTRY_TOOLS_PROFILE,
-                timeout=httpx.Timeout(settings.health_check_timeout_seconds),
-            ) as builtin_client,
-        ):
-            check_tasks = []
-            for service_path in enabled_services:
-                server_info = await server_service.get_server_info(
-                    service_path, include_credentials=True
+        # Process-lifetime pooled clients (owned by the app lifespan; closed on
+        # shutdown via aclose_shared_clients). Reused across cycles so a server is
+        # not re-handshaked every cycle, and within a cycle the initialize+probe to
+        # one server reuse a connection. Per-request timeouts are passed on each
+        # stream/post below; the SSRF guard still validates+pins every request.
+        client = shared_guarded_async_client(profile=PROXY_PROFILE)
+        builtin_client = shared_guarded_async_client(profile=BUILTIN_AIREGISTRY_TOOLS_PROFILE)
+
+        check_tasks = []
+        for service_path in enabled_services:
+            server_info = await server_service.get_server_info(
+                service_path, include_credentials=True
+            )
+            if server_info and server_info.get("proxy_pass_url"):
+                check_tasks.append((service_path, server_info))
+
+        # Execute health checks in staggered batches
+        for batch_start in range(0, len(check_tasks), HEALTH_CHECK_BATCH_SIZE):
+            batch = check_tasks[batch_start : batch_start + HEALTH_CHECK_BATCH_SIZE]
+            batch_coros = []
+            for path, info in batch:
+                profile = proxy_profile_for_entity_target(
+                    "mcp_server", path, info["proxy_pass_url"]
                 )
-                if server_info and server_info.get("proxy_pass_url"):
-                    check_tasks.append((service_path, server_info))
+                selected_client = (
+                    builtin_client if profile is BUILTIN_AIREGISTRY_TOOLS_PROFILE else client
+                )
+                batch_coros.append(self._check_single_service(selected_client, path, info))
+            results = await asyncio.gather(*batch_coros, return_exceptions=True)
 
-            # Execute health checks in staggered batches
-            for batch_start in range(0, len(check_tasks), HEALTH_CHECK_BATCH_SIZE):
-                batch = check_tasks[batch_start : batch_start + HEALTH_CHECK_BATCH_SIZE]
-                batch_coros = []
-                for path, info in batch:
-                    profile = proxy_profile_for_entity_target(
-                        "mcp_server", path, info["proxy_pass_url"]
-                    )
-                    selected_client = (
-                        builtin_client if profile is BUILTIN_AIREGISTRY_TOOLS_PROFILE else client
-                    )
-                    batch_coros.append(self._check_single_service(selected_client, path, info))
-                results = await asyncio.gather(*batch_coros, return_exceptions=True)
+            for result in results:
+                if isinstance(result, bool) and result:
+                    status_changed = True
 
-                for result in results:
-                    if isinstance(result, bool) and result:
-                        status_changed = True
-
-                # Pause between batches to avoid CPU/connection spikes
-                if batch_start + HEALTH_CHECK_BATCH_SIZE < len(check_tasks):
-                    await asyncio.sleep(HEALTH_CHECK_BATCH_DELAY_SECONDS)
+            # Pause between batches to avoid CPU/connection spikes
+            if batch_start + HEALTH_CHECK_BATCH_SIZE < len(check_tasks):
+                await asyncio.sleep(HEALTH_CHECK_BATCH_DELAY_SECONDS)
 
         # Only broadcast if something actually changed
         if status_changed:
@@ -449,6 +612,32 @@ class HealthMonitoringService:
 
         proxy_pass_url = server_info.get("proxy_pass_url")
         new_status = previous_status
+
+        # Resolve+cache an OAuth2 client_credentials bearer (no-op unless
+        # auth_scheme == 'oauth') so the synchronous header builder attaches it
+        # to both the liveness probe and any triggered tool fetch.
+        #
+        # An 'oauth' scheme with no usable backend_oauth is reported by NAME rather than
+        # probed. Registration is two-step -- POST the server, then PUT /oauth-config --
+        # so a failed or abandoned second step leaves exactly this state legitimately.
+        # Probing anyway produces a generic transport failure, and the only record of the
+        # real cause is a log line the operator never sees, so the server looks broken for
+        # an unrelated reason. This is the one misconfiguration the registry can name with
+        # certainty before making a request.
+        if (server_info.get("auth_scheme") or "none") == "oauth":
+            bo = server_info.get("backend_oauth") or {}
+            if not bo.get("token_url") or not bo.get("client_id"):
+                new_status = "unhealthy: backend OAuth not configured"
+                self.server_health_status[service_path] = new_status
+                self.server_last_check_time[service_path] = datetime.now(UTC)
+                return previous_status != new_status
+        server_info = await _with_backend_oauth(server_info)
+
+        if _discovery_identity_unconnected(server_info):
+            new_status = DISCOVERY_IDENTITY_UNCONNECTED
+            self.server_health_status[service_path] = new_status
+            self.server_last_check_time[service_path] = datetime.now(UTC)
+            return previous_status != new_status
 
         try:
             # Try to reach the service endpoint using transport-aware checking
@@ -573,6 +762,19 @@ class HealthMonitoringService:
                 f"Merged encrypted health headers count={len(decrypted):d} names={sorted(entry['name'] for entry in decrypted)}",
             )
 
+        # A pre-resolved OAuth bearer (client_credentials OR a borrowed per-user
+        # discovery-identity token) is the only credential when present; set by the
+        # async caller (backend_oauth.with_bearer), whose tiers bow out when an
+        # explicit static auth_scheme exists. Gated by the destination check above.
+        #
+        # ALWAYS 'Authorization' -- never auth_header_name. See the matching note
+        # in core/mcp_client.py: inheriting an api_key server's 'X-API-Key' would
+        # emit `X-API-Key: Bearer <oauth-token>`, which no upstream reads correctly.
+        resolved_bearer = server_info.get(_BACKEND_OAUTH_TOKEN_KEY)
+        if resolved_bearer:
+            headers["Authorization"] = f"Bearer {resolved_bearer}"
+            logger.debug("Added resolved OAuth bearer header to health request")
+            return headers
         auth_scheme = server_info.get("auth_scheme", "none")
         encrypted_credential = server_info.get("auth_credential_encrypted")
         if auth_scheme != "none" and encrypted_credential:
@@ -591,6 +793,158 @@ class HealthMonitoringService:
             else:
                 logger.warning(f"Health credential decryption failed service={entity_path}")
         return headers
+
+    async def _read_discover_response(
+        self,
+        response: httpx.Response,
+    ) -> dict | None:
+        """Read a server/discover response until it holds a JSON-RPC answer.
+
+        Stops at the first complete answer or MAX_DISCOVER_RESPONSE_BYTES, so
+        an SSE response that stays open cannot hold the probe.
+
+        Args:
+            response: The streamed response.
+
+        Returns:
+            The parsed JSON-RPC response, or None.
+        """
+        body = b""
+        async for chunk in response.aiter_bytes():
+            body += chunk
+            message = _parse_jsonrpc_response(body)
+            if message is not None:
+                return message
+            if len(body) >= MAX_DISCOVER_RESPONSE_BYTES:
+                break
+        return _parse_jsonrpc_response(body)
+
+    def _is_known_legacy_endpoint(
+        self,
+        server_path: str,
+        endpoint: str,
+    ) -> bool:
+        """Whether this server recently answered server/discover as handshake-era.
+
+        An entry for a different endpoint (the server's URL changed) or an
+        expired entry is dropped and does not count.
+        """
+        entry = self._legacy_mcp_endpoints.get(server_path)
+        if entry is None:
+            return False
+        cached_endpoint, expires_at = entry
+        if cached_endpoint != endpoint or time() >= expires_at:
+            self._legacy_mcp_endpoints.pop(server_path, None)
+            return False
+        return True
+
+    def _remember_legacy_endpoint(
+        self,
+        server_path: str,
+        endpoint: str,
+    ) -> None:
+        """Record that this server answered server/discover as handshake-era."""
+        self._legacy_mcp_endpoints[server_path] = (
+            endpoint,
+            time() + LEGACY_MCP_ERA_CACHE_SECONDS,
+        )
+        # Log the redacted endpoint only: server_path comes from a record loaded
+        # with credentials, and CodeQL treats every value from it as sensitive.
+        logger.debug(
+            f"Remembering handshake-era answer for {LEGACY_MCP_ERA_CACHE_SECONDS}s "
+            f"endpoint={redact_url(endpoint)}"
+        )
+
+    def _forget_legacy_endpoint(
+        self,
+        server_path: str | None,
+    ) -> None:
+        """Drop the handshake-era entry, so the next check sends server/discover."""
+        if server_path and self._legacy_mcp_endpoints.pop(server_path, None) is not None:
+            logger.debug("Forgot a handshake-era entry after an unhealthy result")
+
+    async def _send_server_discover(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        headers: dict[str, str],
+    ) -> bool | None:
+        """Send server/discover and classify the answer.
+
+        Returns:
+            True for a modern server, False for any other answer or failure,
+            None for a 401 or 403 (the server's era is still unknown).
+        """
+        extra_headers, payload = _server_discover_request()
+        probe_headers = {**headers, **extra_headers}
+        try:
+            async with client.stream(
+                "POST",
+                endpoint,
+                headers=probe_headers,
+                content=payload,
+                follow_redirects=True,
+                timeout=httpx.Timeout(settings.health_check_timeout_seconds),
+            ) as response:
+                status = response.status_code
+                if status in (401, 403):
+                    logger.debug(
+                        f"server/discover probe got status={status} endpoint={redact_url(endpoint)}; "
+                        "using the legacy probe for its auth handling"
+                    )
+                    return None
+                message = await self._read_discover_response(response)
+        except Exception as e:
+            logger.debug(
+                f"server/discover probe failed endpoint={redact_url(endpoint)} type={type(e).__name__}"
+            )
+            return False
+
+        is_modern = _is_modern_mcp_answer(message)
+        logger.debug(
+            f"server/discover probe endpoint={redact_url(endpoint)} status={status} modern={is_modern}"
+        )
+        return is_modern
+
+    async def _probe_server_discover(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        headers: dict[str, str],
+        server_path: str | None = None,
+    ) -> bool:
+        """Check whether the endpoint is a live MCP 2026-07-28 server.
+
+        Sends server/discover on the same guarded client and headers the
+        legacy probe uses. Never decides "unhealthy" by itself: any failure,
+        auth error or non-modern answer returns False, and the caller falls
+        back to the initialize + ping probe unchanged.
+
+        With a server_path, a handshake-era answer (or no answer) is
+        remembered for LEGACY_MCP_ERA_CACHE_SECONDS, and later checks skip
+        server/discover until the entry expires or the legacy probe fails.
+        A 401 or 403 is not remembered, since it says nothing about the era.
+
+        Args:
+            client: The guarded httpx client.
+            endpoint: The exact MCP endpoint, already validated.
+            headers: Headers built for this exact destination.
+            server_path: The server's registry path, the cache key.
+
+        Returns:
+            True when the server answered as a modern MCP server.
+        """
+        if server_path and self._is_known_legacy_endpoint(server_path, endpoint):
+            logger.debug(
+                f"Skipping server/discover for {redact_url(endpoint)}: "
+                "answered as handshake-era recently"
+            )
+            return False
+
+        is_modern = await self._send_server_discover(client, endpoint, headers)
+        if is_modern is False and server_path:
+            self._remember_legacy_endpoint(server_path, endpoint)
+        return is_modern is True
 
     async def _initialize_mcp_session(
         self, client: httpx.AsyncClient, endpoint: str, headers: dict[str, str]
@@ -646,22 +1000,74 @@ class HealthMonitoringService:
                 server_session_id = response.headers.get("Mcp-Session-Id") or response.headers.get(
                     "mcp-session-id"
                 )
-                if server_session_id:
-                    logger.debug(f"Server returned session ID: {server_session_id}")
-                    return server_session_id
-                else:
-                    # If server doesn't return a session ID, generate one for stateless servers
-                    client_session_id = str(uuid.uuid4())
-                    logger.debug(
-                        f"Server did not return session ID, using client-generated: {client_session_id}"
-                    )
-                    return client_session_id
 
         except Exception as e:
             logger.warning(
                 f"MCP initialize failed for {redact_url(endpoint)} type={type(e).__name__}"
             )
             return None
+
+        await self._send_initialized_notification(client, endpoint, headers, server_session_id)
+
+        if server_session_id:
+            logger.debug(f"Server returned session ID: {server_session_id}")
+            return server_session_id
+
+        # If server doesn't return a session ID, generate one for stateless servers
+        client_session_id = str(uuid.uuid4())
+        logger.debug(
+            f"Server did not return session ID, using client-generated: {client_session_id}"
+        )
+        return client_session_id
+
+    async def _send_initialized_notification(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        headers: dict[str, str],
+        server_session_id: str | None,
+    ) -> None:
+        """Complete the MCP handshake by sending notifications/initialized.
+
+        The MCP lifecycle requires this notification after a successful
+        initialize. Servers that enforce it reject the following ping with
+        404 Session not found until it arrives (issue #1817).
+
+        Best effort: a server that rejects the notification or a network error
+        is logged and does not fail the check, so lenient servers keep their
+        current result and the ping that follows decides health.
+
+        Args:
+            client: httpx AsyncClient instance
+            endpoint: The MCP endpoint URL
+            headers: Headers sent with initialize
+            server_session_id: Session ID the server issued, or None for a
+                stateless server (no Mcp-Session-Id header is sent then)
+        """
+        notify_headers = headers.copy()
+        if server_session_id:
+            notify_headers["Mcp-Session-Id"] = server_session_id
+
+        try:
+            # Streamed for the same reason as initialize: only the status is needed.
+            async with client.stream(
+                "POST",
+                endpoint,
+                headers=notify_headers,
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                timeout=httpx.Timeout(5.0),
+                follow_redirects=True,
+            ) as response:
+                if response.status_code >= 400:
+                    logger.debug(
+                        f"MCP initialized notification rejected endpoint={redact_url(endpoint)} "
+                        f"status={response.status_code}"
+                    )
+        except Exception as e:
+            logger.debug(
+                f"MCP initialized notification failed endpoint={redact_url(endpoint)} "
+                f"type={type(e).__name__}"
+            )
 
     async def _try_ping_without_auth(self, client: httpx.AsyncClient, endpoint: str) -> bool:
         """
@@ -752,9 +1158,34 @@ class HealthMonitoringService:
             return response
 
     async def _check_server_endpoint_transport_aware(
-        self, client: httpx.AsyncClient, proxy_pass_url: str, server_info: dict
+        self,
+        client: httpx.AsyncClient,
+        proxy_pass_url: str,
+        server_info: dict,
     ) -> tuple[bool, str]:
         """Check server endpoint using transport-aware logic.
+
+        An unhealthy result drops the server's handshake-era entry, so the
+        next check asks server/discover again. A modern server that was down
+        when it was first probed is then recognized once it is back.
+
+        Returns:
+            tuple[bool, str]: (is_healthy, status_detail)
+        """
+        is_healthy, status_detail = await self._check_transport_endpoints(
+            client, proxy_pass_url, server_info
+        )
+        if not is_healthy:
+            self._forget_legacy_endpoint(_health_server_path(server_info))
+        return is_healthy, status_detail
+
+    async def _check_transport_endpoints(
+        self,
+        client: httpx.AsyncClient,
+        proxy_pass_url: str,
+        server_info: dict,
+    ) -> tuple[bool, str]:
+        """Run the transport-aware probes for one server.
 
         Returns:
             tuple[bool, str]: (is_healthy, status_detail)
@@ -786,7 +1217,13 @@ class HealthMonitoringService:
                     "mcp_server", entity_path, registered_target, outbound_url
                 )
                 validate_url(outbound_url, profile=outbound_profile)
-        except UrlValidationError:
+        except UrlValidationError as e:
+            if _is_dns_failure(e):
+                logger.warning(
+                    f"Health check could not resolve the host of {redact_url(proxy_pass_url)} "
+                    "(credentials NOT sent)",
+                )
+                return False, HealthStatus.UNHEALTHY_HOST_NOT_RESOLVED
             logger.warning(
                 f"Health check blocked by SSRF guard for {redact_url(proxy_pass_url)} (credentials NOT sent)",
             )
@@ -897,6 +1334,18 @@ class HealthMonitoringService:
                 include_session_id=False,
             )
             logger.info(f"[TRACE] Resolved streamable-http endpoint: {redact_url(endpoint)}")
+
+            # Step 0: an MCP 2026-07-28 server has no initialize handshake. If it
+            # answers server/discover as a modern server, it is healthy. Any other
+            # answer falls through to the handshake-era probe below, unchanged.
+            if await self._probe_server_discover(
+                client, endpoint, headers, server_path=_health_server_path(server_info)
+            ):
+                logger.info(
+                    f"Health check succeeded at {redact_url(endpoint)} "
+                    f"(server/discover, MCP {MODERN_MCP_PROTOCOL_VERSION})"
+                )
+                return True, HealthStatus.HEALTHY
 
             try:
                 # Step 1: Initialize session to get session ID
@@ -1030,6 +1479,16 @@ class HealthMonitoringService:
             logger.info(
                 f"[TRACE] Resolved default streamable-http endpoint: {redact_url(endpoint)}"
             )
+            # Same modern-server check as the streamable-http path above. The
+            # ping below gets 400 -32020 from a 2026-07-28 server (no headers).
+            if await self._probe_server_discover(
+                client, endpoint, headers, server_path=_health_server_path(server_info)
+            ):
+                logger.info(
+                    f"Health check succeeded at {redact_url(endpoint)} "
+                    f"(server/discover, MCP {MODERN_MCP_PROTOCOL_VERSION})"
+                )
+                return True, HealthStatus.HEALTHY
             ping_payload = '{ "jsonrpc": "2.0", "id": "0", "method": "ping" }'
 
             try:
@@ -1244,9 +1703,14 @@ class HealthMonitoringService:
                     )
 
                     if needs_update:
+                        # current_server_info was read without credentials, so a
+                        # full-card write would replace nested documents such as
+                        # egress_oauth without their secrets (client_secret_encrypted)
+                        # and wipe them. Persist only the fields discovery owns.
                         updated_server_info = current_server_info.copy()
                         updated_server_info["tool_list"] = tool_list
                         updated_server_info["num_tools"] = new_tool_count
+                        discovered_fields = ["tool_list", "num_tools"]
 
                         # Store MCP server info if available
                         if mcp_server_info:
@@ -1260,14 +1724,24 @@ class HealthMonitoringService:
                                     updated_server_info["mcp_server_version_updated_at"] = (
                                         datetime.now(UTC).isoformat()
                                     )
+                                    discovered_fields += [
+                                        "mcp_server_version_previous",
+                                        "mcp_server_version_updated_at",
+                                    ]
                                 updated_server_info["mcp_server_version"] = new_ver
+                                discovered_fields.append("mcp_server_version")
                                 logger.info(
                                     f"Storing MCP server version for {service_path}: {new_ver}"
                                 )
                             if mcp_server_info.get("name"):
                                 updated_server_info["mcp_server_name"] = mcp_server_info["name"]
+                                discovered_fields.append("mcp_server_name")
 
-                        await server_service.update_server(service_path, updated_server_info)
+                        await server_service.update_server(
+                            service_path,
+                            updated_server_info,
+                            updated_fields=discovered_fields,
+                        )
 
                         # Update scopes with newly discovered tools
                         try:
@@ -1313,7 +1787,7 @@ class HealthMonitoringService:
 
         from ..services.server_service import server_service
 
-        server_info = await server_service.get_server_info(service_path)
+        server_info = await server_service.get_server_info(service_path, include_credentials=True)
         if not server_info:
             return "error: server not registered", None
 
@@ -1329,9 +1803,20 @@ class HealthMonitoringService:
 
         proxy_pass_url = server_info.get("proxy_pass_url")
 
+        # Resolve+cache an OAuth2 client_credentials bearer (no-op unless
+        # auth_scheme == 'oauth') for the probe and any triggered tool fetch.
+        server_info = await _with_backend_oauth(server_info)
+
         # Record check time
         last_checked_time = datetime.now(UTC)
         self.server_last_check_time[service_path] = last_checked_time
+
+        # Same gate as the periodic loop. This is the path the UI's refresh calls, so
+        # omitting it here left the card reporting "Healthy, 45 tools" while the loop
+        # had already recorded the server as unhealthy -- the operator sees this one.
+        if _discovery_identity_unconnected(server_info):
+            self.server_health_status[service_path] = DISCOVERY_IDENTITY_UNCONNECTED
+            return DISCOVERY_IDENTITY_UNCONNECTED, last_checked_time
 
         if not proxy_pass_url:
             current_status = "error: missing proxy URL"

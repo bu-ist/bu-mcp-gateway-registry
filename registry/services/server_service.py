@@ -1,15 +1,18 @@
 import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from ..core.metrics import ASSET_ID_CONFLICT_TOTAL
 from ..exceptions import AssetIdConflictError
 from ..repositories.factory import get_server_repository
 from ..repositories.interfaces import ServerRepositoryBase
+from ..schemas.security import ToolOverride
 from ..utils.credential_encryption import (
     _migrate_auth_type_to_auth_scheme,
     strip_credentials_from_dict,
 )
+from ..utils.path_utils import make_version_id
 from ..utils.url_guard import (
     proxy_profile_for_entity_target,
     validate_proxy_pass_url,
@@ -18,6 +21,10 @@ from ..utils.url_guard import (
 )
 
 logger = logging.getLogger(__name__)
+
+# MCP 2026-07-28 deprecates HTTP+SSE with a twelve-month window, so the gateway
+# keeps routing it until at least this date.
+SSE_TRANSPORT_REMOVAL_EARLIEST: str = "2027-07-28"
 
 
 def _validate_endpoint_fields(
@@ -46,6 +53,27 @@ def _validate_endpoint_fields(
             reject_nginx_metacharacters=True,
             resolve=False,
         )
+
+
+def _warn_if_sse_only(
+    server_info: dict[str, Any],
+) -> None:
+    """Log a warning for a server registered with only the HTTP+SSE transport.
+
+    MCP 2026-07-28 deprecates HTTP+SSE. The gateway still routes it; this gives
+    operators notice before support is removed (no earlier than
+    SSE_TRANSPORT_REMOVAL_EARLIEST).
+    """
+    transports = server_info.get("supported_transports") or []
+    if list(transports) != ["sse"]:
+        return
+    logger.warning(
+        "Server %s registers only the deprecated HTTP+SSE transport. MCP 2026-07-28 "
+        "deprecates it; gateway support may be removed no earlier than %s. Move the "
+        "server to streamable-http.",
+        server_info.get("path"),
+        SSE_TRANSPORT_REMOVAL_EARLIEST,
+    )
 
 
 class ServerService:
@@ -104,6 +132,7 @@ class ServerService:
         """
         path = server_info.get("path")
         new_version = server_info.get("version")
+        _warn_if_sse_only(server_info)
 
         # Fail-closed URL validation on every registration path (dashboard/API,
         # internal register, CLI, federation import) before anything is
@@ -143,6 +172,7 @@ class ServerService:
                         path=path,
                         version=new_version,
                         proxy_pass_url=server_info.get("proxy_pass_url"),
+                        mcp_endpoint=server_info.get("mcp_endpoint"),
                         status=server_info.get("status", "stable"),
                         is_default=False,
                     )
@@ -231,14 +261,38 @@ class ServerService:
             "is_new_version": False,
         }
 
-    async def update_server(self, path: str, server_info: dict[str, Any]) -> bool:
+    async def update_server(
+        self,
+        path: str,
+        server_info: dict[str, Any],
+        *,
+        updated_fields: list[str] | None = None,
+        expected_updated_at: str | None = None,
+    ) -> bool:
         """Update an existing server.
+
+        Args:
+            updated_fields: When given, only these fields (plus
+                ``updated_at``) are persisted; concurrent writes to other
+                fields survive. None writes every field.
+            expected_updated_at: When given, the update only lands if the
+                stored ``updated_at`` still equals this value, enforced
+                atomically in the repository write.
 
         Raises:
             UrlValidationError: If the update sets a proxy_pass_url that fails
                 SSRF/scheme validation. Validation only runs when the update
                 payload actually carries a proxy_pass_url, so health-status and
                 tool-list updates are unaffected.
+
+        Note:
+            Every branch below that writes into ``server_info`` MUST also extend
+            ``updated_fields`` when it is not None. A field-scoped write persists
+            only the named fields, so an unnamed mutation is silently discarded
+            -- which is how a re-pinned proxy target once kept its stale IPs and
+            a repointed server once kept the previous host's credential. Prefer a
+            helper that returns the names it wrote (see
+            ``clear_upstream_headers_on_repoint``) over restating them here.
         """
         # Validate the merged target state whenever a target-bearing field is
         # edited. This prevents an existing built-in registration from lending
@@ -285,6 +339,13 @@ class ServerService:
                     server_info["proxy_target_host"] = pin["proxy_target_host"]
                 # Re-enabling clears any prior refresh auto-disable.
                 server_info["proxy_disabled_reason"] = None
+                if updated_fields is not None:
+                    updated_fields = [
+                        *updated_fields,
+                        "proxy_resolved_ips",
+                        "proxy_target_host",
+                        "proxy_disabled_reason",
+                    ]
             # Credential-misdirection guard: an MCP server's effective target is
             # proxy_target_url OR (fallback) proxy_pass_url. Use effective_proxy_target
             # (NOT resolve_proxy_target) so the comparison is routability-agnostic:
@@ -293,13 +354,20 @@ class ServerService:
             # and skip the clear, letting a repoint-before-enable carry the old
             # host's secret to a new host. effective_proxy_target omits that gate,
             # so a host change is caught even while the server is disabled.
-            clear_upstream_headers_on_repoint(
+            cleared = clear_upstream_headers_on_repoint(
                 server_info,
                 existing_target=effective_proxy_target("mcp_server", dict(existing or {})),
                 new_target=effective_proxy_target("mcp_server", merged),
             )
+            if updated_fields is not None and cleared:
+                updated_fields = [*updated_fields, *cleared]
 
-        result = await self._repo.update(path, server_info)
+        result = await self._repo.update(
+            path,
+            server_info,
+            updated_fields=updated_fields,
+            expected_updated_at=expected_updated_at,
+        )
 
         if result:
             # Update search index
@@ -327,6 +395,149 @@ class ServerService:
             nginx_reload_scheduler.mark_dirty()
 
         return result
+
+    @staticmethod
+    def is_safe_override_key(tool_name: str) -> bool:
+        """Whether a tool name can be used as a Mongo field key.
+
+        Tool names become keys under ``tool_overrides``. A name containing
+        "." would be read by $set as a nested path (creating {"a": {"b": ...}}
+        instead of the key "a.b"), so the read side would never find it and
+        the block would silently fail open. A leading "$" is rejected by the
+        server outright.
+        """
+        return bool(tool_name) and "." not in tool_name and not tool_name.startswith("$")
+
+    async def set_tool_blocked(
+        self,
+        path: str,
+        tool_name: str,
+        blocked: bool,
+        *,
+        source: str = "admin",
+        reason: str | None = None,
+        updated_by: str | None = None,
+    ) -> bool:
+        """Block or unblock a single tool on a server.
+
+        Callers must validate tool_name against the server's tool_list before
+        calling; this only guards the Mongo-key constraint.
+
+        Returns:
+            True if the server was found and updated.
+        """
+        if not self.is_safe_override_key(tool_name):
+            logger.warning(
+                f"Refusing to set override for unusable tool key: "
+                f"server='{path}' tool='{tool_name}'"
+            )
+            return False
+
+        override = ToolOverride(
+            blocked=blocked,
+            source=source,
+            reason=reason,
+            updated_at=datetime.now(UTC).isoformat(),
+            updated_by=updated_by or "system",
+        ).model_dump()
+        # No cache to invalidate: the proxy reads block state fresh on every
+        # tools/call, so the change takes effect on the next request.
+        return await self._repo.set_tool_override(path, tool_name, override)
+
+    # Severities that trigger an automatic block. Scanner emits uppercase
+    # (e.g. "SAFE", "HIGH"), so compare case-insensitively.
+    _AUTO_BLOCK_SEVERITIES = frozenset({"critical", "high"})
+
+    @classmethod
+    def _extract_unsafe_tools(cls, raw_output: dict[str, Any]) -> dict[str, str]:
+        """Map tool_name -> reason for tools a scan flagged CRITICAL/HIGH.
+
+        raw_output["tool_results"] is a LIST of per-tool entries, each with a
+        "findings" map keyed by analyzer; a tool is unsafe if ANY analyzer
+        reports critical/high. Tool names unusable as Mongo keys are skipped
+        with a warning rather than written somewhere the read side can't see.
+        """
+        unsafe: dict[str, str] = {}
+        tool_results = raw_output.get("tool_results") or []
+        if not isinstance(tool_results, list):
+            return unsafe
+
+        for entry in tool_results:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("item_type") not in (None, "tool"):
+                continue
+            tool_name = entry.get("tool_name")
+            if not tool_name or not isinstance(tool_name, str):
+                continue
+
+            findings = entry.get("findings") or {}
+            if not isinstance(findings, dict):
+                continue
+
+            for analyzer_name, analyzer_findings in findings.items():
+                if not isinstance(analyzer_findings, dict):
+                    continue
+                severity = str(analyzer_findings.get("severity", "")).lower()
+                if severity not in cls._AUTO_BLOCK_SEVERITIES:
+                    continue
+                if not cls.is_safe_override_key(tool_name):
+                    logger.warning(
+                        f"Scan flagged '{tool_name}' as {severity.upper()} but the name "
+                        f"cannot be used as an override key; NOT auto-blocking"
+                    )
+                    break
+                threats = analyzer_findings.get("threat_names") or []
+                threat_label = ",".join(str(t) for t in threats) if threats else analyzer_name
+                unsafe[tool_name] = f"{severity.upper()}:{threat_label}"
+                break  # one finding is enough to block this tool
+
+        return unsafe
+
+    async def reconcile_security_blocks(
+        self,
+        path: str,
+        raw_output: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Recompute a server's tool_overrides after a scan.
+
+        Rules:
+          - Admin decisions always win and are never touched. This includes an
+            admin *unblock* of a previously auto-blocked tool: if it were not
+            preserved, the next rescan would silently re-block it and the admin
+            toggle would be meaningless.
+          - source="security_scan" entries are rebuilt from this scan only, so
+            a tool that is no longer flagged has its auto-block cleared.
+
+        Returns the new overrides map (also written to the repository).
+        """
+        existing = await self._repo.get_tool_overrides(path)
+        unsafe = self._extract_unsafe_tools(raw_output)
+
+        new_overrides: dict[str, Any] = {}
+
+        # 1. Carry over every admin decision untouched.
+        for tool_name, entry in existing.items():
+            if isinstance(entry, dict) and entry.get("source") == "admin":
+                new_overrides[tool_name] = entry
+
+        # 2. Auto-block currently-flagged tools that have no admin decision.
+        now = datetime.now(UTC).isoformat()
+        for tool_name, reason in unsafe.items():
+            if tool_name in new_overrides:
+                continue  # admin already decided; leave it alone
+            new_overrides[tool_name] = ToolOverride(
+                blocked=True,
+                source="security_scan",
+                reason=reason,
+                updated_at=now,
+                updated_by="system",
+            ).model_dump()
+
+        # Anything previously auto-blocked but no longer flagged simply is not
+        # carried forward, which clears the block.
+        await self._repo.replace_tool_overrides(path, new_overrides)
+        return new_overrides
 
     async def get_server_info(
         self,
@@ -723,6 +934,20 @@ class ServerService:
         )
         return server_info["num_stars"]
 
+    async def remove_server_fields(self, path: str, fields: list[str]) -> None:
+        """Actually DELETE fields from a server document.
+
+        ``update_server`` issues ``{"$set": doc}`` -- a partial merge -- so popping a
+        key from the in-memory dict only omits it from ``$set`` and leaves the stored
+        value in place. That is deliberate for the merge semantics other callers rely
+        on, but it means "clear this credential" cannot be expressed by popping: the
+        ciphertext survives, and switching the scheme back later silently reactivates
+        it. Use this when a field must genuinely go, and note it is a SEPARATE write
+        from the ``update_server`` that reshaped the rest of the record.
+        """
+        for field in fields:
+            await self._repo.update_field(path, field, None)
+
     async def remove_server(self, path: str) -> bool:
         """Remove a server and all its version documents from the registry.
 
@@ -740,6 +965,12 @@ class ServerService:
         """
         from .search_index_cleanup import remove_from_search_index_with_retry
 
+        # Read the designation BEFORE anything is deleted. It is the only record of which
+        # vault address holds the borrowed token, and it dies with the server document.
+        # Needs include_credentials so the oauth_discovery block is present at all.
+        existing = await self.get_server_info(path, include_credentials=True)
+        prior_disc = (existing or {}).get("oauth_discovery") or {}
+
         if not await remove_from_search_index_with_retry(
             self._search_repo,
             path,
@@ -752,6 +983,23 @@ class ServerService:
             return False
 
         deleted_count = await self._repo.delete_with_versions(path)
+        if deleted_count > 0:
+            # Drop the in-process backend-OAuth bearer and its single-flight lock.
+            # Nothing else prunes them, so without this a deleted server's live access
+            # token stays resident in memory until the process restarts.
+            from registry.core.backend_oauth import invalidate as invalidate_backend_oauth
+
+            invalidate_backend_oauth(path)
+            # Revoke the delegated credential a discovery designation was borrowing.
+            # This lives here rather than in the delete ROUTES because eight call sites
+            # reach this method -- two API routes plus six federation/reconciliation
+            # paths -- and the residue is not a recoverable orphan: discovery entries are
+            # deliberately absent from the consenting user's Connected Accounts, and the
+            # designation that named the address is gone with the document, so nothing
+            # can find it afterwards.
+            from .discovery_credential import revoke_discovery_credential
+
+            await revoke_discovery_credential(path, prior_disc)
         return deleted_count > 0
 
     async def add_server_version(
@@ -761,6 +1009,7 @@ class ServerService:
         proxy_pass_url: str,
         status: str = "stable",
         is_default: bool = False,
+        mcp_endpoint: str | None = None,
     ) -> bool:
         """
         Add a new version to an existing server.
@@ -804,7 +1053,7 @@ class ServerService:
             await self._repo.update(path, active_server)
 
         # Check if version already exists
-        new_version_id = f"{path}:{version}"
+        new_version_id = make_version_id(path, version)
         existing_inactive = await self._repo.get(new_version_id)
         if existing_inactive:
             raise ValueError(f"Version {version} already exists for server {path}")
@@ -819,6 +1068,7 @@ class ServerService:
             "server_name": active_server.get("server_name"),
             "version": version,
             "proxy_pass_url": proxy_pass_url,
+            "mcp_endpoint": mcp_endpoint,
             "status": status,
             "is_active": False,
             "version_group": version_group,
@@ -881,7 +1131,7 @@ class ServerService:
             raise ValueError(f"Server {path} has no versions to remove")
 
         # Find and remove the inactive version document
-        version_id = f"{path}:{version}"
+        version_id = make_version_id(path, version)
         inactive_version = await self._repo.get(version_id)
         if not inactive_version:
             raise ValueError(f"Version {version} not found for server {path}")
@@ -943,7 +1193,7 @@ class ServerService:
             raise ValueError(f"Server {path} has no other versions configured")
 
         # Find target inactive version
-        target_version_id = f"{path}:{version}"
+        target_version_id = make_version_id(path, version)
         target_inactive = await self._repo.get(target_version_id)
         if not target_inactive:
             # List available versions

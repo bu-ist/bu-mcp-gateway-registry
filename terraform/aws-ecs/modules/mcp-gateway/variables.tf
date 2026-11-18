@@ -41,19 +41,19 @@ variable "task_execution_role_arn" {
 variable "registry_image_uri" {
   description = "Container image URI for registry service (defaults to pre-built image from public ECR)"
   type        = string
-  default     = "public.ecr.aws/p3v1o3c6/registry:1.29.0"
+  default     = "public.ecr.aws/p3v1o3c6/registry:1.37.0"
 }
 
 variable "auth_server_image_uri" {
   description = "Container image URI for auth server service (defaults to pre-built image from public ECR)"
   type        = string
-  default     = "public.ecr.aws/p3v1o3c6/auth-server:1.29.0"
+  default     = "public.ecr.aws/p3v1o3c6/auth-server:1.37.0"
 }
 
 variable "mcpgw_image_uri" {
   description = "Container image URI for mcpgw service (defaults to pre-built image from public ECR)"
   type        = string
-  default     = "public.ecr.aws/p3v1o3c6/mcpgw:1.29.0"
+  default     = "public.ecr.aws/p3v1o3c6/mcpgw:1.37.0"
 }
 
 variable "enable_demo_servers" {
@@ -395,6 +395,50 @@ variable "embeddings_response_format" {
   default     = ""
 }
 
+variable "embeddings_request_timeout_seconds" {
+  description = "Timeout in seconds for each remote embeddings request (litellm provider only)."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.embeddings_request_timeout_seconds >= 1 && var.embeddings_request_timeout_seconds <= 600
+    error_message = "embeddings_request_timeout_seconds must be between 1 and 600."
+  }
+}
+
+variable "embeddings_max_retries" {
+  description = "Retries for transient remote embeddings failures (HTTP 429, 5xx, connection errors)."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.embeddings_max_retries >= 0 && var.embeddings_max_retries <= 10
+    error_message = "embeddings_max_retries must be between 0 and 10."
+  }
+}
+
+variable "embeddings_retry_max_input_chars" {
+  description = "Trim target in characters for the one retry after a failed embedding call. null uses the per-model default (2048 for Cohere on Amazon Bedrock, 28000 otherwise)."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.embeddings_retry_max_input_chars == null ? true : (var.embeddings_retry_max_input_chars >= 256 && var.embeddings_retry_max_input_chars <= 200000)
+    error_message = "embeddings_retry_max_input_chars must be null or between 256 and 200000."
+  }
+}
+
+variable "embeddings_extra_headers" {
+  description = "Extra HTTP headers sent on every embeddings request (litellm provider only), as a map of header name to value. Expanded into the EMBEDDINGS_EXTRA_HEADER_1..5 env vars. Stored in clear text: never put a credential here."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = length(var.embeddings_extra_headers) <= 5
+    error_message = "embeddings_extra_headers supports at most 5 entries (EMBEDDINGS_EXTRA_HEADER_1..5)."
+  }
+}
+
 
 # Registration Deduplication. Advisory only; reuses the embeddings
 # model above. The /api/<entity>/check-duplicates endpoints are always
@@ -407,12 +451,12 @@ variable "dedup_registration_hint_enabled" {
 }
 
 variable "dedup_score_threshold" {
-  description = "Minimum similarity score (0.0..1.0) for an advisory match. Default 0.7."
+  description = "Minimum cosine similarity (0.0..1.0) for an advisory duplicate match. Leave null to use the default calibrated for the configured embeddings model: 0.45 for all-MiniLM-L6-v2, 0.85 for openai/text-embedding-ada-002, 0.6 for anything else. Cosine scales are model-specific, so a number tuned for one model is noise on another. Set a value only to override the per-model default."
   type        = number
-  default     = 0.7
+  default     = null
   validation {
-    condition     = var.dedup_score_threshold >= 0.0 && var.dedup_score_threshold <= 1.0
-    error_message = "dedup_score_threshold must be between 0.0 and 1.0."
+    condition     = coalesce(var.dedup_score_threshold, 0.0) >= 0.0 && coalesce(var.dedup_score_threshold, 0.0) <= 1.0
+    error_message = "dedup_score_threshold must be null or between 0.0 and 1.0."
   }
 }
 
@@ -448,6 +492,23 @@ variable "session_cookie_domain" {
   description = "Domain for session cookies (e.g., '.example.com' for cross-subdomain sharing). Leave empty for single-domain deployments (cookie scoped to exact host only)."
   type        = string
   default     = ""
+}
+
+variable "session_cookie_host_prefix" {
+  description = "Name the session cookie __Host-<name> (Secure, Path=/, no Domain). Requires session_cookie_secure = true and an empty session_cookie_domain."
+  type        = bool
+  default     = false
+}
+
+variable "session_max_age_seconds" {
+  description = "Browser session lifetime in seconds: the auth server's session store TTL, the session cookie's Max-Age, and the registry's cookie signature max age. Rendered into both the registry and auth-server task definitions so the two always match."
+  type        = number
+  default     = 28800
+
+  validation {
+    condition     = var.session_max_age_seconds > 0 && floor(var.session_max_age_seconds) == var.session_max_age_seconds
+    error_message = "session_max_age_seconds must be a positive whole number of seconds (for example 28800 for 8 hours); the registry and auth-server refuse to start on 0 or a negative value."
+  }
 }
 
 variable "oauth2_allowed_redirect_uris" {
@@ -486,6 +547,14 @@ variable "bind_host" {
   default     = "0.0.0.0"
 }
 
+# Debug only: log the raw user search query at INFO. Queries can carry PII, so
+# this defaults to false and both the registry and mcpgw warn at startup when on.
+variable "search_log_query_text" {
+  description = "Log the raw user search query at INFO in the registry and mcpgw (debug only)"
+  type        = bool
+  default     = false
+}
+
 # Security Scanning Configuration
 variable "security_scan_enabled" {
   description = "Enable/disable security scanning for MCP servers during registration"
@@ -501,6 +570,18 @@ variable "security_scan_on_registration" {
 
 variable "security_block_unsafe_servers" {
   description = "Block (disable) servers that fail security scans"
+  type        = bool
+  default     = true
+}
+
+variable "security_allow_unsafe_servers" {
+  description = "Keep a server that fails its scan enabled with only its HIGH/CRITICAL tools blocked. Requires security_block_unsafe_servers=true"
+  type        = bool
+  default     = false
+}
+
+variable "security_block_on_scan_failure" {
+  description = "Treat a scan that could not complete as unsafe (servers, agents and skills). Set false to keep an unassessed asset enabled and tagged security-pending, e.g. for endpoints that cannot be scanned anonymously"
   type        = bool
   default     = true
 }
@@ -672,6 +753,15 @@ variable "registry_rum_allowed_hosts" {
   default     = ""
 }
 
+# Base64 .tar.gz of the UI branding folder, rendered as UI_BRANDING_ARCHIVE_B64
+# on the registry container only. Validated (format and 48 KiB cap) at the root
+# module; see terraform/aws-ecs/variables.tf.
+variable "ui_branding_archive_b64" {
+  description = "Optional base64-encoded .tar.gz of the UI branding folder, extracted into /app/branding by the registry at startup. Empty disables it."
+  type        = string
+  default     = ""
+}
+
 # =============================================================================
 # CLOUDFRONT CONFIGURATION (CloudFront HTTPS Support feature)
 # =============================================================================
@@ -741,6 +831,35 @@ variable "entra_graph_base_url" {
   description = "Microsoft Graph base URL override. Leave empty on standard deployments — auto-inferred from entra_login_base_url."
   type        = string
   default     = ""
+}
+
+variable "entra_graph_resource_url" {
+  description = "Native Microsoft Graph OAuth resource URL. Leave empty for known Entra clouds; set to the official Graph resource for the target cloud when entra_login_base_url uses a custom proxy. This is not the Graph fetch proxy URL."
+  type        = string
+  default     = ""
+}
+
+variable "entra_browser_user_read_enabled" {
+  description = "Request Microsoft Graph User.Read on Entra browser login. Graph lookup also requires entra_group_recovery_enabled."
+  type        = bool
+  default     = false
+}
+
+variable "entra_group_recovery_enabled" {
+  description = "Enable Microsoft Graph recovery for Entra group overage (eligible bearer tokens and browser sessions consented to User.Read)."
+  type        = bool
+  default     = true
+}
+
+variable "entra_group_cache_ttl_seconds" {
+  description = "Positive Microsoft Graph group-result cache lifetime in seconds."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.entra_group_cache_ttl_seconds >= 30 && var.entra_group_cache_ttl_seconds <= 3600 && floor(var.entra_group_cache_ttl_seconds) == var.entra_group_cache_ttl_seconds
+    error_message = "entra_group_cache_ttl_seconds must be a whole number between 30 and 3600."
+  }
 }
 
 variable "entra_scope_format" {
@@ -1619,7 +1738,61 @@ variable "ssrf_allowed_hosts" {
 }
 
 variable "ssrf_allowed_cidrs" {
-  description = "Comma-separated CIDR ranges the SSRF guard accepts for MCP-server / A2A-agent upstreams even though they are private (e.g. an internal service subnet). The cloud metadata address 169.254.169.254 is never permitted."
+  description = "Comma-separated CIDR ranges the SSRF guard accepts for MCP-server / A2A-agent upstreams even though they are private (e.g. an internal service subnet). A listed range also admits the reserved IPv4 addresses it contains (e.g. Istio ServiceEntry VIPs in 240.240.0.0/16), in the registry, the auth-server generic proxy and mcpgw. Cloud metadata/credential, link-local, unspecified and multicast addresses are never permitted."
+  type        = string
+  default     = ""
+}
+
+variable "egress_forward_proxy_enabled" {
+  description = "Route SSRF-guarded egress through the forward proxy named in HTTPS_PROXY / HTTP_PROXY, for targets that resolve exclusively to public addresses. Needed where the tasks have no direct internet egress. Internal targets stay direct and IP-pinned. Relaxes DNS-rebinding protection for public destinations only, so it is opt-in. See docs/forward-proxy-egress.md."
+  type        = bool
+  default     = false
+}
+
+variable "egress_forward_proxy_ca_bundle" {
+  description = "Path INSIDE the container to a PEM CA bundle the SSRF-guarded egress clients trust in addition to the default roots, for a forward proxy that terminates TLS and re-signs with an internal CA. Bake the bundle into the image or mount it from EFS; this variable only names the path. A missing or malformed file fails the task at startup."
+  type        = string
+  default     = ""
+}
+
+variable "cimd_publisher_enabled" {
+  description = "Serve the registry's CIMD at GET /oauth/client-metadata.json (describes the registry as an OAuth client for external CIMD-aware IdPs). Default off; 404 when off."
+  type        = bool
+  default     = false
+}
+
+variable "cimd_cache_ttl" {
+  description = "Public Cache-Control max-age (seconds) for the CIMD document."
+  type        = number
+  default     = 3600
+}
+
+variable "cimd_client_name" {
+  description = "Human-readable client_name in the CIMD document."
+  type        = string
+  default     = "AI Registry Tools"
+}
+
+variable "cimd_redirect_uris" {
+  description = "CSV of allowed callback redirect URIs; default {EGRESS_OAUTH_CALLBACK_BASE_URL or REGISTRY_URL}/oauth2/egress/callback."
+  type        = string
+  default     = ""
+}
+
+variable "cimd_scope" {
+  description = "Space-separated OAuth scopes the client requests; default the advertised OIDC scopes."
+  type        = string
+  default     = ""
+}
+
+variable "cimd_logo_uri" {
+  description = "Optional logo URI in the CIMD document; omitted when empty."
+  type        = string
+  default     = ""
+}
+
+variable "cimd_contacts" {
+  description = "CSV of operator contact emails; optional; omitted when empty."
   type        = string
   default     = ""
 }
@@ -1824,9 +1997,10 @@ variable "registry_extra_env" {
         "GATEWAY_GENERIC_CLIENT_MAX_BODY_SIZE",
         "GATEWAY_PROXY_PREFIX",
         "GATEWAY_GENERIC_STREAM_READ_TIMEOUT_SECONDS",
+        "SSRF_ALLOWED_CIDRS",
       ], upper(trimspace(entry.name)))
     ])
-    error_message = "registry_extra_env must not override Terraform-managed generic-proxy variables."
+    error_message = "registry_extra_env must not override Terraform-managed generic-proxy variables or SSRF_ALLOWED_CIDRS."
   }
 }
 
@@ -1851,17 +2025,27 @@ variable "auth_server_extra_env" {
         "GATEWAY_GENERIC_STREAM_MAX_DURATION_SECONDS",
         "GATEWAY_GENERIC_STREAM_MAX_BYTES",
         "AWS_EC2_METADATA_DISABLED",
+        "SSRF_ALLOWED_CIDRS",
       ], upper(trimspace(entry.name)))
     ])
-    error_message = "auth_server_extra_env must not override Terraform-managed generic-proxy or metadata-hardening variables; use the canonical variables instead."
+    error_message = "auth_server_extra_env must not override Terraform-managed generic-proxy, metadata-hardening or SSRF_ALLOWED_CIDRS variables; use the canonical variables instead."
   }
 }
 
 variable "mcpgw_extra_env" {
-  description = "Extra environment variables for mcpgw service. List of objects with 'name' and 'value' string fields. Reserved-name validation is performed at the root module."
+  description = "Extra environment variables for mcpgw service. List of objects with 'name' and 'value' string fields. Comprehensive reserved-name validation is performed at the root module; the SSRF guard's SSRF_ALLOWED_CIDRS is also refused here so a direct module caller cannot override it."
   type        = list(object({ name = string, value = string }))
   default     = []
   sensitive   = true
+
+  validation {
+    condition = alltrue([
+      for entry in var.mcpgw_extra_env : !contains([
+        "SSRF_ALLOWED_CIDRS",
+      ], upper(trimspace(entry.name)))
+    ])
+    error_message = "mcpgw_extra_env must not override SSRF_ALLOWED_CIDRS; use the ssrf_allowed_cidrs variable instead."
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -1902,6 +2086,30 @@ variable "egress_state_ttl_seconds" {
   default     = 600
 }
 
+variable "egress_http_pool_max_connections" {
+  description = "Max total connections per egress httpx client pool (shared by url_guard)."
+  type        = number
+  default     = 100
+}
+
+variable "egress_http_pool_max_keepalive" {
+  description = "Max idle keepalive connections kept warm per egress httpx client pool."
+  type        = number
+  default     = 20
+}
+
+variable "egress_http_pool_keepalive_expiry_seconds" {
+  description = "Seconds an idle keepalive egress connection survives; keep below the shortest upstream/LB idle timeout."
+  type        = number
+  default     = 30
+}
+
+variable "egress_http_pool_connect_retries" {
+  description = "Connection-establishment retries for egress httpx clients on failure."
+  type        = number
+  default     = 1
+}
+
 variable "egress_obo_allowed_audiences" {
   description = <<-EOT
     Optional allowlist (whitespace-separated) for obo_exchange target_audience
@@ -1912,6 +2120,29 @@ variable "egress_obo_allowed_audiences" {
   EOT
   type        = string
   default     = ""
+}
+
+variable "egress_obo_cache_enabled" {
+  description = <<-EOT
+    Opt-in: cache exchanged OBO tokens in the per-user SecretStore so repeated
+    calls by the same principal to the same audience reuse a still-valid token
+    instead of re-exchanging. Default off preserves the stateless per-request
+    exchange.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "egress_obo_cache_max_ttl_seconds" {
+  description = "Hard cap (seconds) on the OBO cache reuse window, applied below the token's real expiry. Bounds revocation/conditional-access re-evaluation latency on cache hits."
+  type        = number
+  default     = 300
+}
+
+variable "egress_obo_cache_expiry_skew_seconds" {
+  description = "Never reuse a cached OBO token within this many seconds of its expiry. Must be < EGRESS_OBO_CACHE_MAX_TTL_SECONDS."
+  type        = number
+  default     = 30
 }
 
 variable "egress_oauth_trusted_idp_hosts" {
@@ -1938,10 +2169,15 @@ variable "egress_registry_internal_url" {
 }
 
 variable "egress_nginx_marker_secret" {
-  description = "Optional override for the nginx marker secret shared by registry + auth-server. Empty auto-generates a strong value (stored in Secrets Manager). The marker is required unconditionally -- both services refuse to start without it."
+  description = "Optional override for the nginx marker secret shared by registry + auth-server. Empty auto-generates a strong value (stored in Secrets Manager). The marker is required unconditionally; both services refuse to start without it. It must contain only printable ASCII characters other than '$' (no spaces), because the registry renders it into the nginx config and nginx sends it as a header."
   type        = string
   default     = ""
   sensitive   = true
+
+  validation {
+    condition     = var.egress_nginx_marker_secret == "" || can(regex("^[!-#%-~]+$", var.egress_nginx_marker_secret))
+    error_message = "egress_nginx_marker_secret must contain only printable ASCII characters other than '$' (no spaces): the registry renders it into the nginx config and nginx sends it as a header."
+  }
 }
 
 variable "egress_secrets_manager_kms_key_id" {
@@ -1957,7 +2193,7 @@ variable "egress_secrets_manager_path_prefix" {
 }
 
 variable "egress_credential_encryption_key" {
-  description = "Optional AES-256-GCM key (registry-only) used to encrypt per-user egress credentials at rest before they reach Secrets Manager / OpenBao. Empty disables encryption (legacy plaintext); existing deployments keep working unchanged. Never auto-generated."
+  description = "Optional AES-256-GCM key used to encrypt per-user egress credentials at rest before they reach Secrets Manager / OpenBao. Injected into the registry task, and also into the auth-server task when egress_obo_cache_enabled is true (encrypts cached OBO tokens). Empty disables encryption (legacy plaintext); existing deployments keep working unchanged. Never auto-generated."
   type        = string
   default     = ""
   sensitive   = true

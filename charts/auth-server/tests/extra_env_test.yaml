@@ -58,8 +58,11 @@ tests:
       #   env[12] = AWS_EC2_METADATA_DISABLED (chart-managed security constant)
       #   env[13..23] = the eleven unconditional GATEWAY_/GENERIC_PROXY_
       #                 generic-proxy vars (auth-server-consumed)
-      #   env[24] = MY_FLAG       (extraEnv[0])
-      #   env[25] = MY_SECRET_VAR (extraEnv[1])
+      #   env[24] = EGRESS_FORWARD_PROXY_ENABLED   (issue #1832)
+      #   env[25] = EGRESS_FORWARD_PROXY_CA_BUNDLE (issue #1832)
+      #   env[26] = SSRF_ALLOWED_CIDRS (issue #2018, always rendered)
+      #   env[27] = MY_FLAG       (extraEnv[0])
+      #   env[28] = MY_SECRET_VAR (extraEnv[1])
       - equal:
           path: spec.template.spec.containers[0].env[0].name
           value: ENTRA_CLIENT_SECRET
@@ -84,12 +87,157 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].env[23].name
           value: GATEWAY_GENERIC_STREAM_MAX_BYTES
+      # Forward-proxy egress pair (issue #1832), always rendered, then
+      # SSRF_ALLOWED_CIDRS (issue #2018) immediately before the extraEnv append.
       - equal:
           path: spec.template.spec.containers[0].env[24].name
-          value: MY_FLAG
+          value: EGRESS_FORWARD_PROXY_ENABLED
       - equal:
           path: spec.template.spec.containers[0].env[25].name
+          value: EGRESS_FORWARD_PROXY_CA_BUNDLE
+      - equal:
+          path: spec.template.spec.containers[0].env[26].name
+          value: SSRF_ALLOWED_CIDRS
+      - equal:
+          path: spec.template.spec.containers[0].env[27].name
+          value: MY_FLAG
+      - equal:
+          path: spec.template.spec.containers[0].env[28].name
           value: MY_SECRET_VAR
+
+  - it: enables Entra overage recovery with a 300-second positive cache by default
+    set:
+      authProvider:
+        type: entra
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENTRA_BROWSER_USER_READ_ENABLED
+            value: "false"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENTRA_GROUP_RECOVERY_ENABLED
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENTRA_GROUP_CACHE_TTL_SECONDS
+            value: "300"
+
+  - it: requests User.Read with independent group recovery disabled
+    set:
+      authProvider:
+        type: entra
+      entra:
+        browserUserReadEnabled: true
+        groupRecoveryEnabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENTRA_BROWSER_USER_READ_ENABLED
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENTRA_GROUP_RECOVERY_ENABLED
+            value: "false"
+
+  - it: permits disabling Entra recovery and setting the minimum cache TTL
+    set:
+      authProvider:
+        type: entra
+      entra:
+        groupRecoveryEnabled: false
+        groupCacheTtlSeconds: 30
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENTRA_GROUP_RECOVERY_ENABLED
+            value: "false"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENTRA_GROUP_CACHE_TTL_SECONDS
+            value: "30"
+
+  - it: permits the maximum positive cache TTL
+    set:
+      authProvider:
+        type: entra
+      entra:
+        groupCacheTtlSeconds: 3600
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENTRA_GROUP_CACHE_TTL_SECONDS
+            value: "3600"
+
+  - it: rejects a cache TTL below 30 seconds
+    set:
+      authProvider:
+        type: entra
+      entra:
+        groupCacheTtlSeconds: 29
+    asserts:
+      - failedTemplate:
+          errorPattern: "groupCacheTtlSeconds must be a whole number between 30 and 3600"
+
+  - it: rejects a cache TTL above 3600 seconds
+    set:
+      authProvider:
+        type: entra
+      entra:
+        groupCacheTtlSeconds: 3601
+    asserts:
+      - failedTemplate:
+          errorPattern: "groupCacheTtlSeconds must be a whole number between 30 and 3600"
+
+  - it: rejects a nonintegral cache TTL
+    set:
+      authProvider:
+        type: entra
+      entra:
+        groupCacheTtlSeconds: "30.5"
+    asserts:
+      - failedTemplate:
+          errorPattern: "groupCacheTtlSeconds must be a whole number between 30 and 3600"
+
+  - it: rejects a nonboolean group recovery switch
+    set:
+      authProvider:
+        type: entra
+      entra:
+        groupRecoveryEnabled: "false"
+    asserts:
+      - failedTemplate:
+          errorPattern: "groupRecoveryEnabled must be a boolean"
+
+  - it: rejects a nonboolean browser User.Read switch
+    set:
+      authProvider:
+        type: entra
+      entra:
+        browserUserReadEnabled: "true"
+    asserts:
+      - failedTemplate:
+          errorPattern: "browserUserReadEnabled must be a boolean"
+
+  - it: ignores unused Entra settings for a Keycloak deployment
+    set:
+      authProvider:
+        type: keycloak
+      entra:
+        groupCacheTtlSeconds: "bad"
+        groupRecoveryEnabled: "bad"
+        browserUserReadEnabled: "bad"
+    asserts:
+      - isKind:
+          of: Deployment
 
   - it: appends extraEnvFrom entries after chart-managed envFrom sources
     set:
@@ -119,6 +267,76 @@ tests:
           path: spec.template.spec.containers[0].envFrom[1].secretRef.name
           value: auth-server-secret
 
+  - it: renders SSRF_ALLOWED_CIDRS empty by default (#2018)
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SSRF_ALLOWED_CIDRS
+            value: ""
+
+  - it: global.ssrfAllowedCidrs wins over app.ssrfAllowedCidrs (#2018)
+    set:
+      global.ssrfAllowedCidrs: "240.240.0.0/16"
+      app.ssrfAllowedCidrs: "10.0.0.0/8"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SSRF_ALLOWED_CIDRS
+            value: "240.240.0.0/16"
+
+  - it: falls back to app.ssrfAllowedCidrs when global is unset (standalone, #2018)
+    set:
+      app.ssrfAllowedCidrs: "10.0.0.0/8"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SSRF_ALLOWED_CIDRS
+            value: "10.0.0.0/8"
+
+  - it: passes app.ssrfAllowedCidrs into SSRF_ALLOWED_CIDRS (#2018)
+    set:
+      app:
+        ssrfAllowedCidrs: "240.240.0.0/16"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SSRF_ALLOWED_CIDRS
+            value: "240.240.0.0/16"
+
+  - it: rejects a lowercase reserved name (ssrf_allowed_cidrs)
+    # Settings reads env case-insensitively, so a lowercase spelling would
+    # override the chart-managed SSRF_ALLOWED_CIDRS. Names compare upper-cased.
+    set:
+      extraEnv:
+        - name: ssrf_allowed_cidrs
+          value: "0.0.0.0/0"
+    asserts:
+      - failedTemplate:
+          errorPattern: "\"ssrf_allowed_cidrs\" is a reserved variable"
+
+  - it: rejects a mixed-case reserved name with surrounding spaces
+    set:
+      extraEnv:
+        - name: " Ssrf_Allowed_Cidrs "
+          value: "0.0.0.0/0"
+    asserts:
+      - failedTemplate:
+          errorPattern: "is a reserved variable"
+
+  - it: accepts names that differ only in case (HTTPS_PROXY and https_proxy)
+    set:
+      extraEnv:
+        - name: HTTPS_PROXY
+          value: "http://proxy.example.test:3128"
+        - name: https_proxy
+          value: "http://proxy.example.test:3128"
+    asserts:
+      - notFailedTemplate: {}
+
   - it: fails when extraEnv contains an env-block reserved name (ENTRA_CLIENT_SECRET)
     set:
       extraEnv:
@@ -127,6 +345,15 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "\"ENTRA_CLIENT_SECRET\" is a reserved variable"
+
+  - it: rejects ENTRA_GRAPH_RESOURCE_URL via extraEnv
+    set:
+      extraEnv:
+        - name: ENTRA_GRAPH_RESOURCE_URL
+          value: "https://graph-proxy.example.test"
+    asserts:
+      - failedTemplate:
+          errorPattern: "\"ENTRA_GRAPH_RESOURCE_URL\" is a reserved variable"
 
   - it: fails when extraEnv contains a reserved generic stream limit
     set:
@@ -236,6 +463,33 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "\"AWS_EC2_METADATA_DISABLED\" is a reserved variable"
+
+  - it: rejects ENTRA_BROWSER_USER_READ_ENABLED via extraEnv
+    set:
+      extraEnv:
+        - name: ENTRA_BROWSER_USER_READ_ENABLED
+          value: "true"
+    asserts:
+      - failedTemplate:
+          errorPattern: "\"ENTRA_BROWSER_USER_READ_ENABLED\" is a reserved variable"
+
+  - it: rejects ENTRA_GROUP_RECOVERY_ENABLED via extraEnv
+    set:
+      extraEnv:
+        - name: ENTRA_GROUP_RECOVERY_ENABLED
+          value: "false"
+    asserts:
+      - failedTemplate:
+          errorPattern: "\"ENTRA_GROUP_RECOVERY_ENABLED\" is a reserved variable"
+
+  - it: rejects ENTRA_GROUP_CACHE_TTL_SECONDS via extraEnv
+    set:
+      extraEnv:
+        - name: ENTRA_GROUP_CACHE_TTL_SECONDS
+          value: "9999"
+    asserts:
+      - failedTemplate:
+          errorPattern: "\"ENTRA_GROUP_CACHE_TTL_SECONDS\" is a reserved variable"
 
   - it: fails when extraEnv contains ENTRA_SCOPE_FORMAT (issue #990)
     set:

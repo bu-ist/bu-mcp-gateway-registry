@@ -8,12 +8,55 @@ global:
   image:
     # Container registry (host + optional namespace), e.g. "public.ecr.aws/p3v1o3c6"
     registry: public.ecr.aws/p3v1o3c6
-    tag: 1.29.0
+    tag: 1.37.0
     pullPolicy: IfNotPresent
   # When installing chart from repository, add --set global.chartVersion=$(git rev-parse HEAD) to add the git hash to a configmap for debugging
   chartVersion:
+  # SSRF guard CIDR allowlist (SSRF_ALLOWED_CIDRS), set once for registry,
+  # auth-server and mcpgw so the three cannot drift. Comma-separated ranges for
+  # internal MCP servers (e.g. the cluster service CIDR "172.20.0.0/16"); a listed
+  # range also admits reserved IPv4 inside it, such as Istio ServiceEntry VIPs in
+  # "240.240.0.0/16" (#2018). Wins over each subchart's app.ssrfAllowedCidrs, which
+  # stays for standalone installs. Cloud metadata/credential, link-local and
+  # multicast addresses are never permitted.
+  ssrfAllowedCidrs: ""
   # Domain configuration - update this to your actual domain
   domain: "DOMAIN"
+  # Name the session cookie __Host-mcp_gateway_session (Secure, Path=/, no
+  # Domain) so no sibling subdomain can set or overwrite it. This one value
+  # sets SESSION_COOKIE_HOST_PREFIX for both the registry and the
+  # auth-server, which must agree. Requires global.ingress.tls=true,
+  # global.sessionCookieSecure=true, and an empty global.sessionCookieDomain;
+  # the subcharts then render SESSION_COOKIE_DOMAIN empty. Do not set
+  # registry.app.sessionCookieHostPrefix or auth-server.app.sessionCookieHostPrefix:
+  # the chart refuses one that differs from this value. Turning it on signs
+  # every user out once. See docs/design/cookie-security-design.md.
+  sessionCookieHostPrefix: false
+  # Mark the session cookie Secure on HTTPS requests; it is never Secure on
+  # plain HTTP. This one value sets SESSION_COOKIE_SECURE for both the registry
+  # and the auth-server, which must agree. Do not set
+  # auth-server.app.sessionCookieSecure: the chart refuses one that differs
+  # from this value.
+  sessionCookieSecure: true
+  # Session lifetime in seconds: how long the auth-server stores a session and
+  # the session cookie Max-Age, and how long the registry accepts the cookie
+  # signature. Must be a positive integer. This one value sets
+  # SESSION_MAX_AGE_SECONDS for both the registry and the auth-server, which
+  # must agree. Do not set registry.app.sessionMaxAgeSeconds or
+  # auth-server.app.sessionMaxAgeSeconds: the chart refuses one that differs
+  # from this value.
+  sessionMaxAgeSeconds: 28800
+  # Session cookie Domain attribute. Leave empty to default to
+  # ".<global.domain>" (cookie valid across all subdomains of the deployment
+  # domain). Override to a specific hostname (e.g. "mcpregistry.example.com")
+  # to scope tighter, or to a different parent (e.g. ".team.example.com") if
+  # this stack lives under a subdomain. This one value sets
+  # SESSION_COOKIE_DOMAIN for both the registry and the auth-server, which
+  # must agree: two domains leave the browser two session cookies, which both
+  # refuse. Do not set registry.app.sessionCookieDomain or
+  # auth-server.app.sessionCookieDomain: the chart refuses one that differs
+  # from the domain it renders (this value, or ".<global.domain>" when empty).
+  sessionCookieDomain: ""
   # Security settings
   # secretKey: If not provided, a random 64-character key is auto-generated
   # and shared between auth-server and registry via a shared secret.
@@ -33,6 +76,29 @@ global:
   existingSharedSecret: "" # If set, skip creating shared-secret and use this name instead
   existingOauthProviderSecret: "" # If set, skip creating oauth-provider-secret and use this name instead
   existingMongoCredentialsSecret: "" # If set, use this name instead of mongo-credentials in deployments
+  existingKeycloakClientSecret: "" # If set, skip creating keycloak-client-secret and use this name instead. Required under ArgoCD/GitOps unless the client secrets below are set explicitly — see charts/mcp-gateway-registry-stack/README.md.
+  # Secret generation switch.
+  #
+  # true (default): values the chart cannot resolve are generated randomly on
+  # first install and preserved across `helm upgrade` via `lookup`.
+  #
+  # false: REQUIRED for ArgoCD and any other `helm template` based tool. Those
+  # render without cluster access, so `lookup` always returns empty and a
+  # generated value would differ on every sync — replacing secrets under
+  # running pods, rotating the MongoDB user's credential, and re-randomizing
+  # the Keycloak PostgreSQL password against a retained PVC. With generation
+  # off, an unresolved value is a render-time error naming the value to set.
+  #
+  # Values to supply when set to false (or point the existing* keys above at
+  # Secrets that already hold them):
+  #   global.secretKey
+  #   global.authProvider.keycloak.clientSecret / .m2mClientSecret
+  #   keycloak.auth.adminPassword
+  #   keycloak.postgresql.auth.password / .postgresPassword
+  #   mongodb.password
+  #   global.federation.staticToken / .encryptionKey  (federation only)
+  #   registry.egressAuth.markerSecret
+  generateSecrets: true
   # Federation configuration - shared between registry and auth-server
   federation:
     staticTokenAuthEnabled: false # If not provided, defaults to false
@@ -48,6 +114,15 @@ global:
       adminUsername: &keycloakAdmin "user"
       realm: &keycloakRealm "mcp-gateway"
       # Don't set password here - let Keycloak chart generate it
+      # OIDC client secrets for the realm's mcp-gateway-web / mcp-gateway-m2m
+      # clients. Left empty, the chart generates them on first install,
+      # preserves them across `helm upgrade`, and the setup-keycloak Job
+      # publishes them to Keycloak. Set them explicitly when the rendered
+      # value must be deterministic (ArgoCD renders with `helm template`, so
+      # the chart cannot read the previous value back out of the cluster) or
+      # when pointing at an externally managed Keycloak.
+      clientSecret: ""
+      m2mClientSecret: ""
     entra:
       adminGroupId: # UUID of Entra admin group
   # Common ingress settings. Only the registry exposes a public ingress.
@@ -56,6 +131,11 @@ global:
   # also fronted by the registry pod's in-cluster nginx reverse proxy.
   ingress:
     inboundCidrs: # optional comma separated list of allowed inbound CIDR ranges
+    # Optional ALB ssl-policy applied to the HTTPS listener. Leave empty to
+    # let the AWS Load Balancer Controller use its own default
+    # (ELBSecurityPolicy-2016-08). Set a modern policy such as
+    # ELBSecurityPolicy-TLS-1-2-Ext-2018-06 when clients require newer TLS.
+    sslPolicy:
     # Default ALB scheme applied to every ingress in the stack. Stack-level
     # override of each subchart's own global.ingress.scheme. Individual
     # ingresses can still override via <subchart>.ingress.scheme for cases
@@ -70,6 +150,13 @@ global:
     # - subdomain: mcpregistry.domain.com
     # - path:      domain.com/registry
     routingMode: subdomain
+    # Registry hostname prefix used in subdomain mode. The default preserves
+    # the original chart behavior: mcpregistry.<domain>.
+    registrySubdomain: mcpregistry
+    # Optional additional hostnames served by the same registry Ingress. These
+    # are bare lowercase DNS hostnames under the effective session-cookie domain
+    # (default: .<global.domain>) so browser login can share its cookie.
+    additionalHostnames: []
     # Path prefixes used when routingMode: path. Keycloak's browser path
     # (/keycloak) is not configurable here — it's pinned by the registry
     # pod's nginx config and the stack templates that emit
@@ -202,9 +289,23 @@ keycloak:
   auth:
     adminUser: *keycloakAdmin
     existingSecret: '{{ .Release.Name }}-keycloak'
+    # Keycloak admin password. Empty generates one on first install and
+    # preserves it across upgrades (see global.generateSecrets). Rendered into
+    # the Secret named by existingSecret above, which is what the bundled
+    # Bitnami chart reads. Keycloak bootstraps its admin user once, so setting
+    # this on an existing install does not change the password in the realm.
+    adminPassword: ""
   postgresql:
     auth:
       existingSecret: '{{ .Release.Name }}-keycloak-postgresql'
+      # Keycloak's PostgreSQL credentials. Empty generates them on first
+      # install and preserves them across upgrades (see
+      # global.generateSecrets). Set them at FIRST install only: PostgreSQL
+      # initializes its roles from these values once, and changing them later
+      # while the PVC is retained causes the bn_keycloak authentication
+      # failure.
+      password: ""
+      postgresPassword: ""
     image:
       registry: docker.io
       repository: bitnamilegacy/postgresql
@@ -293,18 +394,33 @@ mongodb-configure:
     password: *mongoPassword
     database: *mongoDatabase
     connectionString: *mongoConnectionString
+    # Audit log retention, applied to the audit_events TTL index by the init
+    # Job. Set it HERE rather than out-of-band: the Job re-runs on every
+    # `helm upgrade`, so a value only present in the cluster is not durable.
+    # Shortening it deletes existing audit records, so the script refuses to
+    # unless mongodb-configure.mongodb.auditTtlAllowShrink is also true.
+    auditTtlDays: 7
 # Registry service configuration
 registry:
   app:
+    # Forward-proxy egress for the SSRF-guarded clients (issue #1832). OFF by
+    # default. Only needed where the pods have NO direct internet egress and all
+    # outbound traffic must traverse a corporate forward proxy.
+    #
+    # Set this on BOTH registry and auth-server: the registry runs the health probe
+    # and tool discovery, the auth-server runs the egress-credential-injected tool
+    # call and the OBO token exchange. Enabling it on one of them fixes half the
+    # paths and produces a confusing partial failure.
+    #
+    # The proxy itself is named through the standard HTTP_PROXY / HTTPS_PROXY /
+    # NO_PROXY variables, set via the `extraEnv` list in each service's section
+    # below. They are deliberately not chart-managed, so they are settable.
+    #
+    # Enabling this relaxes DNS-rebinding protection for targets that resolve
+    # exclusively to public addresses; internal targets keep their IP pin with no
+    # extra configuration. See docs/forward-proxy-egress.md before turning it on.
+    # egressForwardProxyEnabled: false
     replicas: 2 # set to > 1 replica for high availability
-    # Session cookie Domain attribute. Leave empty to default to
-    # ".<global.domain>" (cookie valid across all subdomains of the
-    # deployment domain). Override to a specific hostname (e.g.
-    # "mcpregistry.example.com") to scope tighter, or to a different
-    # parent (e.g. ".team.example.com") if this stack lives under a
-    # subdomain. Keep this in sync with auth-server.app.sessionCookieDomain
-    # below — both services read the same cookie.
-    sessionCookieDomain: ""
     # Deployment mode: with-gateway (nginx integration) or registry-only (catalog only)
     deploymentMode: with-gateway
     # Registry mode: full, skills-only, mcp-servers-only, agents-only
@@ -391,7 +507,10 @@ registry:
     # The check is advisory and never blocks registration.
     dedup:
       registrationHintEnabled: true # When true, registration UI pre-flights /check-duplicates and shows hint modal.
-      scoreThreshold: "0.7" # Minimum similarity score (0.0..1.0) for advisory matches.
+      # Empty: use the default calibrated for the embeddings model below
+      # (0.45 for all-MiniLM-L6-v2, 0.85 for text-embedding-ada-002).
+      # Set a value only to override it.
+      scoreThreshold: ""
       maxSuggestions: "3" # Cap on advisory suggestions per request.
     # OpenTelemetry direct OTLP push export configuration
     # Standard OTel SDK var. Setting this activates the OTLP push exporter.
@@ -466,6 +585,17 @@ registry:
     ideOauthCallbackPort: 0
     # Demo server configuration
     disableAiRegistryToolsServer: false # Set to true to disable auto-registration of the built-in airegistry-tools server
+  # Egress HTTP connection pooling (operational tuning). Surfaced here because these
+  # are the egress knobs an operator tunes on a LIVE deployment -- keep
+  # httpPoolKeepaliveExpirySeconds below the shortest upstream/LB idle timeout. The
+  # rest of the egress credential-vault config (oauthTrustedIdpHosts, secretsManager,
+  # callback URLs) is set-once feature config and stays subchart-defaulted. These MUST
+  # match auth-server.egressAuth below.
+  egressAuth:
+    httpPoolMaxConnections: "100" # Max total egress connections in the pool
+    httpPoolMaxKeepalive: "20" # Max idle keep-alive connections retained
+    httpPoolKeepaliveExpirySeconds: "30" # Idle keep-alive lifetime (s); below LB idle timeout
+    httpPoolConnectRetries: "1" # Transport-level connect retries
   # AWS Agent Registry Federation
   awsRegistry:
     federationEnabled: false # Enable AWS Agent Registry federation (overrides MongoDB config on startup)
@@ -525,6 +655,27 @@ registry:
     enabled: true
     ingressClassName: alb
   nodeSelector: {}
+  # PEM CA bundle mounted into the pod, trusted IN ADDITION to the default roots.
+  # Needed only when the forward proxy terminates TLS and re-signs with an
+  # internal CA. Create the ConfigMap or Secret yourself; the chart derives
+  # EGRESS_FORWARD_PROXY_CA_BUNDLE from mountPath and key.
+  # caBundle:
+  #   enabled: true
+  #   existingConfigMap: corporate-ca   # or existingSecret
+  #   key: ca-bundle.pem
+  #   mountPath: /etc/ssl/mcp-gateway
+
+  # Runtime UI branding (logos, favicon, colors, named themes, fonts) without an
+  # image rebuild. Create the ConfigMap yourself from a branding folder:
+  #   kubectl create configmap registry-branding --from-file=./branding/
+  # The whole ConfigMap is mounted read-only at mountPath and the chart sets
+  # UI_BRANDING_DIR to it; edits reach the pod without a restart. See
+  # docs/ui-branding.md.
+  # branding:
+  #   enabled: true
+  #   existingConfigMap: registry-branding
+  #   mountPath: /app/branding
+
   # Extra env vars / envFrom sources appended to the registry container.
   # See charts/registry/values.yaml for validation rules, reserved names,
   # and footgun warnings. These values are forwarded to the registry
@@ -545,6 +696,16 @@ mcpgw:
     # mcpgw only consumes a subset (no MongoDB writer); extra keys merged in
     # by the anchor are ignored by charts/mcpgw/templates/configmap-app-log.yaml.
     !!merge <<: *appLogConfig
+    # Egress HTTP connection pooling (operational tuning). mcpgw holds ONE
+    # process-lifetime pooled httpx client for every outbound hop: the
+    # registry API calls and the Keycloak M2M token POST. Unlike the registry
+    # and auth-server (where these ride under egressAuth.*), mcpgw has no
+    # egress credential vault, so they live under app.* and are always applied.
+    # These MUST match registry.egressAuth and auth-server.egressAuth.
+    httpPoolMaxConnections: "100" # Max total egress connections in the pool
+    httpPoolMaxKeepalive: "20" # Max idle keep-alive connections retained
+    httpPoolKeepaliveExpirySeconds: "30" # Idle keep-alive lifetime (s); below LB idle timeout
+    httpPoolConnectRetries: "1" # Transport-level connect retries
   nodeSelector: {}
   # Extra env vars / envFrom sources appended to the mcpgw container.
   # See charts/mcpgw/values.yaml for validation rules, reserved names,
@@ -555,10 +716,24 @@ mcpgw:
 # Auth server configuration
 auth-server:
   app:
+    # Forward-proxy egress for the SSRF-guarded clients (issue #1832). OFF by
+    # default. Only needed where the pods have NO direct internet egress and all
+    # outbound traffic must traverse a corporate forward proxy.
+    #
+    # Set this on BOTH registry and auth-server: the registry runs the health probe
+    # and tool discovery, the auth-server runs the egress-credential-injected tool
+    # call and the OBO token exchange. Enabling it on one of them fixes half the
+    # paths and produces a confusing partial failure.
+    #
+    # The proxy itself is named through the standard HTTP_PROXY / HTTPS_PROXY /
+    # NO_PROXY variables, set via the `extraEnv` list in each service's section
+    # below. They are deliberately not chart-managed, so they are settable.
+    #
+    # Enabling this relaxes DNS-rebinding protection for targets that resolve
+    # exclusively to public addresses; internal targets keep their IP pin with no
+    # extra configuration. See docs/forward-proxy-egress.md before turning it on.
+    # egressForwardProxyEnabled: false
     replicas: 2 # set to > 1 replica for high availability
-    # Session cookie Domain attribute. See registry.app.sessionCookieDomain
-    # above for guidance — keep these two in sync.
-    sessionCookieDomain: ""
     # Internal JWT configuration
     jwtIssuer: "mcp-auth-server" # Issuer claim for internal JWT tokens
     jwtAudience: "mcp-registry" # Audience claim for internal JWT tokens
@@ -595,6 +770,14 @@ auth-server:
     gatewayGenericAcquireTimeoutSeconds: 5
     gatewayGenericStreamMaxDurationSeconds: 3600
     gatewayGenericStreamMaxBytes: "104857600" # string to avoid Helm float sci-notation
+  # Egress HTTP connection pooling (operational tuning). MUST match
+  # registry.egressAuth above. See that block for guidance; the rest of egressAuth
+  # (oauthTrustedIdpHosts, secretsManager, callback URLs) stays subchart-defaulted.
+  egressAuth:
+    httpPoolMaxConnections: "100" # Max total egress connections in the pool
+    httpPoolMaxKeepalive: "20" # Max idle keep-alive connections retained
+    httpPoolKeepaliveExpirySeconds: "30" # Idle keep-alive lifetime (s); below LB idle timeout
+    httpPoolConnectRetries: "1" # Transport-level connect retries
   metrics:
     # Standard OTel SDK var. Setting this activates the OTLP push exporter.
     otelExporterOtlpEndpoint: "" # OTLP endpoint URL (e.g., http://otel-collector:4317)
@@ -609,8 +792,12 @@ auth-server:
     clientId: ""
     clientSecret: ""
     tenantId: ""
-    loginBaseUrl: "" # Custom Entra login base URL for sovereign clouds
-    graphBaseUrl: "" # Optional Microsoft Graph base URL override (auto-inferred from loginBaseUrl)
+    loginBaseUrl: "" # Sovereign Entra login base URL; a custom login proxy also needs graphBaseUrl.
+    graphBaseUrl: "" # Optional on known Entra clouds; required for a custom login proxy. This is the network fetch URL.
+    graphResourceUrl: "" # Native Microsoft Graph OAuth resource, required for custom login proxies when groupRecoveryEnabled or browserUserReadEnabled is true. Set DoD explicitly.
+    browserUserReadEnabled: false # Request User.Read on browser login. Default false keeps OIDC-only login; Graph lookup also requires groupRecoveryEnabled.
+    groupRecoveryEnabled: true # Recover overage groups via Graph for eligible bearer tokens and browser sessions consented to User.Read. False disables Graph recovery.
+    groupCacheTtlSeconds: 300 # Positive Graph group-result cache lifetime (30..3600 seconds); removals can remain cached until expiration.
     scopeFormat: "" # Entra PRM scope form: "v1" (api://<app-id>/<scope>) or "v2" (bare, default). Set "v1" only if your app exposes v1-style api:// scopes (issue #990).
     applicationIdUri: "" # Application ID URI (e.g. api://<app-id>). Used as the v1 scope prefix and accepted as a token audience. Defaults to api://<clientId>.
   # Okta settings (used when global.authProvider.type = "okta")
@@ -656,6 +843,16 @@ auth-server:
   # Default: "pingfederate"
   idpUserGroupFallbackEnabledProviders: "pingfederate"
   nodeSelector: {}
+  # PEM CA bundle mounted into the pod, trusted IN ADDITION to the default roots.
+  # Needed only when the forward proxy terminates TLS and re-signs with an
+  # internal CA. Create the ConfigMap or Secret yourself; the chart derives
+  # EGRESS_FORWARD_PROXY_CA_BUNDLE from mountPath and key.
+  # caBundle:
+  #   enabled: true
+  #   existingConfigMap: corporate-ca   # or existingSecret
+  #   key: ca-bundle.pem
+  #   mountPath: /etc/ssl/mcp-gateway
+
   # Extra env vars / envFrom sources appended to the auth-server container.
   # See charts/auth-server/values.yaml for validation rules, reserved names,
   # and footgun warnings. These values are forwarded to the auth-server

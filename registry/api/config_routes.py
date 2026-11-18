@@ -154,6 +154,7 @@ CONFIG_GROUPS: dict[str, dict[str, Any]] = {
                     ("entra_group_admin_id", "Admin Group ID", False),
                     ("entra_scope_format", "Scope Format (v1/v2)", False),
                     ("entra_application_id_uri", "Application ID URI", False),
+                    ("entra_login_base_url", "Login Base URL", False),
                 ],
             },
             {
@@ -180,6 +181,7 @@ CONFIG_GROUPS: dict[str, dict[str, Any]] = {
             ("embeddings_model_dimensions", "Dimensions", False),
             ("embeddings_aws_region", "AWS Region", False),
             ("vector_search_ef_search", "Vector Search EF", False),
+            ("search_log_query_text", "Log Raw Search Query", False),
             ("embeddings_api_key", "API Key", True),
             ("embeddings_secret_key", "Secret Key", True),
             ("embeddings_auth_mode", "Auth Mode", False),
@@ -188,6 +190,16 @@ CONFIG_GROUPS: dict[str, dict[str, Any]] = {
             ("embeddings_idp_client_secret", "IdP Client Secret", True),
             ("embeddings_idp_scope", "IdP Scope", False),
             ("embeddings_idp_timeout_seconds", "IdP Timeout (s)", False),
+            ("embeddings_request_timeout_seconds", "Request Timeout (s)", False),
+            ("embeddings_max_retries", "Max Retries", False),
+            ("embeddings_retry_max_input_chars", "Retry Trim Target (chars)", False),
+            # Raw slots, not the embeddings_extra_headers property: every
+            # CONFIG_GROUPS value must stay a scalar for the exporters (issue #1819).
+            ("embeddings_extra_header_1", "Extra Header 1", False),
+            ("embeddings_extra_header_2", "Extra Header 2", False),
+            ("embeddings_extra_header_3", "Extra Header 3", False),
+            ("embeddings_extra_header_4", "Extra Header 4", False),
+            ("embeddings_extra_header_5", "Extra Header 5", False),
         ],
     },
     "health_check": {
@@ -216,6 +228,8 @@ CONFIG_GROUPS: dict[str, dict[str, Any]] = {
             ("security_scan_enabled", "Scan Enabled", False),
             ("security_scan_on_registration", "Scan on Registration", False),
             ("security_block_unsafe_servers", "Block Unsafe", False),
+            ("security_allow_unsafe_servers", "Allow Unsafe, Block Tools", False),
+            ("security_block_on_scan_failure", "Block on Scan Failure (all asset types)", False),
             ("security_analyzers", "Analyzers", False),
             ("security_scan_timeout", "Scan Timeout", False),
             ("security_add_pending_tag", "Add Pending Tag", False),
@@ -378,7 +392,9 @@ CONFIG_GROUPS: dict[str, dict[str, Any]] = {
         "order": 21,
         "fields": [
             ("dedup_registration_hint_enabled", "UI Hint Enabled", False),
-            ("dedup_score_threshold", "Score Threshold", False),
+            ("dedup_score_threshold", "Score Threshold (override)", False),
+            ("effective_dedup_score_threshold", "Score Threshold (in force)", False),
+            ("dedup_threshold_source", "Score Threshold Source", False),
             ("dedup_max_suggestions", "Max Suggestions", False),
         ],
     },
@@ -426,6 +442,9 @@ CONFIG_GROUPS: dict[str, dict[str, Any]] = {
             ("egress_state_ttl_seconds", "OAuth State TTL (s)", False),
             ("egress_registry_internal_url", "Registry Internal Vend URL", False),
             ("egress_obo_allowed_audiences", "OBO Allowed Audiences", False),
+            ("egress_obo_cache_enabled", "OBO Cache Enabled", False),
+            ("egress_obo_cache_max_ttl_seconds", "OBO Cache Max TTL (s)", False),
+            ("egress_obo_cache_expiry_skew_seconds", "OBO Cache Expiry Skew (s)", False),
             # trusted-IdP allowlist for the credentialed-OAuth SSRF profile; not
             # sensitive (hostnames only) but shown here because entries receive
             # client secrets and refresh tokens
@@ -443,6 +462,18 @@ CONFIG_GROUPS: dict[str, dict[str, Any]] = {
             ("openbao_kv_mount", "OpenBao KV Mount", False),
             ("openbao_auth_method", "OpenBao Auth Method", False),
             ("openbao_role", "OpenBao Role", False),
+            ("openbao_auth_mount", "OpenBao Auth Mount", False),
+            # egress HTTP connection pooling (shared clients; not sensitive)
+            ("egress_http_pool_max_connections", "HTTP Pool Max Connections", False),
+            ("egress_http_pool_max_keepalive", "HTTP Pool Max Keep-Alive", False),
+            ("egress_http_pool_keepalive_expiry_seconds", "HTTP Pool Keep-Alive Expiry (s)", False),
+            ("egress_http_pool_connect_retries", "HTTP Pool Connect Retries", False),
+            # forward-proxy egress for the SSRF-guarded clients. The boolean and
+            # the CA-bundle PATH are shown; the proxy URL deliberately is NOT,
+            # because HTTP_PROXY may embed basic-auth credentials
+            # (http://user:pass@proxy:3128). The boolean answers "is this on".  # pragma: allowlist secret
+            ("egress_forward_proxy_enabled", "Forward Proxy Enabled", False),
+            ("egress_forward_proxy_ca_bundle", "Forward Proxy CA Bundle", False),
         ],
     },
     "a2a_reverse_proxy": {
@@ -472,6 +503,7 @@ CONFIG_GROUPS: dict[str, dict[str, Any]] = {
         "fields": [
             ("rum_snippet_b64", "RUM Snippet (base64)", True),
             ("rum_allowed_hosts", "RUM Allowed Hosts", False),
+            ("ui_branding_dir", "UI Branding Folder", False),
         ],
     },
     "gateway_generic_proxy": {
@@ -497,6 +529,19 @@ CONFIG_GROUPS: dict[str, dict[str, Any]] = {
             ("gateway_generic_stream_max_bytes", "Stream Max Bytes", False),
             ("gateway_generic_stream_read_timeout_seconds", "Stream Read Timeout (seconds)", False),
             ("gateway_egress_selfcheck_enabled", "Egress Self-Check Enabled", False),
+        ],
+    },
+    "cimd": {
+        "title": "CIMD Publisher",
+        "order": 30,
+        "fields": [
+            ("cimd_publisher_enabled", "Enabled", False),
+            ("cimd_cache_ttl", "Cache TTL (s)", False),
+            ("cimd_client_name", "Client Name", False),
+            ("cimd_redirect_uris", "Redirect URIs", False),
+            ("cimd_scope", "Scope", False),
+            ("cimd_logo_uri", "Logo URI", False),
+            ("cimd_contacts", "Contacts", False),
         ],
     },
 }

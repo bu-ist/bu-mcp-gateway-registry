@@ -66,23 +66,31 @@ def _make_server_with_tools(n_tools, server_name="test-server", path="/test"):
 
 
 async def _call_with_mocked_registry(tool_func, mock_response, capture=None, **kwargs):
-    """Call a registry search tool with mocked HTTP client and token."""
+    """Call a registry search tool with a mocked pooled client and token.
+
+    The search tools now POST through the process-lifetime pooled client
+    (``servers/mcpgw/http_pool.py``), so the seam is ``shared_async_client`` plus
+    ``client.request("POST", url, ...)``.
+    """
     captured_kwargs = {}
 
-    async def mock_post(url, **post_kwargs):
-        captured_kwargs.update(post_kwargs)
+    async def mock_request(method, url, **request_kwargs):
+        captured_kwargs.update(request_kwargs)
+        captured_kwargs["_method"] = method
+        captured_kwargs["_url"] = url
         return mock_response
 
     mock_client = AsyncMock()
-    mock_client.post = mock_post
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.request = mock_request
 
     with (
-        patch("servers.mcpgw.server.httpx.AsyncClient", return_value=mock_client),
+        patch("servers.mcpgw.server.shared_async_client", return_value=mock_client),
         patch("servers.mcpgw.server._extract_bearer_token", return_value="test-token"),
     ):
         result = await tool_func(**kwargs)
+
+    # The pooled client is shared process-wide; a request path must never close it.
+    mock_client.aclose.assert_not_awaited()
 
     if capture is not None:
         capture.update(captured_kwargs)
@@ -127,8 +135,12 @@ async def _call_search_registry(
     max_results=10,
     capture=None,
     include_discovery_receipt=False,
+    metadata_fields=None,
 ):
     """Helper to call search_registry with mocked HTTP client and token."""
+    kwargs = {}
+    if metadata_fields is not None:
+        kwargs["metadata_fields"] = metadata_fields
     return await _call_with_mocked_registry(
         search_registry,
         mock_response,
@@ -136,6 +148,7 @@ async def _call_search_registry(
         query=query,
         max_results=max_results,
         include_discovery_receipt=include_discovery_receipt,
+        **kwargs,
     )
 
 
@@ -156,7 +169,9 @@ async def test_request_payload_uses_correct_field_names():
     assert "max_results" in body
     assert body["max_results"] == 7
     assert "entity_types" in body
-    assert body["entity_types"] == ["mcp_server", "tool", "a2a_agent", "skill", "virtual_server"]
+    # No virtual_server: this tool reads only servers[], so requesting virtual
+    # servers spent max_results slots on results it discarded (issue #1752).
+    assert body["entity_types"] == ["mcp_server", "tool", "a2a_agent", "skill"]
     assert "top_k" not in body
     assert "entity_type" not in body
 
@@ -586,3 +601,407 @@ async def test_discovery_receipt_caps_top_withheld_items():
         "tool_4",
         "tool_5",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Issue #1752: search_registry returns the virtual servers it asks for
+# ---------------------------------------------------------------------------
+
+
+def _make_virtual_server(n_tools=2, server_name="bundle", path="/bundle"):
+    """A virtual server payload shaped like VirtualServerSearchResult."""
+    return {
+        "server_name": server_name,
+        "path": path,
+        "backend_count": 2,
+        "matching_tools": [
+            {
+                "tool_name": f"vs_tool_{i}",
+                "description": f"Virtual tool {i}",
+                "relevance_score": round(0.8 - i * 0.1, 2),
+            }
+            for i in range(n_tools)
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_registry_returns_virtual_servers():
+    """The request asks for virtual_server, so the response must carry them."""
+    mock_resp = _make_mock_response()
+    mock_resp.json.return_value = {
+        "servers": [],
+        "tools": [],
+        "agents": [],
+        "skills": [],
+        "virtual_servers": [_make_virtual_server()],
+    }
+
+    result = await _call_search_registry(mock_resp, query="bundled tools")
+
+    assert result["virtual_servers"] == [_make_virtual_server()]
+
+
+@pytest.mark.asyncio
+async def test_virtual_servers_count_toward_total_results():
+    mock_resp = _make_mock_response()
+    mock_resp.json.return_value = {
+        "servers": [_make_server_with_tools(1, path="/a")],
+        "tools": [],
+        "agents": [],
+        "skills": [],
+        "virtual_servers": [
+            _make_virtual_server(path="/vs1"),
+            _make_virtual_server(path="/vs2"),
+        ],
+    }
+
+    result = await _call_search_registry(mock_resp, query="bundled tools")
+
+    assert result["total_results"] == 3
+
+
+@pytest.mark.asyncio
+async def test_virtual_server_tools_appear_in_the_discovery_receipt():
+    mock_resp = _make_mock_response()
+    mock_resp.json.return_value = {
+        "servers": [],
+        "tools": [],
+        "agents": [],
+        "skills": [],
+        "virtual_servers": [_make_virtual_server(n_tools=2, path="/bundle")],
+    }
+
+    result = await _call_search_registry(
+        mock_resp,
+        query="bundled tools",
+        max_results=10,
+        include_discovery_receipt=True,
+    )
+
+    receipt = result["discovery_receipt"]
+    assert receipt["exposed_results"] == [
+        {
+            "asset_type": "tool",
+            "service_path": "/bundle",
+            "name": "vs_tool_0",
+            "similarity_score": 0.8,
+        },
+        {
+            "asset_type": "tool",
+            "service_path": "/bundle",
+            "name": "vs_tool_1",
+            "similarity_score": 0.7,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_missing_virtual_servers_key_yields_an_empty_list():
+    """An older registry omits the key; the tool must not raise."""
+    mock_resp = _make_mock_response(servers=[])
+
+    result = await _call_search_registry(mock_resp, query="bundled tools")
+
+    assert result["virtual_servers"] == []
+    assert result["total_results"] == 0
+
+
+@pytest.mark.asyncio
+async def test_search_registry_does_not_pin_entity_types():
+    """Virtual servers must stay in scope, and so must the custom types.
+
+    The tool used to pin entity_types to the built-in names. Sending no filter
+    leaves the registry searching its default scope, which keeps virtual servers
+    in scope and is the only way to reach custom types, whose names are defined
+    at runtime and so cannot appear in a hard-coded list.
+    """
+    capture = {}
+    mock_resp = _make_mock_response(servers=[])
+
+    await _call_search_registry(mock_resp, query="bundled tools", capture=capture)
+
+    assert "entity_types" not in capture["json"]
+
+
+@pytest.mark.asyncio
+async def test_intelligent_tool_finder_no_longer_requests_virtual_servers():
+    """It reads only servers[], so asking would spend slots on discarded results."""
+    capture = {}
+    mock_resp = _make_mock_response(servers=[])
+
+    await _call_finder(mock_resp, query="bundled tools", capture=capture)
+
+    assert "virtual_server" not in capture["json"]["entity_types"]
+    assert capture["json"]["entity_types"] == ["mcp_server", "tool", "a2a_agent", "skill"]
+
+
+# ---------------------------------------------------------------------------
+# search_registry returns the custom entity records the registry matched
+# ---------------------------------------------------------------------------
+
+
+def _make_custom_record(
+    entity_type="prompt_template",
+    name="summarize-ticket",
+    path="/prompt_template/summarize-ticket",
+    relevance_score=0.77,
+):
+    """A custom entity payload shaped like CustomEntitySearchResult."""
+    return {
+        "entity_type": entity_type,
+        "path": path,
+        "name": name,
+        "description": "Summarize a support ticket",
+        "tags": ["support"],
+        "visibility": "public",
+        "owner": "platform",
+        "is_enabled": True,
+        "relevance_score": relevance_score,
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_registry_returns_custom_records():
+    """The registry indexes and matches custom records, so the tool must return them."""
+    mock_resp = _make_mock_response()
+    mock_resp.json.return_value = {
+        "servers": [],
+        "tools": [],
+        "agents": [],
+        "skills": [],
+        "virtual_servers": [],
+        "custom": [_make_custom_record()],
+    }
+
+    result = await _call_search_registry(mock_resp, query="summarize a ticket")
+
+    assert result["custom"] == [_make_custom_record()]
+
+
+@pytest.mark.asyncio
+async def test_custom_records_count_toward_total_results():
+    """They consume the max_results budget, so the total has to admit them."""
+    mock_resp = _make_mock_response()
+    mock_resp.json.return_value = {
+        "servers": [_make_server_with_tools(1, path="/a")],
+        "tools": [],
+        "agents": [],
+        "skills": [],
+        "virtual_servers": [],
+        "custom": [
+            _make_custom_record(path="/prompt_template/one", name="one"),
+            _make_custom_record(path="/prompt_template/two", name="two"),
+        ],
+    }
+
+    result = await _call_search_registry(mock_resp, query="prompts")
+
+    assert result["total_results"] == 3
+
+
+@pytest.mark.asyncio
+async def test_custom_records_appear_in_the_discovery_receipt():
+    """asset_type names the custom type, so a receipt shows which kind matched."""
+    mock_resp = _make_mock_response()
+    mock_resp.json.return_value = {
+        "servers": [],
+        "tools": [],
+        "agents": [],
+        "skills": [],
+        "virtual_servers": [],
+        "custom": [
+            _make_custom_record(entity_type="gem", name="tone-of-voice", path="/gem/tone"),
+        ],
+    }
+
+    result = await _call_search_registry(
+        mock_resp,
+        query="tone of voice",
+        max_results=10,
+        include_discovery_receipt=True,
+    )
+
+    assert result["discovery_receipt"]["exposed_results"] == [
+        {
+            "asset_type": "gem",
+            "service_path": "/gem/tone",
+            "name": "tone-of-voice",
+            "similarity_score": 0.77,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_custom_record_without_a_type_falls_back_to_custom():
+    """A record missing its discriminator still has to be countable in a receipt."""
+    record = _make_custom_record()
+    del record["entity_type"]
+    mock_resp = _make_mock_response()
+    mock_resp.json.return_value = {"servers": [], "custom": [record]}
+
+    result = await _call_search_registry(
+        mock_resp,
+        query="prompts",
+        include_discovery_receipt=True,
+    )
+
+    assert result["discovery_receipt"]["exposed_results"][0]["asset_type"] == "custom"
+
+
+@pytest.mark.asyncio
+async def test_missing_custom_key_yields_an_empty_list():
+    """Registries with custom entity types disabled omit the key; do not raise."""
+    mock_resp = _make_mock_response(servers=[])
+
+    result = await _call_search_registry(mock_resp, query="prompts")
+
+    assert result["custom"] == []
+    assert result["total_results"] == 0
+
+
+# ---------------------------------------------------------------------------
+# search_registry can ask for the metadata a registrant attached to an asset
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_registry_omits_metadata_fields_by_default():
+    """Asking for no metadata must stay the default: search returns none unasked."""
+    capture = {}
+    mock_resp = _make_mock_response(servers=[])
+
+    await _call_search_registry(mock_resp, query="anything", capture=capture)
+
+    assert "metadata_fields" not in capture["json"]
+
+
+@pytest.mark.asyncio
+async def test_search_registry_forwards_metadata_fields():
+    """Search drops the metadata subdocument unless the caller names the keys."""
+    capture = {}
+    mock_resp = _make_mock_response(servers=[])
+
+    await _call_search_registry(
+        mock_resp,
+        query="who owns the billing server",
+        metadata_fields="owner_team,owner_person",
+        capture=capture,
+    )
+
+    assert capture["json"]["metadata_fields"] == "owner_team,owner_person"
+
+
+@pytest.mark.asyncio
+async def test_search_registry_returns_projected_metadata_on_results():
+    """The projected metadata rides on the result objects, so pass them through."""
+    server = _make_server_with_tools(1, path="/billing")
+    server["metadata"] = {"owner_team": "platform"}
+    mock_resp = _make_mock_response(servers=[server])
+
+    result = await _call_search_registry(
+        mock_resp,
+        query="billing",
+        metadata_fields="owner_team",
+    )
+
+    assert result["servers"][0]["metadata"] == {"owner_team": "platform"}
+
+
+@pytest.mark.asyncio
+async def test_empty_metadata_fields_is_treated_as_unasked():
+    """An empty string is not a projection request; do not send a 422-bait value."""
+    capture = {}
+    mock_resp = _make_mock_response(servers=[])
+
+    await _call_search_registry(mock_resp, query="anything", metadata_fields="", capture=capture)
+
+    assert "metadata_fields" not in capture["json"]
+
+
+# ---------------------------------------------------------------------------
+# The discovery receipt ranks candidates by score, not by category order
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_receipt_ranks_candidates_by_score_not_category_order():
+    """A high-scoring custom record must be exposed ahead of a weaker tool.
+
+    Candidates are appended one category at a time (tools, then agents, then
+    skills, then custom records), so an unsorted slice would report category
+    order: whatever was appended last would always be the first called withheld
+    however well it scored. The receipt documents top_withheld as the
+    highest-scoring near misses, so the split has to be ranked.
+    """
+    server = {
+        "server_name": "weak-server",
+        "path": "/weak",
+        "matching_tools": [
+            {"tool_name": "weak_tool", "description": "barely related", "relevance_score": 0.10},
+        ],
+    }
+    mock_resp = _make_mock_response()
+    mock_resp.json.return_value = {
+        "servers": [server],
+        "tools": [],
+        "agents": [],
+        "skills": [],
+        "virtual_servers": [],
+        "custom": [
+            _make_custom_record(name="strong-record", path="/gem/strong", relevance_score=0.95),
+        ],
+    }
+
+    result = await _call_search_registry(
+        mock_resp,
+        query="anything",
+        max_results=1,
+        include_discovery_receipt=True,
+    )
+
+    receipt = result["discovery_receipt"]
+    assert receipt["exposed_results"] == [
+        {
+            "asset_type": "prompt_template",
+            "service_path": "/gem/strong",
+            "name": "strong-record",
+            "similarity_score": 0.95,
+        },
+    ]
+    assert receipt["withheld"]["top_withheld"] == [
+        {
+            "asset_type": "tool",
+            "service_path": "/weak",
+            "name": "weak_tool",
+            "similarity_score": 0.10,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receipt_ranking_tolerates_a_missing_score():
+    """A candidate with no score sorts last rather than raising on None."""
+    mock_resp = _make_mock_response()
+    mock_resp.json.return_value = {
+        "servers": [],
+        "tools": [],
+        "agents": [],
+        "skills": [],
+        "virtual_servers": [],
+        "custom": [
+            _make_custom_record(name="scored", path="/gem/scored", relevance_score=0.5),
+            _make_custom_record(name="unscored", path="/gem/unscored", relevance_score=None),
+        ],
+    }
+
+    result = await _call_search_registry(
+        mock_resp,
+        query="anything",
+        max_results=1,
+        include_discovery_receipt=True,
+    )
+
+    receipt = result["discovery_receipt"]
+    assert receipt["exposed_results"][0]["name"] == "scored"
+    assert receipt["withheld"]["top_withheld"][0]["name"] == "unscored"

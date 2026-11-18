@@ -110,6 +110,18 @@ auth_request_duration_ms = _meter.create_histogram(
     unit="ms",
 )
 
+auth_path_flush_total = _meter.create_counter(
+    name="mcpgw_registry_auth_path_flush_total",
+    description=(
+        "Auth-path count flushes to the shared stats document, labeled by outcome "
+        "(ok | error). The flush is what carries the per-path traffic mix from "
+        "this process to the registry's telemetry heartbeat, and it fails silently "
+        "by design, so an error series is the only thing that tells an absent mix "
+        "from an unreported one"
+    ),
+    unit="1",
+)
+
 
 # =============================================================================
 # Tool-execution metrics (auth-side, with full client info from headers)
@@ -154,6 +166,23 @@ token_mint_total = _meter.create_counter(
 
 
 # =============================================================================
+# Audit-integrity metrics
+# =============================================================================
+
+# Declared with the SAME name in registry/observability/meters.py (as
+# token_mint_total already is) so one PromQL query covers both processes.
+audit_integrity_degraded_total = _meter.create_counter(
+    name="mcpgw_registry_audit_integrity_degraded_total",
+    description=(
+        "Audit-integrity degradations, labeled by reason (record_dropped | "
+        "identity_hop_claim_missing | claim_dropped). Rate-alertable counterpart "
+        "to the CRITICAL/WARNING log lines."
+    ),
+    unit="1",
+)
+
+
+# =============================================================================
 # Redirect-validation metrics (open-redirect hardening, PR #1475 follow-up)
 # =============================================================================
 
@@ -166,6 +195,76 @@ redirect_rejected_total = _meter.create_counter(
     ),
     unit="1",
 )
+
+
+# =============================================================================
+# Egress pooled-client keep-alive reset metrics
+# =============================================================================
+
+egress_conn_reset_total = _meter.create_counter(
+    name="mcpgw_registry_egress_conn_reset_total",
+    description=(
+        "Pooled egress HTTP requests that hit a closed keep-alive connection and "
+        "were transparently retried once, labeled by site (obo | vend). A rising "
+        "count means EGRESS_HTTP_POOL_KEEPALIVE_EXPIRY_SECONDS is set above an "
+        "upstream/LB idle timeout."
+    ),
+    unit="1",
+)
+
+
+# =============================================================================
+# OBO token-cache metrics (opt-in EGRESS_OBO_CACHE_ENABLED)
+# =============================================================================
+
+obo_cache_hit = _meter.create_counter(
+    name="mcpgw_obo_cache_hit_total",
+    description="OBO exchanged-token cache hits (a valid cached token was reused), labeled by idp",
+    unit="1",
+)
+
+obo_cache_miss = _meter.create_counter(
+    name="mcpgw_obo_cache_miss_total",
+    description="OBO cache misses (no usable cached token; a live exchange follows), labeled by idp",
+    unit="1",
+)
+
+obo_exchange_performed = _meter.create_counter(
+    name="mcpgw_obo_exchange_performed_total",
+    description="Live OBO token exchanges performed against the IdP, labeled by idp",
+    unit="1",
+)
+
+obo_exchange_failure = _meter.create_counter(
+    name="mcpgw_obo_exchange_failure_total",
+    description="Live OBO token exchanges that failed, labeled by idp",
+    unit="1",
+)
+
+obo_cache_store_error = _meter.create_counter(
+    name="mcpgw_obo_cache_store_error_total",
+    description=(
+        "OBO cache SecretStore and lease ops that degraded or failed closed, labeled by "
+        "op (get | put | lease) and kind (backend: store/lease outage or timeout; "
+        "unexpected: a programming or contract error, also logged at ERROR)"
+    ),
+    unit="1",
+)
+
+obo_cache_unstorable = _meter.create_counter(
+    name="mcpgw_obo_cache_unstorable_total",
+    description=(
+        "OBO exchanges that succeeded but could not be cached because the IdP "
+        "returned no usable expires_in (opaque/short-lived token), labeled by idp. "
+        "A nonzero value means the cache can never populate for that IdP."
+    ),
+    unit="1",
+)
+
+
+def record_egress_conn_reset(site: str) -> None:
+    """Record a pooled-client keep-alive reconnect retry for the given site."""
+    egress_conn_reset_total.add(1, {"site": site})
 
 
 # =============================================================================
@@ -237,7 +336,7 @@ def record_generic_proxy_slot_rejected(pool: str) -> None:
     """Record a generic-proxy capacity rejection (503) for the given pool."""
     try:
         generic_proxy_slot_rejected_total.add(1, {"pool": pool})
-    except Exception:  # pragma: no cover - metrics must never break the hop
+    except Exception:  # nosec B110 # pragma: no cover - metrics must never break the hop
         pass
 
 
@@ -245,7 +344,7 @@ def record_generic_proxy_stream_outcome(outcome: str) -> None:
     """Record a start/terminal outcome for a streaming generic-proxy request."""
     try:
         generic_proxy_stream_outcome_total.add(1, {"outcome": outcome})
-    except Exception:  # pragma: no cover - metrics must never break the hop
+    except Exception:  # nosec B110 # pragma: no cover - metrics must never break the hop
         pass
 
 
@@ -260,7 +359,7 @@ def record_generic_proxy_request(entity_type: str, outcome: str) -> None:
     """
     try:
         generic_proxy_request_total.add(1, {"entity_type": entity_type, "outcome": outcome})
-    except Exception:  # pragma: no cover - metrics must never break the hop
+    except Exception:  # nosec B110 # pragma: no cover - metrics must never break the hop
         pass
 
 
@@ -302,9 +401,12 @@ HOP_OUTCOMES: tuple[str, ...] = (
     "internal_error",
 )
 
+# The flush counter's label set: one closed enum, two values.
+AUTH_PATH_FLUSH_OUTCOMES: tuple[str, ...] = ("ok", "error")
 
-def zero_init_generic_proxy_metrics() -> None:
-    """Seed every known generic-proxy label combination with zero.
+
+def zero_init_metrics() -> None:
+    """Seed every known label combination on this module's counters with zero.
 
     Each add() gets its own try, so one failure cannot skip the rest.
 
@@ -332,14 +434,15 @@ def zero_init_generic_proxy_metrics() -> None:
         for entity_type in HOP_ENTITY_TYPES
         for outcome in HOP_OUTCOMES
     ]
+    seeds += [(auth_path_flush_total, {"outcome": outcome}) for outcome in AUTH_PATH_FLUSH_OUTCOMES]
     seeded = 0
     for instrument, attrs in seeds:
         try:
             instrument.add(0, attrs)
             seeded += 1
-        except Exception:  # pragma: no cover - metrics must never break startup
+        except Exception:  # nosec B110 # pragma: no cover - metrics must never break startup
             pass
-    logger.info("zero-init seeded %d/%d generic-proxy series", seeded, len(seeds))
+    logger.info("zero-init seeded %d/%d series", seeded, len(seeds))
 
 
 # =============================================================================

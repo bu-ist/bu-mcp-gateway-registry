@@ -7,6 +7,7 @@ Common questions and answers about the MCP Gateway Registry.
 - [What is MCP and why do I need a gateway?](what-is-mcp-and-gateway.md)
 - [How do I deploy and register MCP servers and agents?](deploying-and-registering-servers-agents.md)
 - [What changes when I upgrade to a release with the gateway generic proxy?](gateway-proxy-backwards-compatibility.md)
+- [What changes when I upgrade to a release with MCP 2026-07-28 support?](upgrading-to-mcp-2026-07-28.md)
 
 ## Tool and Agent Discovery
 
@@ -27,6 +28,7 @@ Common questions and answers about the MCP Gateway Registry.
 ## Operations and Monitoring
 
 - [How do I monitor the health of MCP servers?](monitoring-server-health.md)
+- [How do I configure an external proxy server when my corporate network has no direct internet access?](configuring-a-forward-proxy-for-egress.md)
 - [How do I configure MongoDB Atlas instead of MongoDB CE?](configuring-mongodb-atlas-backend.md)
 - [How do I migrate an existing local MongoDB to authenticated mode? (local dev only)](migrate-local-mongodb-to-authenticated.md)
 - [How do I rotate my MongoDB password and OpenBao token? (local Docker Compose, EC2/macOS)](rotate-mongodb-and-openbao-secrets.md)
@@ -59,6 +61,7 @@ Common questions and answers about the MCP Gateway Registry.
 - [Can I use an Entra ID token to call the registry API instead of the UI-generated token?](use-entra-token-for-registry-api.md)
 - [How do I register an M2M client and assign it groups without an IdP Admin API token?](registering-m2m-client-without-idp-admin-token.md)
 - [Registry API Authentication FAQ (static token, IdP JWT, coexistence)](registry-api-auth-faq.md)
+- [Why do registry API calls return 500 for users in many IdP groups?](registry-api-500-for-users-with-many-groups.md)
 - [How do I generate an MCP access token that lasts longer than 8 hours?](generate-token-longer-than-8-hours.md)
 - [How do I pass an M2M token from Entra to the registration gate?](oauth2-token-for-registration-gate.md)
 - [How does an admin seed per-user egress PATs for a `pat` server?](seeding-per-user-egress-pats-as-admin.md)

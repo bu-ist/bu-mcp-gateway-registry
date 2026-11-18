@@ -142,12 +142,19 @@ def store(request, secrets_manager_store, openbao_store):
 @pytest.mark.unit
 class TestSecretStoreContract:
     async def test_get_miss_returns_none(self, store):
-        assert await store.get_token("oauth2", "nobody", "github", "/x") is None
+        assert (
+            await store.get_token("oauth2", "nobody", "github", "/x", purpose=keys.EGRESS_PURPOSE)
+            is None
+        )
 
     async def test_put_then_get_roundtrip(self, store):
         tok = _token()
-        await store.put_token("oauth2", "alice", "github", "/github-mcp", tok)
-        got = await store.get_token("oauth2", "alice", "github", "/github-mcp")
+        await store.put_token(
+            "oauth2", "alice", "github", "/github-mcp", tok, purpose=keys.EGRESS_PURPOSE
+        )
+        got = await store.get_token(
+            "oauth2", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+        )
         assert got is not None
         assert got.access_token == tok.access_token
         assert got.refresh_token == tok.refresh_token
@@ -155,16 +162,33 @@ class TestSecretStoreContract:
 
     async def test_delete_is_idempotent(self, store):
         # deleting a missing entry must not raise
-        await store.delete_token("oauth2", "ghost", "github", "/x")
-        await store.put_token("oauth2", "alice", "github", "/github-mcp", _token())
-        await store.delete_token("oauth2", "alice", "github", "/github-mcp")
-        assert await store.get_token("oauth2", "alice", "github", "/github-mcp") is None
-        await store.delete_token("oauth2", "alice", "github", "/github-mcp")  # again, no raise
+        await store.delete_token("oauth2", "ghost", "github", "/x", purpose=keys.EGRESS_PURPOSE)
+        await store.put_token(
+            "oauth2", "alice", "github", "/github-mcp", _token(), purpose=keys.EGRESS_PURPOSE
+        )
+        await store.delete_token(
+            "oauth2", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+        )
+        assert (
+            await store.get_token(
+                "oauth2", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+            )
+            is None
+        )
+        await store.delete_token(
+            "oauth2", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+        )  # again, no raise
 
     async def test_list_for_user_returns_connections_without_tokens_leaking(self, store):
-        await store.put_token("oauth2", "alice", "github", "/github-mcp", _token("a1"))
-        await store.put_token("oauth2", "alice", "slack", "/slack-mcp", _token("a2"))
-        await store.put_token("oauth2", "bob", "github", "/github-mcp", _token("b1"))
+        await store.put_token(
+            "oauth2", "alice", "github", "/github-mcp", _token("a1"), purpose=keys.EGRESS_PURPOSE
+        )
+        await store.put_token(
+            "oauth2", "alice", "slack", "/slack-mcp", _token("a2"), purpose=keys.EGRESS_PURPOSE
+        )
+        await store.put_token(
+            "oauth2", "bob", "github", "/github-mcp", _token("b1"), purpose=keys.EGRESS_PURPOSE
+        )
 
         conns = await store.list_for_user("oauth2", "alice")
         pairs = sorted((p, s) for p, s, _ in conns)
@@ -175,20 +199,35 @@ class TestSecretStoreContract:
     async def test_auth_method_namespacing_prevents_cross_vend(self, store):
         # A network-trusted static-key caller named "alice" must NOT read
         # the real oauth2 user alice's token.
-        await store.put_token("oauth2", "alice", "github", "/github-mcp", _token("real"))
         await store.put_token(
-            "network-trusted", "alice", "github", "/github-mcp", _token("staticbot")
+            "oauth2", "alice", "github", "/github-mcp", _token("real"), purpose=keys.EGRESS_PURPOSE
         )
-        real = await store.get_token("oauth2", "alice", "github", "/github-mcp")
-        bot = await store.get_token("network-trusted", "alice", "github", "/github-mcp")
+        await store.put_token(
+            "network-trusted",
+            "alice",
+            "github",
+            "/github-mcp",
+            _token("staticbot"),
+            purpose=keys.EGRESS_PURPOSE,
+        )
+        real = await store.get_token(
+            "oauth2", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+        )
+        bot = await store.get_token(
+            "network-trusted", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+        )
         assert real.access_token == "real"
         assert bot.access_token == "staticbot"  # distinct buckets
 
     @pytest.mark.parametrize("auth_method,user_id,provider,server_path", HARD_KEYS)
     async def test_hard_keys_roundtrip(self, store, auth_method, user_id, provider, server_path):
         tok = _token(f"tok_{user_id}")
-        await store.put_token(auth_method, user_id, provider, server_path, tok)
-        got = await store.get_token(auth_method, user_id, provider, server_path)
+        await store.put_token(
+            auth_method, user_id, provider, server_path, tok, purpose=keys.EGRESS_PURPOSE
+        )
+        got = await store.get_token(
+            auth_method, user_id, provider, server_path, purpose=keys.EGRESS_PURPOSE
+        )
         assert got is not None and got.access_token == tok.access_token
         conns = await store.list_for_user(auth_method, user_id)
         assert (provider, server_path) in [(p, s) for p, s, _ in conns]
@@ -248,9 +287,13 @@ class TestOpenBaoReauth:
     async def test_get_reauthenticates_and_retries_once(self):
         store, state = self._store_that_forbids_until_reauth()
         # token gets written only after reauth flips authed=True
-        await store.put_token("oauth2", "alice", "github", "/github-mcp", _token("a1"))
+        await store.put_token(
+            "oauth2", "alice", "github", "/github-mcp", _token("a1"), purpose=keys.EGRESS_PURPOSE
+        )
         assert state["logins"] == 1  # the put triggered one re-auth
-        got = await store.get_token("oauth2", "alice", "github", "/github-mcp")
+        got = await store.get_token(
+            "oauth2", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+        )
         assert got is not None and got.access_token == "a1"
 
     async def test_persistent_forbidden_eventually_raises(self):
@@ -275,7 +318,9 @@ class TestOpenBaoReauth:
         from registry.secrets.interfaces import SecretStoreError
 
         with pytest.raises(SecretStoreError):
-            await store.get_token("oauth2", "alice", "github", "/github-mcp")
+            await store.get_token(
+                "oauth2", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+            )
         assert logins["n"] == 1  # retried exactly once
 
 
@@ -345,10 +390,14 @@ class TestOverflowStaleReadRetry:
         store = SecretsManagerStore(client=client, prefix="mcp/egress", target_payload_bytes=6144)
         tok_a = self._big_token("a")
         tok_b = self._big_token("b")
-        await store.put_token("oauth2", "alice", "github", "/github", tok_a)
-        await store.put_token("oauth2", "alice", "slack", "/slack", tok_b)
+        await store.put_token(
+            "oauth2", "alice", "github", "/github", tok_a, purpose=keys.EGRESS_PURPOSE
+        )
+        await store.put_token(
+            "oauth2", "alice", "slack", "/slack", tok_b, purpose=keys.EGRESS_PURPOSE
+        )
         # The principal name is encoded; derive the real root secret id from the store.
-        root_name = store._secret_name("oauth2", "alice")
+        root_name = store._secret_name("oauth2", "alice", keys.EGRESS_PURPOSE)
         # Confirm we are actually in the sharded layout.
         root = client.get_secret_value(SecretId=root_name)["SecretString"]
         assert "_egress" in root, "test setup did not reach sharded layout"
@@ -364,7 +413,9 @@ class TestOverflowStaleReadRetry:
         try:
             store._client = _RaceOnceClient(client, root_name, new_root)
             # The first shard read is sabotaged; the retry must re-read and succeed.
-            got = await store.get_token("oauth2", "alice", "github", "/github")
+            got = await store.get_token(
+                "oauth2", "alice", "github", "/github", purpose=keys.EGRESS_PURPOSE
+            )
             assert got is not None and got.access_token.startswith("a")
         finally:
             ctx.stop()
@@ -377,6 +428,161 @@ class TestOverflowStaleReadRetry:
             assert pairs == [("github", "/github"), ("slack", "/slack")]
         finally:
             ctx.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Write verification against a stale read-back (issue #1875)
+# --------------------------------------------------------------------------- #
+
+
+class ResourceNotFoundException(Exception):
+    """Mirrors the boto3 error (matched by class name in the store)."""
+
+
+class _StaleReadBackClient:
+    """Wrap a Secrets Manager client so that, after each write, the next
+    ``stale_reads`` reads of that secret still return what was there before the
+    write: the previous value, or ResourceNotFoundException for a secret that was
+    just created. This is what GetSecretValue (AWSCURRENT) can return right after
+    PutSecretValue or CreateSecret, although the write succeeded.
+    """
+
+    def __init__(self, client, stale_reads: int) -> None:
+        self._client = client
+        self._stale_reads = stale_reads
+        self._pending: dict[str, list[str | None]] = {}
+        self.stale_served = 0
+
+    def _current(self, secret_id: str) -> str | None:
+        try:
+            return self._client.get_secret_value(SecretId=secret_id)["SecretString"]
+        except Exception:
+            return None
+
+    def put_secret_value(self, **kwargs):
+        previous = self._current(kwargs["SecretId"])
+        response = self._client.put_secret_value(**kwargs)
+        self._pending[kwargs["SecretId"]] = [previous] * self._stale_reads
+        return response
+
+    def create_secret(self, **kwargs):
+        response = self._client.create_secret(**kwargs)
+        self._pending[kwargs["Name"]] = [None] * self._stale_reads
+        return response
+
+    def get_secret_value(self, **kwargs):
+        pending = self._pending.get(kwargs["SecretId"])
+        if pending:
+            previous = pending.pop(0)
+            self.stale_served += 1
+            if previous is None:
+                raise ResourceNotFoundException(kwargs["SecretId"])
+            return {"SecretString": previous}
+        return self._client.get_secret_value(**kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
+@pytest.mark.unit
+class TestWriteVerificationReadBack:
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch):
+        import registry.secrets.secrets_manager.store as store_mod
+
+        monkeypatch.setattr(store_mod, "_READ_BACK_BACKOFF_BASE", 0)
+
+    @pytest.fixture
+    def aws_client(self):
+        moto = pytest.importorskip("moto")
+        boto3 = pytest.importorskip("boto3")
+        with moto.mock_aws():
+            yield boto3.client("secretsmanager", region_name="us-east-1")
+
+    async def test_inline_write_survives_stale_read_back(self, aws_client):
+        client = _StaleReadBackClient(aws_client, stale_reads=2)
+        store = SecretsManagerStore(client=client, prefix="mcp/egress")
+
+        # First write creates the secret (read-back not found), second one
+        # updates it (read-back returns the previous version).
+        await store.put_token(
+            "oauth2", "alice", "github", "/github", _token("first"), purpose=keys.EGRESS_PURPOSE
+        )
+        await store.put_token(
+            "oauth2", "alice", "github", "/github", _token("second"), purpose=keys.EGRESS_PURPOSE
+        )
+
+        got = await store.get_token(
+            "oauth2", "alice", "github", "/github", purpose=keys.EGRESS_PURPOSE
+        )
+        assert got is not None and got.access_token == "second"
+        assert client.stale_served == 4
+
+    async def test_sharded_write_survives_stale_read_back(self, aws_client):
+        client = _StaleReadBackClient(aws_client, stale_reads=2)
+        # 6 KiB target: two ~4 KiB tokens overflow to shards plus a manifest.
+        store = SecretsManagerStore(client=client, prefix="mcp/egress", target_payload_bytes=6144)
+
+        await store.put_token(
+            "oauth2",
+            "alice",
+            "github",
+            "/github",
+            _token("a" + "x" * 4000),
+            purpose=keys.EGRESS_PURPOSE,
+        )
+        await store.put_token(
+            "oauth2",
+            "alice",
+            "slack",
+            "/slack",
+            _token("b" + "x" * 4000),
+            purpose=keys.EGRESS_PURPOSE,
+        )
+
+        root_name = store._secret_name("oauth2", "alice", keys.EGRESS_PURPOSE)
+        assert "_egress" in aws_client.get_secret_value(SecretId=root_name)["SecretString"]
+        pairs = sorted((p, s) for p, s, _ in await store.list_for_user("oauth2", "alice"))
+        assert pairs == [("github", "/github"), ("slack", "/slack")]
+
+    async def test_persistently_stale_read_back_still_fails(self, aws_client):
+        from registry.secrets.interfaces import SecretStoreError
+
+        store = SecretsManagerStore(client=aws_client, prefix="mcp/egress")
+        await store.put_token(
+            "oauth2", "alice", "github", "/github", _token("first"), purpose=keys.EGRESS_PURPOSE
+        )
+        store._client = _StaleReadBackClient(aws_client, stale_reads=100)
+
+        with pytest.raises(SecretStoreError, match="inline write verification failed"):
+            await store.put_token(
+                "oauth2",
+                "alice",
+                "github",
+                "/github",
+                _token("second"),
+                purpose=keys.EGRESS_PURPOSE,
+            )
+
+    async def test_read_back_that_keeps_failing_raises_after_last_attempt(self, aws_client):
+        import registry.secrets.secrets_manager.store as store_mod
+        from registry.secrets.interfaces import SecretStoreError
+
+        # The secret is created, but every read-back still finds nothing: the last
+        # read error is raised, not a verification mismatch.
+        client = _StaleReadBackClient(aws_client, stale_reads=100)
+        store = SecretsManagerStore(client=client, prefix="mcp/egress")
+
+        with pytest.raises(SecretStoreError, match="is missing"):
+            await store.put_token(
+                "oauth2",
+                "alice",
+                "github",
+                "/github",
+                _token("first"),
+                purpose=keys.EGRESS_PURPOSE,
+            )
+        assert client.stale_served == store_mod._READ_BACK_ATTEMPTS
 
 
 # --------------------------------------------------------------------------- #
@@ -417,14 +623,20 @@ class TestOpenBaoTransientRetry:
             return real_write(path, secret, mount_point)
 
         kv.create_or_update_secret = flaky_write
-        await store.put_token("oauth2", "alice", "github", "/github-mcp", _token("a1"))
+        await store.put_token(
+            "oauth2", "alice", "github", "/github-mcp", _token("a1"), purpose=keys.EGRESS_PURPOSE
+        )
         assert calls["n"] == 3
-        got = await store.get_token("oauth2", "alice", "github", "/github-mcp")
+        got = await store.get_token(
+            "oauth2", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+        )
         assert got is not None and got.access_token == "a1"
 
     async def test_read_retries_through_connection_refused(self):
         store, kv = self._store()
-        await store.put_token("oauth2", "alice", "github", "/github-mcp", _token("a1"))
+        await store.put_token(
+            "oauth2", "alice", "github", "/github-mcp", _token("a1"), purpose=keys.EGRESS_PURPOSE
+        )
         real_read = kv.read_secret_version
         calls = {"n": 0}
 
@@ -437,7 +649,9 @@ class TestOpenBaoTransientRetry:
             return real_read(path, mount_point, raise_on_deleted_version)
 
         kv.read_secret_version = flaky_read
-        got = await store.get_token("oauth2", "alice", "github", "/github-mcp")
+        got = await store.get_token(
+            "oauth2", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+        )
         assert got is not None and got.access_token == "a1"
 
     async def test_persistent_transient_raises_after_bounded_retries(self):
@@ -453,7 +667,9 @@ class TestOpenBaoTransientRetry:
 
         kv.create_or_update_secret = always_down
         with pytest.raises(SecretStoreError):
-            await store.put_token("oauth2", "alice", "github", "/github-mcp", _token())
+            await store.put_token(
+                "oauth2", "alice", "github", "/github-mcp", _token(), purpose=keys.EGRESS_PURPOSE
+            )
         # initial attempt + N bounded retries, then give up (no infinite loop)
         assert calls["n"] == store_mod._TRANSIENT_RETRIES + 1
 
@@ -469,7 +685,9 @@ class TestOpenBaoTransientRetry:
         from registry.secrets.interfaces import SecretStoreError
 
         with pytest.raises(SecretStoreError):
-            await store.put_token("oauth2", "alice", "github", "/github-mcp", _token())
+            await store.put_token(
+                "oauth2", "alice", "github", "/github-mcp", _token(), purpose=keys.EGRESS_PURPOSE
+            )
         assert calls["n"] == 1  # raised immediately, no retry
 
     async def test_write_retries_on_transient_error_type(self):
@@ -490,9 +708,13 @@ class TestOpenBaoTransientRetry:
             return real_write(path, secret, mount_point)
 
         kv.create_or_update_secret = flaky_write
-        await store.put_token("oauth2", "alice", "github", "/github-mcp", _token("a1"))
+        await store.put_token(
+            "oauth2", "alice", "github", "/github-mcp", _token("a1"), purpose=keys.EGRESS_PURPOSE
+        )
         assert calls["n"] == 2
-        got = await store.get_token("oauth2", "alice", "github", "/github-mcp")
+        got = await store.get_token(
+            "oauth2", "alice", "github", "/github-mcp", purpose=keys.EGRESS_PURPOSE
+        )
         assert got is not None and got.access_token == "a1"
 
 

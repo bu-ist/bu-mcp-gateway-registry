@@ -6,20 +6,36 @@ from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlparse
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from registry.common.request_origin import normalize_origin
 from registry.common.secret_key import validate_secret_key
+from registry.common.session_cookie import (
+    DEFAULT_SESSION_COOKIE_NAME,
+    check_host_prefix_settings,
+    check_session_cookie_name,
+    effective_session_cookie_name,
+    session_cookie_signing_salt,
+)
+from registry.constants import (
+    MAX_EMBEDDINGS_EXTRA_HEADERS,
+    REGISTRY_MANAGED_EMBEDDINGS_HEADERS,
+)
+from registry.utils.embeddings_provider import (
+    resolve_remote_model,
+)
+from registry.utils.header_validation import (
+    validate_header_name,
+    validate_header_value,
+)
 
 
 def _normalize_cors_origin(value: str) -> str | None:
     """Validate and normalize a single CORS origin string.
 
-    A valid origin is ``scheme://host[:port]`` with an ``http`` or ``https``
-    scheme and no path, query, fragment, credentials, or wildcard. This is a
-    strict allowlist check: anything that does not parse cleanly to an exact
-    origin returns ``None`` so the caller can reject it rather than widening
-    the CORS policy.
+    The parser lives in ``registry/common/request_origin.py`` so the CORS
+    allowlist and the auth server's MCP Origin check accept the same origins.
 
     Args:
         value: Candidate origin string (already whitespace-stripped).
@@ -28,43 +44,7 @@ def _normalize_cors_origin(value: str) -> str | None:
         The normalized ``scheme://host[:port]`` origin (lower-cased scheme and
         host), or ``None`` if the value is not a well-formed exact origin.
     """
-    if not value or "*" in value:
-        return None
-    try:
-        parsed = urlparse(value)
-        # Accessing .port validates the port and may raise ValueError for an
-        # out-of-range or non-numeric port; catching it here fails closed.
-        port = parsed.port
-    except ValueError:
-        return None
-    if parsed.scheme not in ("http", "https"):
-        return None
-    if not parsed.hostname:
-        return None
-    # Reject anything carrying a path/query/fragment or userinfo: an origin is
-    # only scheme + host + optional port.
-    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-        return None
-    if parsed.username or parsed.password:
-        return None
-    host = parsed.hostname.lower()
-    # Strip a single trailing dot (FQDN root label). Browsers never send a
-    # trailing-dot Origin header, so a configured "example.com." would be a
-    # dead entry; normalizing it keeps the allowlist matching real origins.
-    if host.endswith(".") and not host.endswith(".."):
-        host = host[:-1]
-    if not host:
-        return None
-    # urlparse strips the brackets from IPv6 literals; restore them so the
-    # reconstructed origin matches the bracketed form a browser sends in the
-    # Origin header (e.g. http://[::1]:8080). A colon in the hostname is only
-    # valid for an IPv6 literal.
-    if ":" in host:
-        host = f"[{host}]"
-    scheme = parsed.scheme.lower()
-    if port is not None:
-        return f"{scheme}://{host}:{port}"
-    return f"{scheme}://{host}"
+    return normalize_origin(value)
 
 
 # Accepted values for STORAGE_BACKEND. Keep in sync with the Terraform allowlist
@@ -128,6 +108,29 @@ ALLOWED_SECRET_STORES: frozenset[str] = frozenset(
 # Issue #1477.
 MCP_TOKEN_ABSOLUTE_MAX_TTL_HOURS: int = 168
 
+# Advisory duplicate-check thresholds, per embeddings model. Cosine scales are
+# model-specific and not comparable, so one number cannot serve every model:
+# measured against the same corpus, all-MiniLM-L6-v2 puts unrelated pairs at
+# 0.00-0.25 and genuine duplicates at 0.50-0.83, while
+# openai/text-embedding-ada-002 puts unrelated pairs at 0.73-0.78 (gibberish
+# still scores 0.736) and genuine duplicates at 0.83-0.92. Running MiniLM's
+# number on ada-002 sits below its noise floor and advises
+# dedup_max_suggestions unrelated entries on every registration, which is the
+# symptom issue #1696 reported.
+#
+# Keys are matched as case-insensitive substrings of EMBEDDINGS_MODEL_NAME, so
+# a provider prefix ('openai/text-embedding-ada-002') still resolves.
+# DEDUP_SCORE_THRESHOLD overrides all of this when set.
+DEDUP_THRESHOLD_BY_EMBEDDINGS_MODEL: dict[str, float] = {
+    "all-minilm-l6-v2": 0.45,
+    "text-embedding-ada-002": 0.85,
+}
+
+# Used when no threshold is configured and the model is not one we have
+# measured. Deliberately mid-scale: an uncalibrated model can place unrelated
+# pairs anywhere, and a too-low guess is the noisy failure, not the quiet one.
+DEDUP_THRESHOLD_UNKNOWN_MODEL_DEFAULT: float = 0.6
+
 
 class DeploymentMode(str, Enum):
     """Deployment mode options."""
@@ -181,16 +184,45 @@ class Settings(BaseSettings):
         description="Comma-separated allowlist of hosts the RUM snippet may reference (script src and beacon endpoints). If set, the snippet is rejected (fail closed) when it references any host not on the list. Empty disables the check.",
     )
 
+    # Runtime UI branding folder (logos, favicon, manifest.json, theme.css)
+    ui_branding_dir: str | None = Field(
+        default=None,
+        description="Directory holding the UI branding files served at {ROOT_PATH}/branding/<name>. Flat folder, no subdirectories. When unset, resolves to /app/branding in the container and ./branding in local dev. The entrypoint extracts UI_BRANDING_ARCHIVE_B64 into this directory when that variable is set.",
+    )
+
     # Auth settings
     secret_key: str = ""
-    session_cookie_name: str = "mcp_gateway_session"
-    session_max_age_seconds: int = 60 * 60 * 8  # 8 hours
-    # Secure-by-default: the session cookie carries the Secure flag so browsers
-    # only transmit it over HTTPS. Operators running a plain-HTTP local dev
-    # stack can explicitly opt out with SESSION_COOKIE_SECURE=false; every other
-    # deployment stays protected without extra configuration.
+    # Read by both services (the auth server shares this class). The configured
+    # SESSION_COOKIE_NAME; every reader and writer of the cookie uses
+    # session_cookie_effective_name, which adds the __Host- prefix when it is on.
+    # Validated in __init__ so both services refuse a name a browser would not keep.
+    session_cookie_name: str = DEFAULT_SESSION_COOKIE_NAME
+    session_max_age_seconds: int = Field(
+        default=60 * 60 * 8,
+        description=(
+            "Browser session lifetime in seconds, default 8 hours. The auth server "
+            "stores the session for this long and gives the session cookie this "
+            "Max-Age; the registry and the auth server refuse a cookie signed longer "
+            "ago. Set the same value on both services. Must be positive."
+        ),
+    )
+    # Secure-by-default: on an HTTPS request the session cookie carries the
+    # Secure flag exactly when this is true. On plain HTTP it never does (a
+    # browser drops a Secure cookie set over HTTP), so a localhost stack needs
+    # no opt-out. The auth server's login and the registry's expiries both
+    # decide through session_cookie_secure_flag.
     session_cookie_secure: bool = True
     session_cookie_domain: str | None = None  # e.g., ".example.com" for cross-subdomain sharing
+    session_cookie_host_prefix: bool = Field(
+        default=False,
+        description=(
+            "Name the session cookie __Host-<SESSION_COOKIE_NAME> and set it Secure, "
+            "Path=/ and without Domain, so no sibling subdomain can set or overwrite "
+            "it. Requires SESSION_COOKIE_SECURE=true and an empty SESSION_COOKIE_DOMAIN; "
+            "startup fails otherwise. Turning it on renames the cookie, which signs "
+            "every user out once. Read by the registry and the auth server."
+        ),
+    )
 
     # CORS allowlist. Comma-separated list of exact origins (scheme + host +
     # optional port) permitted to make credentialed cross-origin requests to
@@ -380,15 +412,46 @@ class Settings(BaseSettings):
     embeddings_model_name: str = "all-MiniLM-L6-v2"
     embeddings_model_dimensions: int = 384  # 384 for default and 1024 for bedrock titan v2
 
-    # HNSW vector search tuning (only used with DocumentDB backend)
-    # Higher efSearch improves recall at the cost of query latency.
-    # Default 40 may miss documents in small collections; 100 gives near-exact recall.
-    vector_search_ef_search: int = 100
+    # HNSW vector search tuning (only used with the DocumentDB backend; MongoDB
+    # CE and Atlas take the client-side path, where these are inert).
+    #
+    # efSearch is the dynamic candidate queue HNSW keeps during traversal, the
+    # equivalent of numCandidates in MongoDB Atlas. It bounds how many documents
+    # the search can return, so k can never usefully exceed it. DocumentDB caps
+    # it at 1000. Raised from 100 to 1000 in issue #1751: the search runs a
+    # single global query now rather than one per entity type, so the whole
+    # traversal budget goes to that one query.
+    # Capped at 1000 so a typo fails at startup rather than on every query:
+    # DocumentDB rejects a larger value at query time.
+    vector_search_ef_search: int = Field(default=1000, ge=1, le=1000)
+
+    # DocumentDB applies $match AFTER the vector search, so k is spent selecting
+    # nearest neighbours before entity_type and status/enabled filtering runs,
+    # and whatever the filters discard is simply lost. Over-request to
+    # compensate; MongoDB Atlas calls this the overrequest pattern and
+    # recommends at least 20x. k = max_results * this, clamped to half of
+    # efSearch (issue #1751).
+    #
+    # Must be at least 1. A zero or negative multiplier would build a pipeline
+    # asking for no candidates.
+    vector_search_overrequest: int = Field(default=20, ge=1, le=1000)
+
+    # Concurrent model.encode() calls allowed process-wide. encode() runs in a
+    # worker thread so it no longer blocks the event loop, but torch also
+    # parallelises inside a single encode, so unbounded threads would make every
+    # concurrent search slower. Small on purpose (issue #1751).
+    embeddings_encode_concurrency: int = Field(default=2, ge=1, le=64)
 
     # Search fusion method: 'rrf' (Reciprocal Rank Fusion, industry standard)
     # or 'legacy' (previous additive formula). RRF avoids score saturation and
     # handles missing embeddings gracefully.
     search_fusion_method: str = "rrf"
+
+    # Debug aid: log the raw user search query. Off by default because a query is
+    # free text a user typed and can contain PII. Turning it on logs the query at
+    # INFO in both the registry and mcpgw, and each logs a startup warning so it
+    # is not left on unnoticed. See docs/SECURITY_GUIDELINES.md.
+    search_log_query_text: bool = False
 
     # Custom entity types (admin-defined schema-driven catalog types)
     custom_entity_types_enabled: bool = Field(
@@ -439,6 +502,48 @@ class Settings(BaseSettings):
     #                  directly and extracts the vectors itself. Opt-in only.
     embeddings_response_format: str = "openai"  # "openai" | "raw_array"
 
+    # Timeout and retries for every remote embeddings call (issue #1826). Before
+    # LiteLLM was removed these were LiteLLM's own defaults; now they are ours.
+    # Retries cover 429, 5xx and connection errors; on Amazon Bedrock they map to
+    # botocore's standard retry mode (max_attempts = retries + 1).
+    embeddings_request_timeout_seconds: int = Field(default=30, ge=1, le=600)
+    embeddings_max_retries: int = Field(default=2, ge=0, le=10)
+
+    # Trim target for the single retry after a failed embedding call (#1917). The
+    # first attempt always sends the full text. Only when it fails and the text is
+    # longer than this does the registry retry once with the text trimmed: every
+    # tool/skill name kept, the longest descriptions shortened first. Unset uses a
+    # per-model default: 2048 for Cohere on Amazon Bedrock (its hard limit), 28000
+    # otherwise. Lower it for a model with a smaller input limit.
+    embeddings_retry_max_input_chars: int | None = Field(default=None, ge=256, le=200000)
+
+    @field_validator("embeddings_retry_max_input_chars", mode="before")
+    @classmethod
+    def _empty_retry_max_input_chars_is_unset(cls, v: object) -> object:
+        """Treat a blank value as unset rather than as a parse error.
+
+        Compose passes ``${EMBEDDINGS_RETRY_MAX_INPUT_CHARS:-}`` and Terraform
+        passes an empty string for null, so "not configured" arrives as "".
+        Without this the registry refuses to start on those surfaces.
+        """
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    # Operator-configured extra headers for the embeddings endpoint (issue #1819).
+    # Five separate scalar slots rather than one structured value, so every config
+    # serializer and every deployment surface keeps treating these as plain
+    # strings. Each slot holds one header in HTTP syntax: "Name: value".
+    # Only sent when embeddings_provider='litellm'; validated in __init__.
+    #
+    # NOT a credential store: values are plain config, never encrypted, never
+    # masked. A bearer token belongs in EMBEDDINGS_API_KEY or the IdP auth mode.
+    embeddings_extra_header_1: str = ""
+    embeddings_extra_header_2: str = ""
+    embeddings_extra_header_3: str = ""
+    embeddings_extra_header_4: str = ""
+    embeddings_extra_header_5: str = ""
+
     # IdP client-credentials auth for the litellm embeddings provider.
     # When embeddings_auth_mode == "idp", a bearer token is fetched from the IdP
     # per token-lifetime and injected on each embedding call instead of a static key.
@@ -467,6 +572,19 @@ class Settings(BaseSettings):
     # Well-known discovery settings
     enable_wellknown_discovery: bool = True
     wellknown_cache_ttl: int = 300  # 5 minutes
+
+    # CIMD (Client ID Metadata Document) publisher (issue #992). Default OFF.
+    # When enabled, GET /oauth/client-metadata.json returns a public document
+    # describing THIS registry as an OAuth CLIENT; the document's URL is the
+    # client_id the registry presents to external CIMD-aware IdPs. Renaming the
+    # endpoint would change that client_id, so the path is stable.
+    cimd_publisher_enabled: bool = False
+    cimd_cache_ttl: int = 3600  # public max-age for the CIMD document
+    cimd_client_name: str = "AI Registry Tools"
+    cimd_redirect_uris: str = ""  # CSV; default {egress_oauth_callback_base}/oauth2/egress/callback
+    cimd_scope: str = ""  # space-separated; default advertised OIDC scopes
+    cimd_logo_uri: str = ""  # optional; omitted from the document when empty
+    cimd_contacts: str = ""  # CSV operator contact emails; optional
 
     # ARD Catalog Publisher settings (issue #1294)
     # Publishes /.well-known/ai-catalog.json per the Agentic Resource Discovery spec.
@@ -535,8 +653,13 @@ class Settings(BaseSettings):
             "clients. Useful when the IdP performs RFC 7591 DCR and rejects "
             "registration requests containing scope names it doesn't recognize. "
             "Example: `openid email profile offline_access`. "
-            "When unset, all scopes from the registry's authorization config are "
-            "advertised (default)."
+            "When unset, the OIDC-universal set is advertised (see "
+            "DEFAULT_ADVERTISED_SCOPES in registry/auth/oauth_metadata.py). The "
+            "registry's internal scope names are deliberately NOT advertised: "
+            "they are authorization identifiers rather than IdP OAuth scopes, a "
+            "scope-validating IdP rejects the authorization request with "
+            "`invalid_scope`, and advertising them would name privileged scopes "
+            "to a client that may request them via DCR."
         ),
     )
 
@@ -568,10 +691,31 @@ class Settings(BaseSettings):
     security_scan_enabled: bool = True
     security_scan_on_registration: bool = True
     security_block_unsafe_servers: bool = True
+
+    # When true, a server failing its scan stays enabled with its HIGH/CRITICAL
+    # tools individually blocked instead of the whole server being disabled.
+    # Only has effect when security_block_unsafe_servers is true.
+    security_allow_unsafe_servers: bool = False
+
     security_analyzers: str = "yara"  # Comma-separated: yara, llm, or yara,llm
     security_scan_timeout: int = 60  # 1 minute
     security_add_pending_tag: bool = True
     mcp_scanner_llm_api_key: str = ""  # Optional LLM API key for advanced analysis
+    security_block_on_scan_failure: bool = Field(
+        default=True,
+        description=(
+            "Treat a scan that could not complete as an unsafe verdict. On by "
+            "default, which preserves the behaviour of earlier releases. Turn it "
+            "off to leave an asset enabled when its scan raised: such a scan "
+            "reports is_safe=False with zero findings, so blocking on it disables "
+            "an asset the scanner never actually assessed, and the asset is still "
+            "tagged security-pending either way. Deployments with endpoints that "
+            "cannot be scanned anonymously (per-user egress OAuth, for instance) "
+            "will want it off, since those fail on every registration. Applies to "
+            "servers, agents and skills alike; the per-type block_unsafe_* "
+            "settings still govern assets the scanner did reach a verdict on."
+        ),
+    )
 
     # Agent security scanning settings (A2A Agents)
     agent_security_scan_enabled: bool = True
@@ -663,7 +807,10 @@ class Settings(BaseSettings):
             "Comma-separated CIDR ranges whose addresses the SSRF guard accepts "
             "for proxy_pass_url / agent URLs even though they are private (e.g. "
             "'10.0.0.0/8,192.168.0.0/16'). Use for internal MCP-server subnets. "
-            "The cloud metadata address 169.254.169.254 is never permitted."
+            "A listed range can also admit reserved IPv4 addresses it contains, such "
+            "as Istio's auto-allocated ServiceEntry range '240.240.0.0/16'. "
+            "Cloud metadata/credential, link-local, unspecified and multicast "
+            "addresses are never permitted."
         ),
     )
 
@@ -686,6 +833,68 @@ class Settings(BaseSettings):
             "credential, metadata and link-local addresses are never permitted. "
             "Keep this list tight: entries here receive client secrets, refresh "
             "tokens and user assertions."
+        ),
+    )
+
+    # Forward-proxy egress. OFF by default, deliberately: turning it on relaxes
+    # IP-rebind pinning for targets that resolve exclusively to public addresses
+    # (a CONNECT tunnel is dialed by name, and the proxy resolves that name
+    # itself), so it must be an explicit operator decision rather than a side
+    # effect of HTTP_PROXY happening to be exported into the container.
+    #
+    # NOTE: the SSRF guard reads EGRESS_FORWARD_PROXY_ENABLED from os.environ
+    # directly (registry/utils/url_guard.py::_forward_proxy_config), NOT through
+    # this field. The guard must stay importable without building Settings,
+    # because cli/agentcore uses it with zero registry configuration. This field
+    # exists so the value is documented, validated, and visible on the System
+    # Config page. tests/unit/utils/test_url_guard_forward_proxy.py asserts the
+    # two readers agree on the default and on every truthy spelling Pydantic
+    # accepts, because a config page showing 'true' while the guard behaves as
+    # 'false' is worse than the feature simply being off.
+    egress_forward_proxy_enabled: bool = Field(
+        default=False,
+        description=(
+            "When true, the SSRF-guarded egress clients send a target through the "
+            "forward proxy named in HTTPS_PROXY / HTTP_PROXY only when every "
+            "address it resolves to is on the public internet. Needed where the "
+            "registry has no direct internet egress. A target resolving to an "
+            "internal address stays direct and IP-pinned with no further "
+            "configuration, so internal MCP servers are unaffected. On the proxied "
+            "route the guard still resolves the host and classifies every answer, "
+            "and cloud/workload credential, metadata, link-local, reserved and "
+            "multicast addresses stay hard-denied, but the request is dialed by "
+            "hostname instead of a pinned IP, so DNS-rebinding protection is "
+            "relaxed for public destinations only. NO_PROXY is an override for "
+            "public addresses reachable directly. Credential-bearing profiles "
+            "(egress OAuth, federation, egress upstream) accept only https targets "
+            "through a proxy, so the secret stays inside the CONNECT tunnel. "
+            "Requires the pod to resolve external DNS, because classification runs "
+            "before the CONNECT. See docs/forward-proxy-egress.md."
+        ),
+    )
+
+    # TLS-intercepting proxy support. Follows the existing CA-bundle pattern
+    # (PF_ADMIN_CA_BUNDLE, PINGFEDERATE_CA_BUNDLE, KEYCLOAK_CA_BUNDLE): an env var
+    # holding a path to a mounted PEM, validated fail-closed at startup.
+    # Deliberately NOT SSL_CERT_FILE: ssl.create_default_context(cafile=...)
+    # REPLACES the certifi store instead of adding to it, so an operator who points
+    # SSL_CERT_FILE at the one CA their proxy team gave them loses TLS to every
+    # direct-path target. This setting loads the bundle ON TOP of the default roots.
+    egress_forward_proxy_ca_bundle: str = Field(
+        default="",
+        description=(
+            "Path to a PEM CA bundle the SSRF-guarded egress clients trust, in "
+            "addition to the default roots. Needed when the forward proxy "
+            "terminates TLS and re-signs it with an internal CA, which makes every "
+            "proxied upstream certificate fail verification against public roots. "
+            "The bundle is also used to verify the connection to the proxy itself "
+            "when the proxy endpoint is https. Empty (default) keeps the default "
+            "trust store and changes nothing. A path that is missing, unreadable, "
+            "or not valid PEM raises at startup rather than falling back, because a "
+            "silent fallback surfaces as a certificate error on every proxied "
+            "request. Mount the file into the registry and auth-server containers "
+            "the same way KEYCLOAK_CA_BUNDLE is mounted. Consumed by both "
+            "processes."
         ),
     )
     nginx_config_validation_required: bool = Field(
@@ -869,6 +1078,17 @@ class Settings(BaseSettings):
             "`api://<app-id>` or a custom `api://<uri>`). Used verbatim as the "
             "v1 scope prefix in the PRM and accepted as a token audience. "
             "Defaults to the app's `api://<client-id>` form when unset."
+        ),
+    )
+    entra_login_base_url: str = Field(
+        default="https://login.microsoftonline.com",
+        description=(
+            "Entra ID login base URL for the gateway's OWN token endpoint, used "
+            "by the client_credentials grant that authenticates headless backend "
+            "discovery/health against obo_exchange servers. Override for sovereign "
+            "clouds: US Gov `https://login.microsoftonline.us`, China "
+            "`https://login.partner.microsoftonline.cn`. Mirrors the auth-server's "
+            "ENTRA_LOGIN_BASE_URL."
         ),
     )
 
@@ -1223,6 +1443,35 @@ class Settings(BaseSettings):
             )
         return bounded
 
+    @field_validator("session_max_age_seconds")
+    @classmethod
+    def _require_positive_session_lifetime(
+        cls,
+        v: int,
+    ) -> int:
+        """Refuse a session lifetime of zero or less (fail closed).
+
+        Both services build these settings at startup, so either one refuses
+        to start rather than set cookies that expire at once or sign sessions
+        nobody can verify.
+
+        Args:
+            v: The configured lifetime in seconds.
+
+        Returns:
+            The lifetime, unchanged.
+
+        Raises:
+            ValueError: The lifetime is zero or negative.
+        """
+        if v <= 0:
+            raise ValueError(
+                f"SESSION_MAX_AGE_SECONDS must be a positive number of seconds, got {v}. "
+                "Set it to the browser session lifetime (default 28800, 8 hours) on the "
+                "registry and the auth server, or unset it."
+            )
+        return v
+
     # Demo server configuration
     disable_ai_registry_tools_server: bool = Field(
         default=False,
@@ -1251,7 +1500,9 @@ class Settings(BaseSettings):
         ge=1.0,
         description=(
             "Timeout (seconds) for the auth-server proxy hop's upstream MCP "
-            "request. Raise for servers with long-running tools. The generated "
+            "request, response included: an upstream that keeps the response "
+            "open is cut with a 504 when it expires. Raise for servers with "
+            "long-running tools. The generated "
             "/mcp-proxy/ nginx blocks derive their proxy_read_timeout from this "
             "value (plus a 30s buffer), so raising it lifts the whole proxy "
             "chain; no separate nginx change is needed."
@@ -1389,7 +1640,7 @@ class Settings(BaseSettings):
             "state-changing verb (anything but GET/HEAD/OPTIONS) on a generic "
             "route is refused (403 at /validate, before any token mint) if the "
             "caller authenticated with a session cookie rather than a Bearer "
-            "token. A browser carrying only an ambient mcp_gateway_session cookie "
+            "token. A browser carrying only an ambient session cookie "
             "therefore cannot perform cross-site DELETE/PUT/PATCH; programmatic "
             "Bearer callers are unaffected. Relax only for a trusted same-site "
             "deployment. Consumed by the auth-server."
@@ -1546,18 +1797,74 @@ class Settings(BaseSettings):
             "service themselves remain available regardless."
         ),
     )
-    dedup_score_threshold: float = Field(
-        default=0.7,
+    dedup_score_threshold: float | None = Field(
+        default=None,
         ge=0.0,
         le=1.0,
-        description="Minimum semantic-search score (0..1) for an advisory match to be returned.",
+        description=(
+            "Minimum cosine similarity (0..1) for an advisory match. Leave "
+            "unset to take the default calibrated for the configured "
+            "embeddings model (see DEDUP_THRESHOLD_BY_EMBEDDINGS_MODEL); a "
+            "value here overrides that. Cosine scales are not comparable "
+            "across models, which is why there is no single sensible number: "
+            "on all-MiniLM-L6-v2 unrelated pairs land at 0.00-0.25 and "
+            "genuine duplicates at 0.50-0.83, while on "
+            "openai/text-embedding-ada-002 the same corpus puts unrelated "
+            "pairs at 0.73-0.78 and genuine duplicates at 0.83-0.92. Read "
+            "the effective value from effective_dedup_score_threshold."
+        ),
     )
+
     dedup_max_suggestions: int = Field(
         default=3,
         ge=1,
         le=10,
         description="Cap on the number of duplicate suggestions returned.",
     )
+
+    @field_validator("dedup_score_threshold", mode="before")
+    @classmethod
+    def _empty_threshold_is_unset(cls, v: object) -> object:
+        """Treat a blank value as unset rather than as a parse error.
+
+        Every deployment surface passes this through a template
+        (``${DEDUP_SCORE_THRESHOLD:-}`` on Compose, ``tostring(null)`` on
+        Terraform, ``"" | b64enc`` on Helm), so "not configured" arrives as an
+        empty string rather than an absent variable.
+        """
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @property
+    def effective_dedup_score_threshold(self) -> float:
+        """Resolved advisory threshold: operator value, else per-model default.
+
+        Resolution order, which :meth:`dedup_threshold_source` reports for
+        logging: an explicit ``DEDUP_SCORE_THRESHOLD`` wins; otherwise the
+        default calibrated for the configured embeddings model; otherwise
+        ``DEDUP_THRESHOLD_UNKNOWN_MODEL_DEFAULT``, which is deliberately
+        conservative because an uncalibrated model can put unrelated pairs
+        anywhere.
+        """
+        if self.dedup_score_threshold is not None:
+            return self.dedup_score_threshold
+        model = (self.embeddings_model_name or "").lower()
+        for fragment, threshold in DEDUP_THRESHOLD_BY_EMBEDDINGS_MODEL.items():
+            if fragment in model:
+                return threshold
+        return DEDUP_THRESHOLD_UNKNOWN_MODEL_DEFAULT
+
+    @property
+    def dedup_threshold_source(self) -> str:
+        """Where :attr:`effective_dedup_score_threshold` came from."""
+        if self.dedup_score_threshold is not None:
+            return "configured"
+        model = (self.embeddings_model_name or "").lower()
+        for fragment in DEDUP_THRESHOLD_BY_EMBEDDINGS_MODEL:
+            if fragment in model:
+                return f"model-default:{fragment}"
+        return "unknown-model-default"
 
     # Storage Backend Configuration
     storage_backend: str = Field(
@@ -1609,6 +1916,55 @@ class Settings(BaseSettings):
         default=600,
         description="Lifetime of the signed+encrypted OAuth consent state.",
     )
+    egress_http_pool_max_connections: int = Field(
+        default=100,
+        ge=1,
+        le=10000,
+        description=(
+            "Max total connections per pooled egress httpx client (shared across "
+            "OBO/3LO/vend/OAuth-callback/MCP-proxy-stream/health). Bounds FD and "
+            "ephemeral-port use under burst."
+        ),
+    )
+    egress_http_pool_max_keepalive: int = Field(
+        default=20,
+        ge=0,
+        le=10000,
+        description=(
+            "Max idle keep-alive connections per pooled egress client. Clamped to "
+            "egress_http_pool_max_connections at startup."
+        ),
+    )
+    egress_http_pool_keepalive_expiry_seconds: float = Field(
+        default=30.0,
+        ge=0,
+        le=600,
+        description=(
+            "Idle keep-alive expiry (seconds) for pooled egress clients. Set below "
+            "the shortest upstream/LB idle timeout to minimize keep-alive resets."
+        ),
+    )
+    egress_http_pool_connect_retries: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+        description=(
+            "httpx transport connect-establishment retries for pooled egress "
+            "clients (covers connect failures; an app-level single retry covers a "
+            "reset on keep-alive reuse)."
+        ),
+    )
+
+    @field_validator("egress_http_pool_max_keepalive")
+    @classmethod
+    def _clamp_egress_pool_keepalive(cls, v: int, info: ValidationInfo) -> int:
+        # max_keepalive must not exceed max_connections; the field is declared
+        # after max_connections, so info.data carries the validated value.
+        max_conn = info.data.get("egress_http_pool_max_connections")
+        if isinstance(max_conn, int) and v > max_conn:
+            return max_conn
+        return v
+
     egress_consent_use_elicitation: bool = Field(
         default=False,
         description=(
@@ -1617,7 +1973,9 @@ class Settings(BaseSettings):
             "result with isError=true whose text carries the connect URL -- works "
             "on every MCP client. True (enhancement): a -32042 "
             "URLElicitationRequiredError -- cleaner UX but only on clients that "
-            "understand url-mode elicitation (others may swallow it)."
+            "understand url-mode elicitation (others may swallow it). With True, "
+            "an MCP 2026-07-28 client that declares URL elicitation gets an "
+            "input_required result instead of -32042."
         ),
     )
     egress_registry_internal_url: str = Field(
@@ -1645,15 +2003,45 @@ class Settings(BaseSettings):
             "an explicit, audited set of internal server audiences."
         ),
     )
+    egress_obo_cache_enabled: bool = Field(
+        default=False,
+        description=(
+            "Opt-in: cache exchanged OBO tokens in the per-user SecretStore so "
+            "repeated calls by the same principal to the same audience reuse a "
+            "still-valid token instead of re-exchanging. Default off preserves the "
+            "stateless per-request exchange. On a hit the gateway skips the IdP's "
+            "per-request re-authorization for up to the reuse window -- keep the "
+            "max TTL small (or off) where per-call conditional-access matters."
+        ),
+    )
+    egress_obo_cache_max_ttl_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=3600,
+        description=(
+            "Hard cap (seconds) on the OBO cache reuse window, applied below the "
+            "token's real expiry. Bounds revocation/CA-re-evaluation latency on hits."
+        ),
+    )
+    egress_obo_cache_expiry_skew_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=600,
+        description=(
+            "Never reuse a cached OBO token within this many seconds of its expiry "
+            "(applied once, on read). Must be < EGRESS_OBO_CACHE_MAX_TTL_SECONDS."
+        ),
+    )
     auth_server_nginx_marker_secret: str = Field(
         default="",
         description=(
             "Shared secret: nginx force-sets it as X-Validate-Source-Secret on "
-            "the /validate subrequest; auth_server only mints the egress-capable mcp-proxy "
-            "token when it matches, so a direct :8888 /validate call with a forged "
-            "X-Resolved-Upstream cannot obtain one. Required (non-empty) when "
-            "EGRESS_AUTH_ENABLED=true -- startup fails otherwise, since an empty marker "
-            "would mint unconditionally. Treat as a secret."
+            "the /validate subrequest; auth_server mints the mcp-proxy, generic-proxy "
+            "and registry API tokens only when it matches, so a direct :8888 /validate "
+            "call with a forged routing header cannot obtain one. Always required: "
+            "startup fails when it is unset or shorter than 32 bytes, and an empty marker "
+            "mints nothing. Rotate it on registry and auth_server together; during a "
+            "mismatch every registry API request returns 401. Treat as a secret."
         ),
     )
     aws_secrets_region: str = Field(
@@ -1706,6 +2094,15 @@ class Settings(BaseSettings):
         description="OpenBao auth method: token | kubernetes | approle.",
     )
     openbao_role: str = Field(default="", description="OpenBao role for kubernetes/approle auth.")
+    openbao_auth_mount: str = Field(
+        default="",
+        description=(
+            "Mount path of the OpenBao auth method selected by OPENBAO_AUTH_METHOD "
+            "(kubernetes or approle). Empty keeps the method's default path "
+            "(auth/kubernetes, auth/approle). Set it when the method is mounted "
+            "elsewhere, e.g. one kubernetes mount per cluster on a shared Vault."
+        ),
+    )
 
     @field_validator("app_log_dir", mode="before")
     @classmethod
@@ -2124,13 +2521,18 @@ class Settings(BaseSettings):
         # validated (whitespace-stripped) value so the registry and auth_server
         # derive an identical signing key from the same environment variable.
         self.secret_key = validate_secret_key(self.secret_key)
+        # Strip surrounding whitespace first, like SECRET_KEY: HTTP drops leading and
+        # trailing whitespace from the header nginx sends, so an unstripped value
+        # would never match. Registry and auth_server share this Settings class, so
+        # both compare and render the same stripped value.
+        self.auth_server_nginx_marker_secret = self.auth_server_nginx_marker_secret.strip()
         if not self.auth_server_nginx_marker_secret:
             raise RuntimeError(
                 "AUTH_SERVER_NGINX_MARKER_SECRET environment variable is required. "
                 "Set it to a strong random value (at least 32 bytes), identical across all "
-                "auth_server and registry replicas (see chart values.yaml). Without it, the "
-                "auth_server mints mcp-proxy tokens unconditionally, letting a direct :8888 "
-                "/validate call with a forged X-Resolved-Upstream bypass nginx and obtain one."
+                "auth_server and registry replicas (see chart values.yaml). nginx sends it on "
+                "every /validate call, and the auth_server refuses to mint internal tokens "
+                "without a match, so a direct :8888 /validate call cannot obtain one."
             )
         if len(self.auth_server_nginx_marker_secret.encode()) < 32:
             raise RuntimeError(
@@ -2138,10 +2540,154 @@ class Settings(BaseSettings):
                 "strong random value at least 32 bytes long, identical across all auth_server "
                 "and registry replicas (see chart values.yaml)."
             )
+        if not all("!" <= ch <= "~" and ch != "$" for ch in self.auth_server_nginx_marker_secret):
+            # The registry renders the marker into a quoted nginx string and nginx
+            # sends it as a header. A `$` always starts an nginx variable, and
+            # whitespace or control characters do not survive the header round
+            # trip. A non-ASCII value makes `secrets.compare_digest` raise on every
+            # comparison. Either way every internal-token mint (every registry API
+            # request) would fail without a startup error, so only printable ASCII
+            # other than `$` is accepted.
+            raise RuntimeError(
+                "AUTH_SERVER_NGINX_MARKER_SECRET must contain only printable ASCII "
+                "characters other than '$' (no spaces): it is rendered into the nginx config "
+                "and sent as a header. Generate it with "
+                "`python3 -c 'import secrets; print(secrets.token_hex(32))'`."
+            )
         self.egress_credential_encryption_key = self._validate_credential_encryption_key(
             self.egress_credential_encryption_key
         )
         self._validate_egress_auth_config()
+        self._validate_embeddings_extra_header_slots()
+        self._validate_embeddings_model_name()
+        # The auth server reads these same fields, so both services set and read
+        # the session cookie under one name, and both refuse to start with a
+        # __Host- prefix browsers would reject.
+        check_host_prefix_settings(
+            self.session_cookie_host_prefix,
+            self.session_cookie_secure,
+            self.session_cookie_domain,
+        )
+        self.session_cookie_name = check_session_cookie_name(self.session_cookie_name)
+        if not self.session_cookie_secure:
+            # SESSION_COOKIE_SECURE alone decides Secure on HTTPS. A deployment that
+            # copied an old example with "false" would otherwise lose Secure without a
+            # trace, so say it at every start of both services.
+            logging.getLogger(__name__).warning(
+                "SESSION_COOKIE_SECURE is false: the session cookie is sent without the "
+                "Secure attribute even over HTTPS. Set SESSION_COOKIE_SECURE=true for any "
+                "deployment reachable over HTTPS; plain-HTTP development needs no change, "
+                "because the cookie is never Secure on plain HTTP."
+            )
+
+    @property
+    def session_cookie_effective_name(self) -> str:
+        """The name both services set and read the session cookie under.
+
+        ``SESSION_COOKIE_NAME``, with ``__Host-`` in front when
+        ``SESSION_COOKIE_HOST_PREFIX`` is true.
+        """
+        return effective_session_cookie_name(
+            self.session_cookie_name,
+            self.session_cookie_host_prefix,
+        )
+
+    @property
+    def session_cookie_signing_salt(self) -> str | None:
+        """The salt both services sign and check the session cookie value with.
+
+        None (the serializer's default) with ``SESSION_COOKIE_HOST_PREFIX``
+        off; with it on, a salt naming the effective cookie name, so a value
+        signed for another name is refused.
+        """
+        return session_cookie_signing_salt(
+            self.session_cookie_effective_name,
+            self.session_cookie_host_prefix,
+        )
+
+    def _raw_embeddings_extra_header_slots(self) -> list[tuple[int, str]]:
+        """Return (slot number, stripped value) for every populated header slot."""
+        populated: list[tuple[int, str]] = []
+        for index in range(1, MAX_EMBEDDINGS_EXTRA_HEADERS + 1):
+            raw = getattr(self, f"embeddings_extra_header_{index}", "") or ""
+            if raw.strip():
+                populated.append((index, raw.strip()))
+        return populated
+
+    def _validate_embeddings_model_name(self) -> None:
+        """Reject a remote embeddings model name no adapter can serve, at startup.
+
+        Without this, an unsupported name (for example a cohere/ or voyage/ model
+        LiteLLM used to accept, issue #1826) only fails on the first embedding call
+        and search silently degrades to keyword-only. raw_array posts to
+        EMBEDDINGS_API_BASE whatever the prefix, so it is not checked.
+
+        Raises:
+            ValueError: If the provider is the remote one and the model name has no
+                supported prefix. The message names the replacement.
+        """
+        if self.embeddings_provider.lower() != "litellm":
+            return
+        if self.embeddings_response_format.lower() == "raw_array":
+            return
+        resolve_remote_model(self.embeddings_model_name)
+
+    def _validate_embeddings_extra_header_slots(self) -> None:
+        """Validate every populated EMBEDDINGS_EXTRA_HEADER_<N> slot.
+
+        Runs in __init__ rather than as a @field_validator because a field
+        validator sees one slot at a time and cannot detect the same header name
+        set in two slots. Fails at process start rather than on the first
+        embedding call: a bad header breaks every search query, so a loud
+        startup failure beats a 400 from the endpoint discovered hours later.
+
+        Raises:
+            ValueError: If a slot is malformed, names a registry-managed header,
+                or repeats a header name already set in another slot.
+        """
+        seen: dict[str, int] = {}
+        for index, raw in self._raw_embeddings_extra_header_slots():
+            env_name = f"EMBEDDINGS_EXTRA_HEADER_{index}"
+            if ":" not in raw:
+                raise ValueError(
+                    f"{env_name} must be in 'Name: value' form, e.g. "
+                    "'X-Tenant-Id: research'. Got a value with no colon."
+                )
+            name, _, value = raw.partition(":")
+            name = name.strip()
+            value = value.strip()
+            validate_header_name(name, context=env_name)
+            validate_header_value(value, context=env_name)
+
+            lower_name = name.lower()
+            if lower_name in REGISTRY_MANAGED_EMBEDDINGS_HEADERS:
+                raise ValueError(
+                    f"{env_name} cannot set '{name}': the registry manages this "
+                    "header. For a credential use EMBEDDINGS_API_KEY or "
+                    "EMBEDDINGS_AUTH_MODE=idp."
+                )
+            if lower_name in seen:
+                raise ValueError(
+                    f"{env_name} sets header '{name}', already set by "
+                    f"EMBEDDINGS_EXTRA_HEADER_{seen[lower_name]}. Remove one."
+                )
+            seen[lower_name] = index
+
+    @property
+    def embeddings_extra_headers(self) -> dict[str, str]:
+        """Collapse the EMBEDDINGS_EXTRA_HEADER_<N> slots into a header map.
+
+        Slots may be sparse: setting only _3 is valid. Blank slots are skipped
+        rather than treated as the end of the list, so a gap cannot silently
+        drop the headers after it. Splits on the first colon only, so a value
+        containing a colon (a URL, a timestamp) survives intact. Validation
+        already ran in __init__, so this does not re-check.
+        """
+        headers: dict[str, str] = {}
+        for _index, raw in self._raw_embeddings_extra_header_slots():
+            name, _, value = raw.partition(":")
+            headers[name.strip()] = value.strip()
+        return headers
 
     @staticmethod
     def _validate_credential_encryption_key(value: str | None) -> str:
@@ -2188,8 +2734,47 @@ class Settings(BaseSettings):
         - a public callback base URL is required to build the redirect_uri.
 
         The nginx marker secret is required unconditionally (in __init__), not
-        just for egress, since it guards all mcp-proxy token minting.
+        just for egress, since it guards all internal-token minting.
         """
+        if self.egress_obo_cache_enabled:
+            if not self.egress_auth_enabled:
+                raise ValueError(
+                    "EGRESS_OBO_CACHE_ENABLED=true requires EGRESS_AUTH_ENABLED=true "
+                    "(the cache only applies to obo_exchange servers)."
+                )
+            if self.egress_obo_cache_expiry_skew_seconds >= self.egress_obo_cache_max_ttl_seconds:
+                raise ValueError(
+                    "EGRESS_OBO_CACHE_EXPIRY_SKEW_SECONDS "
+                    f"({self.egress_obo_cache_expiry_skew_seconds}) must be < "
+                    "EGRESS_OBO_CACHE_MAX_TTL_SECONDS "
+                    f"({self.egress_obo_cache_max_ttl_seconds}); otherwise every "
+                    "cached token is born expired."
+                )
+            if self.secret_store_backend not in ("openbao", "secrets-manager"):
+                raise ValueError(
+                    "EGRESS_OBO_CACHE_ENABLED=true requires SECRET_STORE_BACKEND to be "
+                    f"'openbao' or 'secrets-manager'; got {self.secret_store_backend!r}."
+                )
+            if self.secret_store_backend == "openbao" and self.openbao_auth_method != "kubernetes":  # nosec B105 - backend name comparison, not a secret  # pragma: allowlist secret
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "EGRESS_OBO_CACHE_ENABLED=true with OPENBAO_AUTH_METHOD=%r: the "
+                    "OBO cache is NOT confined to the obo-cache namespace by a scoped "
+                    "kubernetes-auth role. Use OPENBAO_AUTH_METHOD=kubernetes (the "
+                    "auth-server-obo-cache role), or scope the OpenBao token's own policy "
+                    "to the obo-cache path.",
+                    self.openbao_auth_method,
+                )
+            if self.auth_provider not in ("entra", "keycloak"):
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "EGRESS_OBO_CACHE_ENABLED=true but auth_provider=%r has no OBO "
+                    "token-exchange path; the cache will never populate.",
+                    self.auth_provider,
+                )
+
         if not self.egress_auth_enabled:
             return
 
@@ -2241,6 +2826,19 @@ class Settings(BaseSettings):
         if self.is_local_dev:
             return Path.cwd() / "registry" / "templates"
         return self.container_registry_dir / "templates"
+
+    @property
+    def branding_dir(self) -> Path:
+        """Resolve the UI branding folder.
+
+        Resolution order: UI_BRANDING_DIR when set, else ./branding in local
+        dev mode, else /app/branding in the container.
+        """
+        if self.ui_branding_dir:
+            return Path(self.ui_branding_dir)
+        if self.is_local_dev:
+            return Path.cwd() / "branding"
+        return self.container_app_dir / "branding"
 
     @property
     def nginx_config_path(self) -> Path:
@@ -2473,6 +3071,40 @@ mode there is no gateway to proxy through, so agent routing is DISABLED:
   - /agent/* paths return the registry-only 503
 
 Set DEPLOYMENT_MODE=with-gateway to actually enable A2A reverse-proxy routing.
+================================================================================
+"""
+    logger.warning(banner)
+    print(banner)
+
+
+def print_embeddings_extra_headers_inert_banner(s: Settings) -> None:
+    """Loudly warn when EMBEDDINGS_EXTRA_HEADER_<N> slots are set but never sent.
+
+    Only the 'litellm' provider makes an HTTP request. 'sentence-transformers'
+    runs the model in-process, so there is no request to attach headers to. An
+    operator who configured headers to reach their endpoint while the provider
+    is sentence-transformers has a bigger problem than the headers: embeddings
+    are not going to that endpoint at all. Header names and values are left out
+    of the banner on purpose; the count shows the slots were read.
+    """
+    header_count = len(s.embeddings_extra_headers)
+    if header_count == 0:
+        return
+    if s.embeddings_provider.lower() == "litellm":
+        return
+    banner = f"""
+================================================================================
+WARNING: EMBEDDINGS_EXTRA_HEADER_<N> is set but will NEVER be sent.
+
+EMBEDDINGS_PROVIDER={s.embeddings_provider} runs the embedding model in-process
+and makes no HTTP request, so there is no request to add headers to.
+{header_count} configured header(s) are being IGNORED.
+
+This usually means the whole endpoint configuration is inert, not just the
+headers: embeddings are being computed locally, not by your endpoint.
+
+Set EMBEDDINGS_PROVIDER=litellm (with EMBEDDINGS_API_BASE) to use your endpoint
+and send these headers.
 ================================================================================
 """
     logger.warning(banner)

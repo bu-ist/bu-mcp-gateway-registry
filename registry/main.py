@@ -54,6 +54,7 @@ from registry.api.skill_routes import router as skill_router
 from registry.api.system_routes import router as system_router
 from registry.api.system_routes import set_server_start_time
 from registry.api.virtual_server_routes import router as virtual_server_router
+from registry.api.wellknown_routes import cimd_router
 from registry.api.wellknown_routes import router as wellknown_router
 
 # Import audit logging
@@ -68,8 +69,10 @@ from registry.auth.dependencies import (
 
 # Import domain routers
 from registry.auth.routes import router as auth_router
+from registry.auth.session_cookie import SessionCookieIsolationMiddleware
 
 # Import core configuration
+from registry.core.aws_credential_posture import log_aws_credential_posture
 from registry.core.config import (
     InternalDeploymentType,
     RegistryMode,
@@ -77,10 +80,11 @@ from registry.core.config import (
     _validate_mode_combination,
     log_tab_visibility_warnings,
     print_a2a_reverse_proxy_mode_banner,
+    print_embeddings_extra_headers_inert_banner,
     settings,
 )
 from registry.core.metrics import DEPLOYMENT_MODE_INFO
-from registry.core.nginx_service import nginx_service
+from registry.core.nginx_service import PROXY_ROUTE_PREFIXES, nginx_service
 from registry.core.telemetry import (
     initialize_telemetry,
     send_startup_ping,
@@ -98,9 +102,20 @@ from registry.repositories.factory import get_search_repository
 from registry.services.agent_service import agent_service
 from registry.services.peer_federation_service import get_peer_federation_service
 from registry.services.peer_sync_scheduler import get_peer_sync_scheduler
+from registry.services.scanner_llm_analyzer import (
+    print_llm_analyzer_unavailable_banner,
+)
 
 # Import services for initialization
 from registry.services.server_service import server_service
+from registry.utils.branding_files import (
+    BRANDING_PATH_SEGMENT,
+    DEFAULT_BRANDING_FILES,
+    BrandingFileRefusedError,
+    branding_content_type,
+    branding_response_headers,
+    read_branding_file,
+)
 
 # Server start time tracking moved to registry/api/system_routes.py
 # Setup logging using shared module (RotatingFileHandler + optional MongoDB)
@@ -174,6 +189,14 @@ def _log_startup_configuration() -> None:
         logger.info("    - Federation API: DISABLED")
 
     logger.info("=" * 60)
+
+    # A dangerous toggle: on, every search query a user types is written to the logs.
+    # Warn so it is not left enabled after a debugging session (issue #1752).
+    if settings.search_log_query_text:
+        logger.warning(
+            "SEARCH_LOG_QUERY_TEXT is enabled. Raw user search queries are being "
+            "written to the logs. Disable this outside of debugging."
+        )
 
     # Nudge operators about recommended-but-optional settings left unset (e.g. the
     # egress credential encryption key when the vault is enabled). Same source of
@@ -446,6 +469,31 @@ async def _apply_aws_registry_env_vars() -> None:
     logger.info(f"Federation config updated: aws_registry.enabled={enabled}")
 
 
+def _is_aws_federation_enabled(
+    federation_config: Any,
+) -> bool:
+    """Report whether AgentCore registry federation is on.
+
+    Args:
+        federation_config: The loaded ``FederationConfig``, or ``None`` when the
+            config could not be read.
+
+    Returns:
+        ``True`` only when the config loaded and the flag is set. An unreadable
+        config counts as enabled, so the credential warning stays quiet rather
+        than telling an operator to detach a profile a federation they cannot
+        confirm may need.
+    """
+    if federation_config is None:
+        return True
+
+    aws_registry = getattr(federation_config, "aws_registry", None)
+    if aws_registry is None:
+        return True
+
+    return bool(getattr(aws_registry, "enabled", True))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle management."""
@@ -479,12 +527,29 @@ async def lifespan(app: FastAPI):
     # deployment mode force-disables it (registry-only). Called after mode
     # correction so it reflects the effective deployment_mode.
     print_a2a_reverse_proxy_mode_banner(settings)
+    print_embeddings_extra_headers_inert_banner(settings)
+    print_llm_analyzer_unavailable_banner(
+        {
+            "SECURITY_ANALYZERS": settings.security_analyzers,
+            "AGENT_SECURITY_ANALYZERS": settings.agent_security_analyzers,
+            "SKILL_SECURITY_ANALYZERS": settings.skill_security_analyzers,
+        }
+    )
 
     # Log startup configuration
     _log_startup_configuration()
 
     # Log warnings for ineffective SHOW_*_TAB overrides
     log_tab_visibility_warnings(settings)
+
+    # Resolve forward-proxy egress configuration now (issue #1832), so a bad
+    # EGRESS_FORWARD_PROXY_CA_BUNDLE path fails the process here rather than
+    # surfacing as a certificate error on the first proxied request, hours later.
+    # Also emits the one INFO line that makes "is the proxy flag actually on in
+    # this pod" answerable from the logs alone.
+    from registry.utils.url_guard import validate_forward_proxy_config
+
+    validate_forward_proxy_config()
 
     # Initialize Prometheus metrics
     _initialize_deployment_metrics()
@@ -588,6 +653,10 @@ async def lifespan(app: FastAPI):
                 f"Failed to apply AWS Registry env vars (continuing with startup): {e}",
                 exc_info=True,
             )
+
+        # Bound before the try so the AWS credential check below can read it even
+        # if loading the config raises.
+        federation_config = None
 
         try:
             # Load federation config
@@ -762,6 +831,13 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to load federation config: {e}")
             logger.info("Continuing without federation")
+
+        # Issue #1861: say which AWS identity this process runs as, and warn when
+        # it can reach instance-metadata credentials no enabled feature needs.
+        # Runs after the federation config load so the AgentCore flag is known.
+        await log_aws_credential_posture(
+            aws_federation_enabled=_is_aws_federation_enabled(federation_config),
+        )
 
         logger.info("Initializing peer federation service...")
         peer_federation_service = get_peer_federation_service()
@@ -944,6 +1020,12 @@ async def lifespan(app: FastAPI):
 
         # Shutdown services gracefully
         await health_service.shutdown()
+
+        # Close pooled egress HTTP clients AFTER the health loop is drained, so no
+        # health/telemetry/peer/update egress call runs on an already-closed client.
+        from registry.utils.url_guard import aclose_shared_clients
+
+        await aclose_shared_clients()
         logger.info("Shutdown completed successfully!")
     except Exception as e:
         logger.error(f"❌ Error during shutdown: {e}", exc_info=True)
@@ -1154,6 +1236,19 @@ if settings.audit_log_enabled:
         log_static_assets=settings.audit_log_static_assets,
     )
 
+# Added last, so it is the outermost of the registry's own middleware and runs
+# before the audit middleware and every other registry component that could
+# read cookies. OpenTelemetry's ASGI middleware, added by instrument_app above
+# or by the opentelemetry-instrument wrapper, wraps the whole stack and runs
+# before it, so OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_SERVER_REQUEST must
+# never list Cookie: OTel would record the raw session cookie. This middleware
+# reads the session cookie once through the shared reader, caches the result in
+# the scope, and removes the session cookie from the Cookie header fields passed
+# on, so a handler that reads it any other way than request_session_cookie gets
+# nothing. When it refused a duplicated session cookie, it also adds the expiry
+# of both session cookie variants to whatever response the request gets.
+app.add_middleware(SessionCookieIsolationMiddleware)
+
 # Register API routers with /api prefix
 app.include_router(system_router, tags=["System"])  # /api/version, /api/stats
 app.include_router(auth_router, prefix="/api/auth", tags=["Authentication"])
@@ -1218,6 +1313,11 @@ app.include_router(registry_router, prefix="/api/registry", tags=["Registry Card
 
 # Register well-known discovery router
 app.include_router(wellknown_router, prefix="/.well-known", tags=["Discovery"])
+
+# CIMD (Client ID Metadata Document) publisher at /oauth/client-metadata.json.
+# Root-mounted (NOT under /.well-known): a CIMD is a client-published resource,
+# and the document URL is the registry's OAuth client_id.
+app.include_router(cimd_router, tags=["Discovery"])
 
 # Register ARD Registry adapter (POST /api/ard/search, GET /api/ard/agents, issue #1295)
 from fastapi.exceptions import RequestValidationError  # noqa: E402
@@ -1404,6 +1504,7 @@ def _build_cached_index_html() -> str | None:
     html_content = html_content.replace('="/static/', f'="{prefix}/static/')
     html_content = html_content.replace('="/favicon.ico"', f'="{prefix}/favicon.ico"')
     html_content = html_content.replace('="/rum.js"', f'="{prefix}/rum.js"')
+    html_content = html_content.replace('="/branding/', f'="{prefix}/branding/')
 
     # Inject <base> tag if not already present (for React Router relative links)
     if "<base" not in html_content:
@@ -1435,6 +1536,121 @@ async def serve_rum_js():
     return FileResponse(rum_path, media_type="application/javascript", headers=headers)
 
 
+# Static UI assets, not an API: kept out of the OpenAPI schema (api/openapi.json).
+@app.api_route(
+    f"/{BRANDING_PATH_SEGMENT}/{{name:path}}",
+    methods=["GET", "HEAD"],
+    include_in_schema=False,
+)
+def serve_branding_file(
+    name: str,
+) -> Response:
+    """Serve a runtime UI branding file from the branding folder.
+
+    Registered unconditionally (like /rum.js) so the route exists whether or
+    not the React build is present, and before the SPA catch-all so a
+    /branding/... request never falls through to index.html. Public: the login
+    page needs the logo and theme before anyone signs in.
+
+    The ``path`` converter captures everything under /branding/ so names with
+    a slash are rejected here with a 404 instead of reaching the SPA. Files are
+    read from disk on every request (never cached in memory), so an edited
+    ConfigMap shows up without a restart. The handler is sync so FastAPI runs
+    the file read in its threadpool rather than on the event loop.
+
+    Args:
+        name: Requested file name; must be a bare allowed branding file name.
+
+    Returns:
+        The file, or the built-in default for a missing manifest.json or
+        theme.css.
+
+    Raises:
+        HTTPException: 404 for a disallowed name, a missing file without a
+            default, or a file that is refused (escapes the folder, too
+            large, not a regular file, changed while being opened).
+    """
+    content_type = branding_content_type(name)
+    if content_type is None:
+        raise HTTPException(status_code=404)
+
+    headers = branding_response_headers(content_type)
+    try:
+        content = read_branding_file(settings.branding_dir, name)
+    except FileNotFoundError:
+        default_content = DEFAULT_BRANDING_FILES.get(name)
+        if default_content is None:
+            raise HTTPException(status_code=404) from None
+        return Response(content=default_content, media_type=content_type, headers=headers)
+    except BrandingFileRefusedError as e:
+        logger.warning("Branding: refusing to serve %s: %s", name, e)
+        raise HTTPException(status_code=404) from None
+
+    return Response(content=content, media_type=content_type, headers=headers)
+
+
+GATEWAY_PROXY_DISABLED_BODY: dict[str, str] = {
+    "error": "gateway_proxy_disabled",
+    "message": (
+        "Gateway proxy is disabled in registry-only mode. Connect directly to the "
+        "MCP server using the proxy_pass_url from server registration."
+    ),
+    "deployment_mode": "registry-only",
+    "hint": "Use GET /api/servers/{path} to retrieve the proxy_pass_url for direct connection.",
+}
+
+
+async def _gateway_proxy_disabled_response(
+    full_path: str,
+) -> JSONResponse | None:
+    """Return the registry-only 503 when a path targets a proxied server or agent.
+
+    In with-gateway mode nginx owns the registered MCP server and A2A agent
+    paths, so this never fires. In registry-only mode no proxy location blocks
+    are generated and the request falls through to the SPA catch-all. Serving
+    index.html to an MCP client would be wrong, so the documented JSON 503 is
+    returned instead.
+
+    Only paths whose first segment is a registered server or one of the nginx
+    proxy namespaces (PROXY_ROUTE_PREFIXES) are rejected. Everything else is a
+    registry route or an SPA route and must be served normally.
+
+    Args:
+        full_path: Request path without a leading slash, as captured by the
+            SPA catch-all route.
+
+    Returns:
+        A 503 JSONResponse for proxy targets, or None to let the SPA serve it.
+    """
+    if settings.nginx_updates_enabled:
+        return None
+
+    first_segment = full_path.strip("/").split("/")[0]
+    if not first_segment:
+        return None
+
+    # Agent, virtual-server and gateway REST/skill paths are nginx proxy
+    # namespaces, never registry app routes, so the prefix alone is enough.
+    # Reaching the app means nginx had no location block for the request:
+    # agent routing is off in registry-only mode, and a virtual server or
+    # skill registered after startup gets no block because registry-only mode
+    # skips nginx reloads.
+    if first_segment in PROXY_ROUTE_PREFIXES:
+        return JSONResponse(status_code=503, content=GATEWAY_PROXY_DISABLED_BODY)
+
+    try:
+        server_info = await server_service.get_server_info(f"/{first_segment}")
+    except Exception:
+        logger.exception("Failed to look up server for registry-only path check")
+        return None
+
+    if server_info is None:
+        return None
+
+    logger.debug("Registry-only mode: returning 503 for proxy path %s", full_path)
+    return JSONResponse(status_code=503, content=GATEWAY_PROXY_DISABLED_BODY)
+
+
 if FRONTEND_BUILD_PATH.exists():
     # Build the cached HTML at import time
     _CACHED_INDEX_HTML = _build_cached_index_html()
@@ -1459,6 +1675,13 @@ if FRONTEND_BUILD_PATH.exists():
             or full_path.startswith("static/")
         ):  # Let static files mount handle these
             raise HTTPException(status_code=404)
+
+        # In registry-only mode there is no gateway to proxy through, so a
+        # request for a registered server (or an agent route) gets a clear JSON
+        # 503 rather than the SPA shell.
+        proxy_disabled = await _gateway_proxy_disabled_response(full_path)
+        if proxy_disabled is not None:
+            return proxy_disabled
 
         if _CACHED_INDEX_HTML is not None:
             return HTMLResponse(content=_CACHED_INDEX_HTML)

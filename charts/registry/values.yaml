@@ -1,9 +1,17 @@
 # Global configuration
 global:
+  # Secret generation switch shared with the umbrella chart. true (default)
+  # generates unresolved secret values randomly and preserves them across
+  # `helm upgrade` via `lookup`. Set false for ArgoCD and other
+  # `helm template` based tools, which render without cluster access: there the
+  # lookup is always empty, so a generated value would differ on every sync.
+  # With generation off, an unresolved value is a render-time error naming the
+  # value to set.
+  generateSecrets: true
   image:
     # Container registry (host + optional namespace). Shared default across subcharts.
     registry: public.ecr.aws/p3v1o3c6
-    tag: 1.29.0
+    tag: 1.37.0
     pullPolicy: IfNotPresent
   cloud:
     # AWS region for cloud detection in telemetry. Set this when deploying
@@ -16,8 +24,18 @@ global:
   # deploy via the umbrella.
   ingress:
     scheme: internet-facing
+    inboundCidrs: # optional comma separated list of allowed inbound CIDR ranges
+    # Optional ALB ssl-policy applied to the HTTPS listener. Leave empty to
+    # let the AWS Load Balancer Controller use its own default
+    # (ELBSecurityPolicy-2016-08). Set a modern policy such as
+    # ELBSecurityPolicy-TLS-1-2-Ext-2018-06 when clients require newer TLS.
+    sslPolicy:
     tls: false
     routingMode: subdomain
+    # Registry hostname prefix used in subdomain mode.
+    registrySubdomain: mcpregistry
+    # Optional full hostnames served by the registry Ingress.
+    additionalHostnames: []
     paths:
       registry: /registry
   # Auth provider used by the registry. Defaults match the umbrella's
@@ -57,8 +75,33 @@ app:
 
   # Session cookie Domain attribute. Leave empty to default to
   # ".<global.domain>". See charts/auth-server/values.yaml for a longer
-  # note on when to override.
+  # note on when to override. Must match the auth-server.
+  # global.sessionCookieDomain, which the stack chart sets, takes precedence;
+  # this key applies only to a standalone install.
   sessionCookieDomain: ""
+  # Name the session cookie __Host-mcp_gateway_session (Secure, Path=/, no
+  # Domain) so no sibling subdomain can set or overwrite it. Requires a Secure
+  # session cookie (global.sessionCookieSecure, or global.ingress.tls=true when
+  # that global is unset) and an empty sessionCookieDomain; the chart then
+  # renders SESSION_COOKIE_DOMAIN empty. Set the same value on auth-server.
+  # Turning it on signs every user out once. See docs/design/cookie-security-design.md.
+  # global.sessionCookieHostPrefix, which the stack chart sets, takes
+  # precedence; this key applies only to a standalone install. It has no
+  # default here so the stack chart can tell an override from the default.
+  # Default: false
+  # sessionCookieHostPrefix: false
+  # SESSION_COOKIE_SECURE has no app key here: global.sessionCookieSecure, which
+  # the stack chart sets, decides it, and a standalone install without that
+  # global follows global.ingress.tls.
+  # Session lifetime in seconds (SESSION_MAX_AGE_SECONDS): how long the registry
+  # accepts the session cookie signature. Must be a positive integer and must
+  # match the auth-server, which stores the session and sets the cookie Max-Age
+  # from the same setting. global.sessionMaxAgeSeconds, which the stack chart
+  # sets, takes precedence; this key applies only to a standalone install. It
+  # has no default here so the stack chart can tell an override from the
+  # default. Unset, the chart renders no SESSION_MAX_AGE_SECONDS and the
+  # registry uses its built-in 8 hours, as the auth-server does.
+  # sessionMaxAgeSeconds:
   # Comma-separated exact browser origins allowed to make credentialed
   # cross-origin requests to the registry API (e.g.
   # "https://app.example.com,https://admin.example.com"). The registry's own
@@ -100,6 +143,16 @@ app:
   # ASOR (Workday) integration (independent of peer federation)
   asorAccessToken: "" # Pre-obtained access token for ASOR federation
   workdayTokenUrl: "" # Workday OAuth2 token endpoint URL
+  # Debug only: log the raw user search query at INFO. A query is free text a user
+  # typed and can carry PII, so this stays false outside of debugging. The registry
+  # logs a startup warning while it is on.
+  searchLogQueryText: false
+  # Treat a scan that could not complete as an unsafe verdict, for servers, agents
+  # and skills alike (SECURITY_BLOCK_ON_SCAN_FAILURE). true disables an asset the
+  # scanner never assessed, as in earlier releases; false keeps it enabled and
+  # tagged security-pending. Endpoints that cannot be scanned anonymously (e.g.
+  # per-user egress OAuth) fail on every registration and will want false.
+  securityBlockOnScanFailure: true
   # Skill security scanning configuration
   skillSecurityScanEnabled: true # Enable/disable skill security scanning
   skillSecurityAnalyzers: "static" # Comma-separated: static, behavioral, llm, meta, virustotal, ai-defense
@@ -161,7 +214,10 @@ app:
   # check is advisory and never blocks registration.
   dedup:
     registrationHintEnabled: true # When true, registration UI pre-flights /check-duplicates and shows hint modal.
-    scoreThreshold: "0.7" # Minimum similarity score (0.0..1.0) for advisory matches.
+    # Empty: use the default calibrated for the embeddings model below
+    # (0.45 for all-MiniLM-L6-v2, 0.85 for text-embedding-ada-002).
+    # Set a value only to override it.
+    scoreThreshold: ""
     maxSuggestions: "3" # Cap on advisory suggestions per request.
   # OpenTelemetry direct OTLP push export configuration
   # Standard OTel SDK var. Setting this activates the OTLP push exporter (the
@@ -340,7 +396,57 @@ app:
   #     wildcards, e.g. "obo-echo.<ns>.svc.cluster.local").
   # The cloud metadata address (169.254.169.254) is never permitted by either.
   ssrfAllowedHosts: ""
+  # For a standalone install. Under the stack chart set global.ssrfAllowedCidrs,
+  # which wins over this value and reaches auth-server and mcpgw too. #2018
   ssrfAllowedCidrs: ""
+  # Forward-proxy egress for the SSRF-guarded clients (issue #1832). OFF by
+  # default. Only needed where the pod has NO direct internet egress and all
+  # outbound traffic must traverse a corporate forward proxy.
+  #
+  # When true, a target is sent through the proxy named in HTTPS_PROXY /
+  # HTTP_PROXY ONLY when every address it resolves to is on the public internet.
+  # An internal target stays direct and IP-pinned with no extra configuration, so
+  # in-cluster MCP servers are unaffected. The guard still resolves and classifies
+  # every answer before any CONNECT, and metadata / credential endpoints stay
+  # hard-denied, but a proxied request is dialed by hostname rather than a pinned
+  # IP, so DNS-rebinding protection is relaxed for public destinations only. That
+  # is why this is opt-in rather than inferred from HTTP_PROXY being set.
+  #
+  # Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY through `extraEnv` below.
+  #
+  #   extraEnv:
+  #     - name: HTTPS_PROXY
+  #       value: "http://corp-proxy.internal:3128"
+  #     - name: HTTP_PROXY
+  #       value: "http://corp-proxy.internal:3128"
+  #     - name: NO_PROXY
+  #       value: "localhost,127.0.0.1,169.254.169.254,169.254.170.2,169.254.170.23,.svc.cluster.local,mcpgw-server,auth-server,keycloak"
+  #
+  # NO_PROXY MUST exclude those three cloud credential endpoints. The pod refuses
+  # to start without them, because setting HTTP_PROXY re-points every proxy-aware
+  # SDK in the process and the AWS SDK would then send IAM credential requests to
+  # the proxy, over plain HTTP and from the proxy's own network position. They are
+  # deliberately NOT chart-managed and NOT in reserved-env-names.txt, because
+  # reserving them would make the chart refuse the configuration this feature
+  # needs. Set them on the auth-server too: it runs the egress-credential-injected
+  # tool call and the OBO token exchange.
+  #
+  # Consider raising HEALTH_CHECK_TIMEOUT_SECONDS too: it is a flat timeout whose
+  # connect budget must cover the TCP connection to the proxy, the CONNECT round
+  # trip AND the TLS handshake. There is no chart value for it, so set it through
+  # `extraEnv` below, the same way as the proxy variables.
+  # See docs/forward-proxy-egress.md.
+  egressForwardProxyEnabled: false
+  # CIMD (Client ID Metadata Document) publisher. When enabled, the registry
+  # serves GET /oauth/client-metadata.json describing itself as an OAuth client
+  # for external CIMD-aware IdPs. Default off; non-secret.
+  cimdPublisherEnabled: false
+  cimdCacheTtl: 3600
+  cimdClientName: "AI Registry Tools"
+  cimdRedirectUris: ""
+  cimdScope: ""
+  cimdLogoUri: ""
+  cimdContacts: ""
   # IDE OAuth login (PR #1224). Pre-registered PUBLIC OAuth client_id that IDEs
   # (Cursor, Claude Code, Codex) use to start the gateway login flow. When set,
   # the Connect config advertises it and drops the static gateway token. Empty
@@ -409,6 +515,16 @@ ard:
 # values and continue to be set via extraEnv.
 embeddings:
   responseFormat: "" # "" (openai envelope, default) or "raw_array" (endpoint returns a bare [[float]] array)
+  requestTimeoutSeconds: "" # "" uses the code default (30). Per remote embeddings request (litellm only).
+  maxRetries: "" # "" uses the code default (2). Retries on 429/5xx/connection errors.
+  retryMaxInputChars: "" # "" uses the per-model default (2048 Cohere on Bedrock, 28000 otherwise). Trim target for the one retry after a failed embedding.
+  # Extra HTTP headers sent on every embeddings request (litellm provider only),
+  # at most 5, each as "Name: value". Rendered as EMBEDDINGS_EXTRA_HEADER_1..N.
+  # Stored in CLEAR TEXT and shown unmasked on the System Config page: never put
+  # a credential here (use the API key or authMode: idp). Example:
+  #   extraHeaders:
+  #     - "X-Tenant-Id: research"
+  extraHeaders: []
   authMode: "" # "" (static, default) or "idp"
   idpTokenEndpoint: "" # OAuth2 token endpoint; https:// required unless idpAllowInsecure
   idpClientId: ""
@@ -427,6 +543,7 @@ entra:
   tenantId: ""
   scopeFormat: "" # Entra PRM scope form: "v1" (api://<app-id>/<scope>) or "v2" (bare, default). Set "v1" only if your app exposes v1-style api:// scopes (issue #990).
   applicationIdUri: "" # Application ID URI (e.g. api://<app-id>). Used as the v1 scope prefix and accepted as a token audience. Defaults to api://<clientId>.
+  loginBaseUrl: "" # Entra login host for the registry's OWN client_credentials grant (headless backend discovery against obo_exchange servers). Leave empty on standard Entra deployments; set only for sovereign clouds (e.g. https://login.microsoftonline.us) or air-gapped deployments. Mirrors the auth-server's value.
 # IdP group filtering (applies to all identity providers)
 # When set, only groups matching any of these prefixes are shown in IAM > Groups
 # Example: "mcp-,registry-,ai-"
@@ -514,6 +631,24 @@ egressAuth:
   tokenRefreshSkewSeconds: "300"
   refreshWorkerIntervalSeconds: "300"
   stateTtlSeconds: "600"
+  # Egress httpx client connection pooling (shared by url_guard). Keep
+  # httpPoolKeepaliveExpirySeconds below the shortest upstream/LB idle timeout.
+  httpPoolMaxConnections: "100"
+  httpPoolMaxKeepalive: "20"
+  httpPoolKeepaliveExpirySeconds: "30"
+  httpPoolConnectRetries: "1"
+  # Opt-in exchanged-OBO-token cache. When enabled, exchanged OBO
+  # tokens are cached in the per-user SecretStore so repeated calls by the same
+  # principal to the same audience reuse a still-valid token instead of
+  # re-exchanging. Default off preserves the stateless per-request exchange.
+  oboCacheEnabled: "false"
+  # Hard cap (seconds) on the OBO cache reuse window, applied below the token's
+  # real expiry. Bounds revocation / conditional-access re-evaluation latency on
+  # cache hits.
+  oboCacheMaxTtlSeconds: "300"
+  # Never reuse a cached OBO token within this many seconds of its expiry. Must be
+  # < oboCacheMaxTtlSeconds.
+  oboCacheExpirySkewSeconds: "30"
   # obo_exchange target_audience allowlist (whitespace-separated). Optional.
   # When set, an obo server may only use a listed audience (authoritative positive
   # control against a confused-deputy that points obo at a shared first-party API).
@@ -539,10 +674,12 @@ egressAuth:
   # (legacy plaintext storage), so existing deployments keep working unchanged.
   credentialEncryptionKey: ""
   # nginx marker secret. REQUIRED for standalone deployment (chart render fails
-  # if empty) -- it guards all mcp-proxy token minting and the app requires it
-  # at startup. Set a strong random value, identical to auth-server's. In the
-  # stack it is auto-generated + shared, so leave empty there. Only used by the
-  # standalone subchart secret.
+  # if empty). It guards all internal-token minting (registry API, mcp-proxy,
+  # generic proxy), so a mismatch with auth-server 401s every registry API
+  # request, and the app requires it at startup. Set a strong random value of
+  # printable ASCII other than '$' (no spaces), identical to auth-server's. In
+  # the stack it is auto-generated + shared, so leave empty there. Only used by
+  # the standalone subchart secret.
   markerSecret: ""
   secretsManager:
     kmsKeyId: "" # Optional CMK; empty uses the AWS-managed key.
@@ -556,6 +693,10 @@ egressAuth:
     # stack's openbao-init Job. Named "registry" (not egress-specific) so more
     # policies can attach to the same role/SA over time.
     role: "registry"
+    # Mount path of the auth method above. Empty = its default path
+    # (auth/kubernetes, auth/approle). Set it when the method is mounted
+    # elsewhere, e.g. "k8s-prod" for one kubernetes mount per cluster.
+    authMount: ""
 # PingFederate integration (used when authProvider.type = "pingfederate")
 pingfederate:
   enabled: false
@@ -655,6 +796,36 @@ rumAllowedHosts: ""
 #       secretKeyRef:
 #         name: my-secret
 #         key: my-key
+# PEM CA bundle mounted into the pod and trusted by the SSRF-guarded egress
+# clients IN ADDITION to the default roots (issue #1832). Needed only when the
+# forward proxy terminates TLS and re-signs it with an internal CA, which makes
+# every proxied upstream certificate fail verification against public roots.
+#
+# Deliberately a narrow, dedicated block rather than generic extraVolumes: it is
+# self-documenting and does not hand operators a way to mount anything anywhere.
+# The deployment derives EGRESS_FORWARD_PROXY_CA_BUNDLE from mountPath and key, so
+# the path is never written twice. A missing or malformed PEM fails the pod at
+# startup rather than surfacing as a certificate error on every proxied request.
+caBundle:
+  enabled: false
+  # Exactly one of these is required when enabled (a `fail` guard enforces it).
+  existingConfigMap: "" # ConfigMap holding the PEM
+  existingSecret: "" # or a Secret, for operators who treat the chain as sensitive
+  key: ca-bundle.pem # key within the ConfigMap or Secret
+  mountPath: /etc/ssl/mcp-gateway # directory the volume is mounted at
+# Runtime UI branding (logos, favicon, colors, named themes, fonts) without an
+# image rebuild. Put the branding files (manifest.json, theme.css, images,
+# .woff2 fonts) in a ConfigMap you manage, binary files under binaryData:
+#   kubectl create configmap registry-branding --from-file=./branding/
+# The whole ConfigMap is mounted read-only as a directory at mountPath (never via
+# subPath, so an edited ConfigMap reaches the pod without a restart) and the
+# deployment sets UI_BRANDING_DIR to mountPath, so the path is never written
+# twice. The registry serves the files at /branding/<name>. Keep the ConfigMap
+# under the 1 MiB Kubernetes object limit. See docs/ui-branding.md.
+branding:
+  enabled: false
+  existingConfigMap: "" # required when enabled (a `fail` guard enforces it)
+  mountPath: /app/branding # directory the ConfigMap is mounted at
 extraEnv: []
 # Extra `envFrom:` sources appended to the container. Use this to inject
 # all keys from an external ConfigMap or Secret you manage (e.g. via

@@ -53,7 +53,7 @@ Based on the files changed, determine which personas should review:
 
 ### Step 2.5: Detect New or Modified Configuration Parameters (CRITICAL)
 
-Before running any reviews, determine whether this PR introduces or modifies any configuration parameters across the three deployment surfaces. If it does, the unified parameter reference must be updated in the same PR — missing updates are a **blocker**.
+Before running any reviews, determine whether this PR introduces or modifies any configuration parameters across the three deployment surfaces. If it does, the unified parameter reference must be updated in the same PR. A missing update is a **blocker**.
 
 **Detection command:**
 
@@ -95,6 +95,47 @@ done
 - [ ] `registry/api/config_routes.py` `CONFIG_GROUPS` is updated so the parameter surfaces in `GET /api/config/full` and the System Config UI.
 
 If any of the above is missing, the review verdict is **REQUEST CHANGES** with a blocker titled "Unified parameter reference not updated".
+
+### Step 2.6: Detect New or Changed API Endpoints (CRITICAL)
+
+`api/openapi.json` is the published API contract, and it is **hand-refreshed**: no script generates it and no CI job checks it. A PR that adds a route therefore passes every gate while leaving the new endpoint invisible to API consumers. This has already happened, more than once in a row, so the spec shipped missing endpoints from several merged PRs at the same time.
+
+**Detection:** does the diff add or change a route decorator?
+
+```bash
+# Matches ANY router object, not just `router`/`app`: real routes are declared on
+# names like `cimd_router`, `wellknown_router`, and a narrower pattern misses them
+# (verified: it missed #1711's `@cimd_router.get(...)` entirely).
+gh pr diff {pr-number} | grep -E '^\+\s*@[A-Za-z_][A-Za-z0-9_]*\.(get|post|put|patch|delete)\('
+```
+
+**If that matches**, check whether the spec was refreshed:
+
+```bash
+gh pr diff {pr-number} --name-only | grep -q '^api/openapi\.json$' \
+  && echo "spec refreshed" || echo "SPEC NOT REFRESHED"
+```
+
+And confirm the new path actually landed in it, rather than the file being touched for an unrelated reason:
+
+```bash
+git show {pr-branch}:api/openapi.json | python3 -c "
+import json, sys
+print(sorted(json.load(sys.stdin)['paths']))
+" | tr ',' '\n' | grep -i '<the new path>'
+```
+
+**Merge-blocking checks:**
+
+- [ ] Every route the diff adds appears in `api/openapi.json`.
+- [ ] Every route the diff removes is gone from it.
+- [ ] `info.version` is a clean release semver, not the app's git-describe development string (`1.30.0-46-g...`).
+- [ ] The diff to `api/openapi.json` is confined to the affected paths. A wholesale reformat usually means it was regenerated with `ensure_ascii=False`, which rewrites every non-ASCII character and hides the real change.
+- [ ] Nothing was removed unexpectedly. Unexplained removals usually mean the container was built with a feature flag off or the wrong `DEPLOYMENT_MODE`, so a whole router never registered.
+
+A route added behind a default-off feature flag still belongs in the spec: FastAPI registers the route regardless, and the flag only changes the response at request time.
+
+If a route was added and the spec was not refreshed, the verdict is **REQUEST CHANGES** with a blocker titled "OpenAPI spec not refreshed for new endpoint". The procedure is in [AGENTS.md](../../../AGENTS.md#regenerating-apiopenapijson); refreshing it can also be offered as a follow-up PR when the author would rather not rebuild locally.
 
 ### Step 3: Run Tests and Quality Checks
 
@@ -176,6 +217,17 @@ Generate the review document using this structure:
 | Linting | {PASS/FAIL} | {summary} |
 | Security Scan | {PASS/FAIL} | {summary} |
 
+### API Spec Check
+
+*Only required when the diff adds or changes a route decorator (see Step 2.6). Mark "Not Applicable" otherwise.*
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Every added route appears in `api/openapi.json` | {PASS/FAIL/N/A} | {the paths} |
+| Every removed route is gone from it | {PASS/FAIL/N/A} | n/a |
+| `info.version` is a release semver, not a dev string | {PASS/FAIL/N/A} | n/a |
+| Spec diff confined to the affected paths | {PASS/FAIL/N/A} | n/a |
+
 ### Configuration Parameter Surface Check
 
 *Only required when the PR touches any parameter-carrying file (see Step 2.5). Mark "Not Applicable" if the detection command returned no matches.*
@@ -183,11 +235,11 @@ Generate the review document using this structure:
 | Check | Status | Details |
 |-------|--------|---------|
 | Unified parameter reference updated (`docs/unified-parameter-reference.md`) | {PASS/FAIL/N/A} | {list of new/renamed/removed parameter names and which rows were added} |
-| Docker column populated (`.env.example`, `docker-compose*.yml`) | {PASS/FAIL/N/A} | — |
-| Terraform column populated (`variables.tf`, `terraform.tfvars.example`, module wiring) | {PASS/FAIL/N/A} | — |
-| Helm column populated (`charts/.../values.yaml`, stack values, templates) | {PASS/FAIL/N/A} | — |
-| `registry/api/config_routes.py` `CONFIG_GROUPS` updated | {PASS/FAIL/N/A} | — |
-| Secrets flagged with **(secret)** and wired through Secrets Manager / `secretKeyRef` | {PASS/FAIL/N/A} | — |
+| Docker column populated (`.env.example`, `docker-compose*.yml`) | {PASS/FAIL/N/A} |, |
+| Terraform column populated (`variables.tf`, `terraform.tfvars.example`, module wiring) | {PASS/FAIL/N/A} |, |
+| Helm column populated (`charts/.../values.yaml`, stack values, templates) | {PASS/FAIL/N/A} |, |
+| `registry/api/config_routes.py` `CONFIG_GROUPS` updated | {PASS/FAIL/N/A} |, |
+| Secrets flagged with **(secret)** and wired through Secrets Manager / `secretKeyRef` | {PASS/FAIL/N/A} |, |
 
 ---
 
@@ -247,7 +299,53 @@ Generate the review document using this structure:
 - [ ] {Action 1}
 ```
 
-### Step 7: Present Review Summary
+### Step 7: Render the review as HTML
+
+A review document is long and heavily tabular, which reads badly as raw markdown in a terminal. Render it so the reader can open a formatted page instead:
+
+```bash
+uv run python scripts/render-doc-html.py .scratchpad/pr-NNNN/review.md
+```
+
+That writes `review.html` beside the markdown, self-contained (all CSS inline, no CDN, no JavaScript, renders from `file://`), using the same stylesheet as the explainer skill so every generated document looks the same. Title and byline come from the document's H1 and the italic lines under it, and a section nav is built from the H2 headings.
+
+Useful flags:
+
+- `--footer-html '...'` for provenance, such as the commit the review was performed against.
+- `--diagrams DIR` to inline SVG from `DIR/<key>.svg` wherever the markdown fences a block as ` ```svg:<key> Optional caption `. Keep the ASCII inside the fence: it is what a terminal reader sees, and a missing `.svg` file falls back to it rather than losing the diagram. A review rarely needs this; a design document often does.
+- `--code-style invert` for the template's dark code blocks. The default (`match`) makes code blocks follow the page surface, which suits a document that is mostly code.
+
+Then check the output, because an unparsed HTML file is worse than none:
+
+```bash
+uv run python scripts/prose-scan.py --strict .scratchpad/pr-NNNN/review.md .scratchpad/pr-NNNN/review.html
+```
+
+The renderer already warns about unfilled placeholders, broken in-page anchors, and `svg:` fences with no matching file. Fix anything it reports and re-run.
+
+Re-render after every edit to the markdown. The markdown is the source; the HTML is a build artifact, and the two drift the moment you hand-edit the HTML.
+
+Open it for the reader rather than starting a server:
+
+```bash
+code -r .scratchpad/pr-NNNN/review.html
+```
+
+Do not start a server. The HTML is self-contained, so the editor's preview or a downloaded copy is enough, and a process the user did not ask for is one they have to hunt down later. If they want HTTP, offer this and let them run it in a VS Code integrated terminal, which is what makes VS Code forward the port:
+
+```bash
+python3 -m http.server 8112 --bind 127.0.0.1 --directory /abs/path/to/.scratchpad/pr-NNNN
+```
+
+Then the URL is `http://127.0.0.1:8112/review.html`, or drop the filename for a directory listing. Point `--directory` at the single document's folder, never at `.scratchpad/` itself: that folder holds credential files and `http.server` serves everything below its root.
+
+#### Trust model for the generated HTML
+
+The renderer treats the markdown body, the byline derived from it, and any inlined SVG as untrusted, because this skill summarizes GitHub-fetched content into that markdown. Raw HTML in the markdown is disabled, the byline is escaped with an href scheme allowlist, and an SVG carrying a script, an event handler, or an external reference aborts the render. A `<script>` in a PR body therefore renders as visible, inert text.
+
+`--byline-html` and `--footer-html` are the two exceptions: both are inserted verbatim. Use them only for first-party provenance text you wrote. Never pass a PR title, an issue body, an author name, or any other fetched metadata through either one.
+
+### Step 8: Present Review Summary
 
 After creating the review document, present a summary to the user:
 
@@ -255,6 +353,25 @@ After creating the review document, present a summary to the user:
 2. List any blockers that must be addressed
 3. Provide the path to the full review document
 4. Offer to explain any specific findings in detail
+5. **End the response with a clickable link to the PR** (see below)
+
+#### Always end with a clickable PR link
+
+The last line of every review response must be a full markdown link to the PR, so
+the reader can open it without copying a number into a URL bar:
+
+```markdown
+[#1711, feat: CIMD client metadata document](https://github.com/agentic-community/mcp-gateway-registry/pull/1711)
+```
+
+Rules:
+
+- Use the full `https://github.com/{owner}/{repo}/pull/{number}` URL. A bare
+  `#1711` renders as plain text in the terminal and is not clickable.
+- Include the PR title after the number, so the link says what it points at.
+- This applies to every response about the PR, not just the first one: follow-up
+  answers, "pushed the fixes", and status updates all end with the link.
+- If the response covers more than one PR, link each of them.
 
 ## Review Principles
 
@@ -302,7 +419,8 @@ User: "/pr-review https://github.com/agentic-community/mcp-gateway-registry/pull
 5. Run tests: All pass
 6. Create `.scratchpad/pr-456/review.md`
 7. Conduct reviews from each persona
-8. Present summary with verdict
+8. Render `review.html` with `scripts/render-doc-html.py`
+9. Present summary with verdict
 
 ## Notes
 
@@ -311,3 +429,4 @@ User: "/pr-review https://github.com/agentic-community/mcp-gateway-registry/pull
 - Be constructive and specific - provide file/line references
 - Acknowledge good practices, not just problems
 - Consider the author's experience level when phrasing feedback
+- The markdown is the source of truth and the HTML is a build artifact. Re-render after any edit rather than hand-editing `review.html`

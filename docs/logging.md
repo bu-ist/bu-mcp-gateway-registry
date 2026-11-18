@@ -33,6 +33,42 @@ registry / auth-server
 - **Admin API**: Three endpoints for querying, exporting, and discovering log metadata. All require admin authentication.
 - **Log Viewer UI**: Filter by service, level, hostname, time range, and message content. Supports pagination and JSONL export.
 
+### What does NOT go through this pipeline
+
+Audit records are **not** application logs and never enter the handlers above.
+`registry.audit.sink` emits them on the `registry.audit.records` logger, which
+has `propagate = False` and its own dedicated handler, so an audit record body
+never reaches the rotating file or the `application_logs` collection. That
+matters because an audit record carries durable IdP identity claims
+(`principal_name`, `canonical_id`, `subject`, `object_id`, `tenant_id`,
+`app_id`), and `application_logs` has a much shorter retention
+(`APP_LOG_CENTRALIZED_TTL_DAYS`, 1 day by default) and a different access
+boundary (the admin log API below) than the audit collection. The claim values
+are additionally masked before that dedicated handler runs, because stdout is
+scraped into this same store; full-fidelity claims live only in the durable
+audit store. See [audit-logging.md](audit-logging.md).
+
+The record's readable `username` is partially masked in that stream rather than
+dropped: `alice@contoso.com` is emitted as `a***@contoso.com`. It stays present
+because it is the only thing that lets an operator tell two callers apart on a
+log line, and it is reduced because on an Entra v1.0 access token it holds the
+same UPN as `principal_name`, so redacting one while emitting the other left the
+address in the stream unchanged. A value with no `@` (an opaque subject, a
+service identity, the `anonymous` literal) is emitted as-is. The unmasked value
+is in the durable audit store, which is what the audit UI and
+`GET /api/audit/*` read.
+
+Because audit records no longer reach the rotating file or `application_logs`,
+they no longer appear in the admin log API. Read them through the audit API
+instead.
+
+Adding `registry.audit.records` to `APP_LOG_EXCLUDED_LOGGERS` is neither needed
+nor sufficient: that setting filters only the MongoDB handler.
+
+### Request lines without query strings
+
+The registry and the auth server log every outbound `httpx` request (`HTTP Request: GET <url> "HTTP/1.1 200 OK"`) and every inbound request in uvicorn's access log (`"GET /path HTTP/1.1" 200`). Both lines omit the query string. A query string can carry a credential: the registry's logout call passes the user's ID token to the auth server as `id_token_hint`, and an OAuth callback receives `code` and `state` (#2027). The URL in an `httpx` line keeps its scheme, host, port and path, and drops the userinfo, query string and fragment, through the shared `redact_url` helper. The nginx access logs are separate and unchanged.
+
 ## Configuration Parameters
 
 All parameters use the `APP_LOG_` prefix. The centralized (MongoDB) storage parameters use `APP_LOG_CENTRALIZED_`.

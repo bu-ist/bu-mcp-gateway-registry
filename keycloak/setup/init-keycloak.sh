@@ -10,6 +10,36 @@ REALM="mcp-gateway"
 KEYCLOAK_ADMIN=""
 KEYCLOAK_ADMIN_PASSWORD=""
 
+# Client scopes that carry gateway authorization rather than OIDC identity.
+# The gateway resolves these names into server and tool access, so a
+# self-registered (DCR) client must never be able to request one: it would be
+# choosing its own privilege.
+#
+# This list is created in the realm and assigned to the M2M client, which is
+# a trusted first-party client.
+PRIVILEGED_CLIENT_SCOPES=(
+    "mcp-servers-unrestricted/read"
+    "mcp-servers-unrestricted/execute"
+    "mcp-servers-restricted/read"
+    "mcp-servers-restricted/execute"
+)
+
+# Names withheld from the DCR allowlist: everything created above, plus the
+# two admin scope documents. Deriving this from the creation list is the
+# point, so a scope added above cannot stay requestable by omission.
+#
+# The last two are the `_id` of a scope document granting `server: "*"` with
+# every action (scripts/registry-admins.json,
+# scripts/mcp-registry-admin.json). This script does not create them as
+# client scopes, so naming them here changes nothing today; the Helm chart
+# does create them, and withholding a name that does not exist is free,
+# whereas allowing one that does would hand a DCR client full admin.
+DCR_WITHHELD_SCOPES=(
+    "${PRIVILEGED_CLIENT_SCOPES[@]}"
+    "mcp-registry-admin"
+    "registry-admins"
+)
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -69,13 +99,8 @@ create_realm() {
 
     echo "Creating MCP Gateway realm..."
 
-    # Check if realm already exists
-    if realm_exists "$token"; then
-        echo -e "${YELLOW}Realm already exists. Skipping creation...${NC}"
-        return 0
-    fi
-
-    # Create basic realm
+    # Realm settings the bootstrap owns. Kept in one place so the create and the
+    # update path below cannot drift.
     local realm_json='{
         "realm": "mcp-gateway",
         "enabled": true,
@@ -83,8 +108,36 @@ create_realm() {
         "loginWithEmailAllowed": true,
         "duplicateEmailsAllowed": false,
         "resetPasswordAllowed": true,
-        "editUsernameAllowed": false
+        "editUsernameAllowed": false,
+        "bruteForceProtected": true,
+        "failureFactor": 5,
+        "waitIncrementSeconds": 60,
+        "maxFailureWaitSeconds": 900,
+        "permanentLockout": false
     }'
+
+    # An existing realm is UPDATED, not skipped. Skipping meant a security setting
+    # added here (e.g. bruteForceProtected) never reached a deployment whose realm
+    # already existed, while the script still reported success.
+    if realm_exists "$token"; then
+        local update_status
+        local update_response
+        update_response=$(curl -sS -w $'\n%{http_code}' \
+            -X PUT "${KEYCLOAK_URL}/admin/realms/${REALM}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -d "$realm_json")
+        update_status="${update_response##*$'\n'}"
+        if [ "$update_status" = "204" ]; then
+            echo -e "${GREEN}Realm already exists; settings updated.${NC}"
+            return 0
+        fi
+        # Print the body: a 4xx on a realm representation names the rejected field,
+        # and a bare status is not actionable.
+        echo -e "${RED}Failed to update existing realm (HTTP ${update_status})${NC}" >&2
+        echo "  response: ${update_response%$'\n'*}" >&2
+        return 1
+    fi
 
     local response=$(curl -s -o /dev/null -w "%{http_code}" \
         -X POST "${KEYCLOAK_URL}/admin/realms" \
@@ -96,17 +149,74 @@ create_realm() {
         echo -e "${GREEN}Realm created successfully!${NC}"
         return 0
     elif [ "$response" = "409" ]; then
-        echo -e "${YELLOW}Realm already exists. Continuing...${NC}"
-        return 0
-    else
-        echo -e "${RED}Failed to create realm. HTTP status: ${response}${NC}"
-        echo "Response body:"
-        curl -s -X POST "${KEYCLOAK_URL}/admin/realms" \
+        # Lost a race with a concurrent bootstrap; the realm exists, so apply the
+        # settings rather than continuing with an unknown configuration.
+        local race_status
+        race_status=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X PUT "${KEYCLOAK_URL}/admin/realms/${REALM}" \
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/json" \
-            -d "$realm_json"
-        echo ""
+            -d "$realm_json")
+        if [ "$race_status" = "204" ]; then
+            echo -e "${YELLOW}Realm already exists; settings updated.${NC}"
+            return 0
+        fi
+        echo -e "${RED}Failed to update existing realm (HTTP ${race_status})${NC}" >&2
         return 1
+    else
+        echo -e "${RED}Failed to create realm. HTTP status: ${response}${NC}" >&2
+        return 1
+    fi
+}
+
+# Create the client if absent, otherwise PUT the full representation so attribute
+# changes (webOrigins, post.logout.redirect.uris) reach deployments whose realm
+# already exists. A bare POST silently 409s on a re-run, which would make every
+# hardening change here a no-op for existing installs. Mirrors upsert_client in
+# charts/keycloak-configure/templates/configmap.yaml and the 409->PUT path in
+# terraform/aws-ecs/scripts/init-keycloak.sh.
+upsert_client() {
+    local token=$1
+    local client_id=$2
+    local client_json=$3
+
+    local existing_id
+    existing_id=$(curl -s \
+        -H "Authorization: Bearer ${token}" \
+        "${KEYCLOAK_URL}/admin/realms/${REALM}/clients?clientId=${client_id}" \
+        | grep -o '"id":"[^"]*' | head -1 | cut -d'"' -f4)
+
+    local status
+    if [ -z "$existing_id" ]; then
+        local create_response
+        create_response=$(curl -sS -w $'\n%{http_code}' \
+            -X POST "${KEYCLOAK_URL}/admin/realms/${REALM}/clients" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -d "$client_json")
+        status="${create_response##*$'\n'}"
+        if [ "$status" = "201" ]; then
+            echo -e "  ${GREEN}Client ${client_id} created${NC}"
+        else
+            echo -e "  ${RED}Failed to create client ${client_id} (HTTP ${status})${NC}" >&2
+            echo "  response: ${create_response%$'\n'*}" >&2
+            return 1
+        fi
+    else
+        local update_response
+        update_response=$(curl -sS -w $'\n%{http_code}' \
+            -X PUT "${KEYCLOAK_URL}/admin/realms/${REALM}/clients/${existing_id}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -d "$client_json")
+        status="${update_response##*$'\n'}"
+        if [ "$status" = "204" ]; then
+            echo -e "  ${GREEN}Client ${client_id} updated${NC}"
+        else
+            echo -e "  ${RED}Failed to update client ${client_id} (HTTP ${status})${NC}" >&2
+            echo "  response: ${update_response%$'\n'*}" >&2
+            return 1
+        fi
     fi
 }
 
@@ -131,20 +241,21 @@ create_clients() {
         "webOrigins": [
             "'${REGISTRY_URL:-http://localhost:7860}'",
             "http://localhost:7860",
-            "+"
+            "http://localhost:8888"
         ],
+        "attributes": {
+            "post.logout.redirect.uris": "'${REGISTRY_URL:-http://localhost:7860}'/*##http://localhost:7860/*##http://localhost:8888/*"
+        },
         "protocol": "openid-connect",
         "standardFlowEnabled": true,
         "implicitFlowEnabled": false,
         "directAccessGrantsEnabled": true,
         "serviceAccountsEnabled": false,
+        "fullScopeAllowed": false,
         "publicClient": false
     }'
 
-    curl -s -X POST "${KEYCLOAK_URL}/admin/realms/${REALM}/clients" \
-        -H "Authorization: Bearer ${token}" \
-        -H "Content-Type: application/json" \
-        -d "$web_client_json" > /dev/null
+    upsert_client "$token" "mcp-gateway-web" "$web_client_json"
 
     # Create M2M client
     local m2m_client_json='{
@@ -157,13 +268,11 @@ create_clients() {
         "implicitFlowEnabled": false,
         "directAccessGrantsEnabled": false,
         "serviceAccountsEnabled": true,
+        "fullScopeAllowed": false,
         "publicClient": false
     }'
 
-    curl -s -X POST "${KEYCLOAK_URL}/admin/realms/${REALM}/clients" \
-        -H "Authorization: Bearer ${token}" \
-        -H "Content-Type: application/json" \
-        -d "$m2m_client_json" > /dev/null
+    upsert_client "$token" "mcp-gateway-m2m" "$m2m_client_json"
 
     echo -e "${GREEN}Clients created successfully!${NC}"
 }
@@ -199,7 +308,7 @@ create_scopes() {
 
     echo "Creating custom MCP scopes..."
 
-    local scopes=("mcp-servers-unrestricted/read" "mcp-servers-unrestricted/execute" "mcp-servers-restricted/read" "mcp-servers-restricted/execute")
+    local scopes=("${PRIVILEGED_CLIENT_SCOPES[@]}")
 
     for scope in "${scopes[@]}"; do
         local scope_json='{
@@ -242,8 +351,9 @@ setup_m2m_scopes() {
         return 1
     fi
 
-    # Get all available client scopes
-    local scopes=("mcp-servers-unrestricted/read" "mcp-servers-unrestricted/execute" "mcp-servers-restricted/read" "mcp-servers-restricted/execute")
+    # The M2M client is a trusted first-party client, so unlike a DCR client it
+    # does get the privileged scopes.
+    local scopes=("${PRIVILEGED_CLIENT_SCOPES[@]}")
 
     for scope in "${scopes[@]}"; do
         # Get scope ID
@@ -560,7 +670,7 @@ setup_groups_mapper() {
 # =============================================================================
 # Dynamic Client Registration (RFC 7591) support
 # =============================================================================
-# Three configuration changes are needed so that MCP clients (Claude Code,
+# Four configuration changes are needed so that MCP clients (Claude Code,
 # Claude.ai connectors, Cursor, etc.) can register themselves dynamically and
 # receive tokens that carry the user's groups for per-user authorization at
 # the gateway:
@@ -578,6 +688,11 @@ setup_groups_mapper() {
 #    policy so MCP clients running on diverse cloud egress IPs (Claude Code's
 #    cloud listener, etc.) can register. The client-URI check stays on with
 #    `localhost` allowed for the OAuth callback redirect URI.
+#
+# 4. configure_dcr_allowed_mapper_types() - narrow down the DCR "Allowed Protocol
+#    Mapper Types" policy (anonymous + authenticated). The gateway's own groups/audience
+#    mappers live on the server-side `basic` client-scope, so this does not
+#    affect legitimate MCP.
 
 setup_dcr_groups_mapper() {
     local token=$1
@@ -706,12 +821,27 @@ configure_dcr_allowed_scopes() {
         return 1
     fi
 
-    # Get the union of all realm client-scope NAMES, plus "openid" (which is
-    # the OIDC identifier scope Claude/MCP DCR clients always request but is
-    # not defined as a Keycloak client-scope; without it the policy 403s).
+    # Build the allowed-client-scopes list from the realm's client-scope NAMES,
+    # minus every scope in PRIVILEGED_CLIENT_SCOPES, plus "openid" (the OIDC
+    # identifier scope Claude/MCP DCR clients always request but which is not
+    # a Keycloak client-scope; without it the policy 403s).
+    #
+    # The exclusion is driven by DCR_WITHHELD_SCOPES, which is built from the
+    # same list create_scopes() creates from, so a privileged scope added
+    # there cannot become requestable here by omission. The "/" filter stays
+    # as a second rule covering a privileged scope some other tool created in
+    # this realm.
+    local privileged_json=$(printf '%s\n' "${DCR_WITHHELD_SCOPES[@]}" | jq -R . | jq -sc .)
+
     local all_scope_names=$(curl -s -H "Authorization: Bearer ${token}" \
         "${KEYCLOAK_URL}/admin/realms/${REALM}/client-scopes" | \
-        jq -c '[.[].name] + ["openid"] | unique')
+        jq -c --argjson privileged "$privileged_json" \
+            '[
+                .[].name
+                | . as $scope
+                | select(($privileged | index($scope)) == null)
+                | select(contains("/") | not)
+             ] + ["openid"] | unique')
 
     # Build the updated policy body. Keep `allow-default-scopes` true so the
     # built-in OIDC scopes still pass; explicitly include every realm scope
@@ -797,6 +927,56 @@ configure_dcr_trusted_hosts() {
     fi
 }
 
+configure_dcr_allowed_mapper_types() {
+    local token=$1
+
+    local components=$(curl -s -H "Authorization: Bearer ${token}" \
+        "${KEYCLOAK_URL}/admin/realms/${REALM}/components?type=org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy")
+
+    local sub_type
+    for sub_type in anonymous authenticated; do
+        local policy_id=$(echo "$components" | \
+            jq -r --arg st "$sub_type" '.[] | select(.name=="Allowed Protocol Mapper Types" and .subType==$st) | .id')
+        local parent_id=$(echo "$components" | \
+            jq -r --arg st "$sub_type" '.[] | select(.name=="Allowed Protocol Mapper Types" and .subType==$st) | .parentId')
+
+        if [ -z "$policy_id" ] || [ "$policy_id" = "null" ]; then
+            echo -e "${YELLOW}No '${sub_type}' Allowed Protocol Mapper Types policy found; skipping.${NC}"
+            continue
+        fi
+
+        local policy_json=$(jq -n \
+            --arg name "Allowed Protocol Mapper Types" \
+            --arg providerId "allowed-protocol-mappers" \
+            --arg providerType "org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy" \
+            --arg parentId "$parent_id" \
+            --arg subType "$sub_type" \
+            '{
+                name: $name,
+                providerId: $providerId,
+                providerType: $providerType,
+                parentId: $parentId,
+                subType: $subType,
+                config: {
+                    "allowed-protocol-mapper-types": []
+                }
+            }')
+
+        local response=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X PUT "${KEYCLOAK_URL}/admin/realms/${REALM}/components/${policy_id}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" \
+            -d "$policy_json")
+
+        if [ "$response" = "204" ]; then
+            echo -e "${GREEN}Allowed Protocol Mapper Types (${sub_type}) narrowed down: no client-supplied mappers permitted.${NC}"
+        else
+            echo -e "${RED}Failed to update Allowed Protocol Mapper Types (${sub_type}). HTTP status: ${response}${NC}"
+            return 1
+        fi
+    done
+}
+
 # Main execution
 main() {
     # Get script directory and find .env file
@@ -804,12 +984,34 @@ main() {
     PROJECT_ROOT="$( cd "$SCRIPT_DIR/../.." && pwd )"
     ENV_FILE="$PROJECT_ROOT/.env"
 
-    # Load environment variables from .env file if it exists
+    # Load environment variables from .env file if it exists.
+    #
+    # The caller's environment WINS over the file for every variable that decides
+    # WHICH Keycloak we talk to or WHAT we write into it. This matters now that an
+    # existing client is PUT rather than skipped, because Keycloak replaces
+    # redirectUris/webOrigins wholesale on that PUT: on a host that also has a
+    # Compose .env, the file's localhost values would be written over a deployed
+    # realm and break login with invalid_redirect_uri. KEYCLOAK_ADMIN_URL is in the
+    # list for the same reason in reverse -- a stale .env would otherwise retarget
+    # the entire run at a local Keycloak.
+    CALLER_PRECEDENCE_VARS="KEYCLOAK_ADMIN_URL REGISTRY_URL AUTH_SERVER_EXTERNAL_URL"
     if [ -f "$ENV_FILE" ]; then
         echo "Loading environment variables from $ENV_FILE..."
+        # Snapshot the caller's values before `set -a; source` overwrites them.
+        local _var _snapshot_name
+        for _var in $CALLER_PRECEDENCE_VARS; do
+            eval "_CALLER_${_var}=\${${_var}:-}"
+        done
         set -a  # Automatically export all variables
         source "$ENV_FILE"
         set +a  # Turn off automatic export
+        for _var in $CALLER_PRECEDENCE_VARS; do
+            _snapshot_name="_CALLER_${_var}"
+            if [ -n "${!_snapshot_name}" ] && [ "${!_snapshot_name}" != "${!_var}" ]; then
+                echo "  Keeping caller-supplied ${_var}=${!_snapshot_name} (ignoring .env)"
+                export "${_var}=${!_snapshot_name}"
+            fi
+        done
         echo "Environment variables loaded successfully"
     else
         echo "No .env file found at $ENV_FILE"
@@ -863,6 +1065,7 @@ main() {
         setup_dcr_audience_mapper "$TOKEN"
         configure_dcr_allowed_scopes "$TOKEN"
         configure_dcr_trusted_hosts "$TOKEN"
+        configure_dcr_allowed_mapper_types "$TOKEN"
     else
         exit 1
     fi

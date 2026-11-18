@@ -46,12 +46,24 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from cloud_labels import DECLINED_LABEL
+from forecast_trend import (
+    FORECAST_RATE_TOLERANCE,
+    FORECAST_TREND_AHEAD,
+    FORECAST_TREND_BEHIND,
+    forecast_trend_from_rates,
+)
+from version_labels import is_release_version
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s,p%(process)s,{%(filename)s:%(lineno)d},%(levelname)s,%(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# Matches DEFAULT_TARGET in generate_install_forecast.py. Used only when the
+# forecast JSON predates the "target" field.
+DEFAULT_FORECAST_TARGET: int = 5000
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -336,7 +348,7 @@ def _build_version_adoption_table(
     ]
     for r in rows:
         lines.append(
-            f"| `{r['version']}` | {r['type'].title()} | {r['events']:,} | "
+            f"| `{r['version']}` | {r['type']} | {r['events']:,} | "
             f"{r['percentage']} | {r['instances']} | {r['instance_percentage']} |"
         )
     return "\n".join(lines)
@@ -386,8 +398,8 @@ def _build_feature_adoption_table(
     if not rows:
         return "| (no data) | | |"
     lines = [
-        "| Feature | Enabled | Rate |",
-        "|---------|--------:|-----:|",
+        "| Feature | Instances | % of Fleet |",
+        "|---------|----------:|-----------:|",
     ]
     for r in rows:
         lines.append(f"| {r['feature']} | {r['enabled']:,} | {r['rate']} |")
@@ -440,6 +452,90 @@ def _build_sticky_cloud_compute_table(
     return "\n".join(lines)
 
 
+AUTH_PATH_VOLUME_BUCKETS = ("0", "1-9", "10-99", "100-999", "1k-9k", "10k+")
+
+
+def _build_auth_path_status_line(
+    auth_path: dict,
+    total_instances: int,
+) -> str:
+    """Render the one-sentence verdict on auth-path collection."""
+    reporting = int(auth_path.get("reporting_instances") or 0)
+    total = int(auth_path.get("total_instances") or total_instances or 0)
+    schema_v6 = int(auth_path.get("schema_v6_instances") or 0)
+    coverage = float(auth_path.get("coverage_pct") or 0.0)
+    if reporting > 0:
+        # A single instance in a fleet of thousands rounds to 0.0%, which reads as
+        # a contradiction next to "Collected". Floor the display instead.
+        shown = f"{coverage:.1f}%" if coverage >= 0.05 else "<0.1%"
+        return f"Collected: {reporting} of {total} instances ({shown}) report an auth-path mix."
+    if schema_v6 > 0:
+        return (
+            f"Not collected yet: {schema_v6} of {total} instances run telemetry schema v6, "
+            f"yet no auth-path mix reached the database."
+        )
+    return f"Not collected yet: none of {total} instances report an auth-path mix."
+
+
+def _build_auth_path_mix_table(
+    auth_path: dict,
+) -> str:
+    """Render the volume-weighted fleet share per auth path."""
+    share = auth_path.get("fleet_share_pct") or {}
+    if not share:
+        return "_No instance reports an auth-path mix, so there is no share to show._"
+    per_path = auth_path.get("per_path_instances") or {}
+    lines = [
+        "| Auth Path | Fleet Share | Instances |",
+        "|-----------|------------:|----------:|",
+    ]
+    for path, pct in sorted(share.items(), key=lambda kv: (-float(kv[1]), kv[0])):
+        lines.append(f"| `{path}` | {float(pct):.1f}% | {per_path.get(path, 0)} |")
+    return "\n".join(lines)
+
+
+def _build_auth_path_volume_table(
+    auth_path: dict,
+) -> str:
+    """Render the per-instance 24-hour authentication-volume buckets."""
+    counts = auth_path.get("volume_bucket_counts") or {}
+    if not counts:
+        return "_No instance reports a 24-hour authentication volume._"
+    total = sum(counts.values()) or 1
+    ordered = [b for b in AUTH_PATH_VOLUME_BUCKETS if b in counts]
+    ordered += sorted(b for b in counts if b not in AUTH_PATH_VOLUME_BUCKETS)
+    lines = [
+        "| Authentications per 24h | Instances | % of Reporting |",
+        "|-------------------------|----------:|---------------:|",
+    ]
+    for bucket in ordered:
+        count = counts[bucket]
+        lines.append(f"| `{bucket}` | {count} | {count / total * 100:.1f}% |")
+    return "\n".join(lines)
+
+
+def _build_auth_path_window_summary(
+    auth_path: dict,
+) -> str:
+    """Describe the reported auth-path measurement windows."""
+    window = auth_path.get("window_hours") or {}
+    median = window.get("median")
+    if median is None:
+        return "_No instance reports an auth-path measurement window._"
+    low = int(window.get("min") or 0)
+    high = int(window.get("max") or 0)
+    if high == 0:
+        return (
+            "Reporting instances measure their mix over a window under an hour old, so the "
+            "shares are an early sample. The registry clamps this window to 48 hours."
+        )
+    span = f"{low} to {high} hours" if low != high else f"{high} hours"
+    return (
+        f"Reporting instances measure their mix over {span}, median "
+        f"{float(median):.1f}. The registry clamps this window to 48 hours."
+    )
+
+
 def _read_section_from_tables_md(
     path: str,
     section_header: str,
@@ -490,9 +586,8 @@ def _build_detection_by_version_narrative(
         return sum(int(row.get(m, 0)) for m in methods) / total * 100
 
     # Identify "release" versions (skip the "other" rollup, dev branches, sha-only refs)
-    is_release_re = re.compile(r"^v?\d+\.\d+\.\d+(?:-p\d+)?$")
     releases = [
-        r for r in rows if is_release_re.match(r.get("version", "")) and int(r.get("total", 0)) >= 5
+        r for r in rows if is_release_version(r.get("version", "")) and int(r.get("total", 0)) >= 5
     ]
 
     if not releases:
@@ -627,7 +722,8 @@ def _build_architecture_patterns(
             )
 
     # 5. Surprising survivor: longest-running customer NOT on AWS
-    non_aws = [c for c in customers if c.get("cloud") not in ("aws", "unknown")]
+    # declined is an operator's Dismiss on the cloud banner, not a cloud.
+    non_aws = [c for c in customers if c.get("cloud") not in ("aws", "unknown", DECLINED_LABEL)]
     if non_aws:
         longest_non_aws = max(non_aws, key=lambda i: i.get("events", 0))
         bullets.append(
@@ -840,21 +936,23 @@ def _build_template_vars(
     linear_rate = fc_linear.get("slope_per_day", 0)
     recent_rate = fc_recent.get("daily_add_rate", 0)
     today_count = forecast.get("today", {}).get("installs", total_instances)
-    target = forecast.get("target", 2000)
+    target = forecast.get("target", DEFAULT_FORECAST_TARGET)
     remaining = target - today_count
-    if recent_rate > linear_rate:
+    forecast_trend = forecast_trend_from_rates(recent_rate, linear_rate)
+    tol_pct = round(FORECAST_RATE_TOLERANCE * 100)
+    if forecast_trend == FORECAST_TREND_AHEAD:
         forecast_narrative = (
-            f"Recent pace is ahead of the 14-day OLS slope, indicating sustained acceleration. "
+            f"Recent pace is more than {tol_pct}% ahead of the 14-day OLS slope, so installs are accelerating. "
             f"**{remaining} installs from the {target:,}-install milestone.**"
         )
-    elif recent_rate < linear_rate * 0.85:
+    elif forecast_trend == FORECAST_TREND_BEHIND:
         forecast_narrative = (
-            f"Recent pace is behind the 14-day OLS slope, indicating a slowdown. "
+            f"Recent pace is more than {tol_pct}% behind the 14-day OLS slope, so installs are slowing. "
             f"**{remaining} installs from the {target:,}-install milestone.**"
         )
     else:
         forecast_narrative = (
-            f"Recent pace and 14-day OLS are converged. "
+            f"Recent pace and the 14-day OLS slope agree within {tol_pct}%. "
             f"**{remaining} installs from the {target:,}-install milestone.**"
         )
 
@@ -915,6 +1013,10 @@ def _build_template_vars(
             f"(last complete day).**"
         )
     executive_summary_lead = " ".join(exec_lead_parts) or "No major shifts since the last report."
+
+    # Auth-path telemetry (schema-v6 heartbeat fields; absent on older snapshots).
+    auth_path = metrics.get("auth_path") or {}
+    auth_path_total = int(auth_path.get("total_instances") or total_instances or 0)
 
     # ===== Build the variable dict =====
 
@@ -993,6 +1095,15 @@ def _build_template_vars(
         "search_total_queries": f"{metrics.get('search_stats', {}).get('lifetime_sum', 0):,}",
         "search_avg_per_instance": f"{metrics.get('search_stats', {}).get('lifetime_avg', 0):.1f}",
         "search_max_single_instance": f"{metrics.get('search_stats', {}).get('lifetime_max', 0):,}",
+        # Auth path mix (schema-v6 heartbeat fields)
+        "auth_path_status_line": _build_auth_path_status_line(auth_path, total_instances),
+        "auth_path_reporting_instances": int(auth_path.get("reporting_instances") or 0),
+        "auth_path_total_instances": auth_path_total,
+        "auth_path_coverage_pct": f"{float(auth_path.get('coverage_pct') or 0.0):.1f}",
+        "auth_path_schema_v6_instances": int(auth_path.get("schema_v6_instances") or 0),
+        "auth_path_mix_table": _build_auth_path_mix_table(auth_path),
+        "auth_path_volume_table": _build_auth_path_volume_table(auth_path),
+        "auth_path_window_summary": _build_auth_path_window_summary(auth_path),
         # Forecast
         "forecast_linear_rate": f"{linear_rate:.1f}",
         "forecast_linear_eta": linear_eta,
@@ -1000,6 +1111,7 @@ def _build_template_vars(
         "forecast_recent_eta": recent_eta,
         "forecast_target": f"{target:,}",
         "forecast_narrative": forecast_narrative,
+        "forecast_trend": forecast_trend,
         # LTV
         "yesterday_label": ltv_yesterday.get("date", "?"),
         "ltv_yesterday_proven": f"${ltv_yesterday.get('proven', {}).get('total_usd', 0):,.2f}",

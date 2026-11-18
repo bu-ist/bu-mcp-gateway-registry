@@ -1,9 +1,12 @@
-"""Auth-server egress mint-path tests: canonical auth_method + nginx marker.
+"""Auth-server egress mint-path tests: canonical egress user + nginx marker.
 
-These exercise the two auth_server-side guards:
-- _canonical_auth_method: cookie path 'session_cookie' -> session record 'oauth2'.
+These exercise the auth_server-side guards:
+- _canonical_egress_user: one vault key per human on every token path.
 - _attach_mcp_proxy_token: only mints the egress-capable token when the nginx
   marker matches (when configured); the auth_method claim is stamped.
+
+``canonical_auth_method`` lives in ``registry.egress_auth.service`` and is
+tested in ``tests/unit/egress_auth/test_service.py``.
 """
 
 import jwt as pyjwt
@@ -35,44 +38,6 @@ def _secret_key(monkeypatch):
 
 
 @pytest.mark.unit
-class TestCanonicalAuthMethod:
-    def test_cookie_maps_to_session_record_value(self):
-        vr = {"method": "session_cookie", "data": {"auth_method": "oauth2"}}
-        assert server._canonical_auth_method(vr) == "oauth2"
-
-    def test_cookie_defaults_oauth2(self):
-        assert server._canonical_auth_method({"method": "session_cookie", "data": {}}) == "oauth2"
-
-    def test_idp_provider_methods_canonicalize_to_oauth2(self):
-        # A bearer issued directly by the per-user IdP (what a DCR client like
-        # Claude Code / Codex presents) reports the provider name as `method`. It
-        # MUST fold into the same `oauth2` bucket the cookie-consent path wrote --
-        # otherwise the DCR vend misses the vault and the user loops on consent.
-        for method in ("keycloak", "entra", "cognito", "okta", "auth0", "pingfederate"):
-            assert server._canonical_auth_method({"method": method}) == "oauth2", method
-
-    def test_network_trusted_passthrough(self):
-        # Non-per-user methods are NOT folded -- they pass through so the vend's
-        # is_per_user_auth_method() check still rejects them.
-        assert server._canonical_auth_method({"method": "network-trusted"}) == "network-trusted"
-        assert server._canonical_auth_method({"method": "federation-static"}) == "federation-static"
-        assert server._canonical_auth_method({"method": "future-unknown"}) == "future-unknown"
-
-    def test_self_signed_maps_to_inner_auth_method_claim(self):
-        # A self-signed JWT (UI 'generate token', or the egress OAuth-facade
-        # /token mint) reports method='self_signed' (the FORMAT) but carries the
-        # principal's auth_method as an inner claim. The vault keys on the
-        # principal method, so this MUST canonicalize to the claim -- else a user
-        # who consents via a cookie session (bucket 'oauth2') and vends with a
-        # minted token (would-be bucket 'self_signed') loops on consent forever.
-        vr = {"method": "self_signed", "data": {"auth_method": "oauth2"}}
-        assert server._canonical_auth_method(vr) == "oauth2"
-
-    def test_self_signed_defaults_oauth2_when_claim_absent(self):
-        assert server._canonical_auth_method({"method": "self_signed", "data": {}}) == "oauth2"
-
-
-@pytest.mark.unit
 class TestCanonicalEgressUserPaths:
     """The per-user egress vault id must resolve identically on the consent-write
     (cookie) and vend (bearer) paths, or the vaulted token is written under one
@@ -89,13 +54,18 @@ class TestCanonicalEgressUserPaths:
         vr = {"username": "alice@example.com", "data": {"sub": "00000000-sub-alice"}}
         assert server._canonical_egress_user(vr) == "00000000-sub-alice"
 
-    def test_cookie_uses_persisted_subject(self):
-        # Consent-write path: the session carries the sub persisted at login as
-        # ``subject`` (create_session), NOT ``sub``. It must resolve the same value.
+    def test_cookie_uses_the_account_id_stored_at_login(self):
+        # Consent-write path: the login stores the account id on the session as
+        # ``egress_user`` (create_session), NOT ``sub``. It must resolve the same
+        # value as the bearer's sub.
         vr = {
             "method": "session_cookie",
             "username": "alice@example.com",
-            "data": {"subject": "00000000-sub-alice", "auth_method": "oauth2"},
+            "data": {
+                "egress_user": "00000000-sub-alice",
+                "subject": "00000000-sub-alice",
+                "auth_method": "oauth2",
+            },
         }
         assert server._canonical_egress_user(vr) == "00000000-sub-alice"
 
@@ -106,7 +76,11 @@ class TestCanonicalEgressUserPaths:
         cookie_vr = {
             "method": "session_cookie",
             "username": "alice@contoso.com",  # from preferred_username / email
-            "data": {"subject": "entra-oid-sub-123", "auth_method": "oauth2"},
+            "data": {
+                "egress_user": "entra-oid-sub-123",
+                "subject": "entra-oid-sub-123",
+                "auth_method": "oauth2",
+            },
         }
         bearer_vr = {
             "username": "entra-oid-sub-123",  # access token lacks preferred_username
@@ -114,10 +88,32 @@ class TestCanonicalEgressUserPaths:
         }
         assert server._canonical_egress_user(cookie_vr) == server._canonical_egress_user(bearer_vr)
 
-    def test_falls_back_to_username_when_no_sub(self):
-        # Non-OIDC callers (no sub anywhere) keep their pre-existing bucket.
-        vr = {"username": "svc-account", "data": {}}
-        assert server._canonical_egress_user(vr) == "svc-account"
+    def test_session_uses_the_key_stored_at_login(self):
+        # A session with no subject (a non-OIDC login that mapped none) keys on
+        # the username fallback key the callback stored, whatever its provider
+        # and username fields say now.
+        vr = {
+            "method": "session_cookie",
+            "username": "svc-account",
+            "data": {
+                "provider": "google",
+                "username": "svc-account",
+                "egress_user": "name:github:svc-account",
+            },
+        }
+        assert server._canonical_egress_user(vr) == "name:github:svc-account"
+
+    @pytest.mark.parametrize("subject", [None, "00000000-sub-alice"], ids=["no-subject", "subject"])
+    def test_session_without_a_stored_key_has_no_key_whatever_its_subject(self, subject):
+        # A session record without ``egress_user`` (one created before the login
+        # stored it) owns no bucket until the user signs in again: the cookie
+        # path neither falls back to its subject nor rebuilds a key from its
+        # provider and username.
+        data = {"provider": "github", "username": "svc-account"}
+        if subject is not None:
+            data["subject"] = subject
+        vr = {"method": "session_cookie", "username": "svc-account", "data": data}
+        assert server._canonical_egress_user(vr) == ""
 
     def test_empty_when_nothing_present(self):
         assert server._canonical_egress_user({}) == ""
@@ -152,11 +148,72 @@ class TestCanonicalEgressUserPaths:
         }
         assert server._canonical_egress_user(vr) == "00000000-sub-attacker"
 
+    def test_self_signed_without_egress_user_is_empty_not_the_username_sub(self):
+        # A gateway-minted self-signed USER token sets sub=login username by
+        # construction (on Keycloak that is the user's email). If the egress_user
+        # claim is absent, falling through to that sub keys the vault on the
+        # USERNAME namespace while the browser-consent path wrote the OIDC sub --
+        # one human, two buckets, and the vend silently reads the empty one ("0
+        # tools", nothing logged). Resolution must fail closed instead.
+        vr = {
+            "method": server.AUTH_METHOD_SELF_SIGNED,
+            "username": "alice@example.com",
+            "data": {"sub": "alice@example.com", "auth_method": "oauth2"},
+        }
+        assert server._canonical_egress_user(vr) == ""
+
+    def test_self_signed_without_egress_user_ignores_every_username_candidate(self):
+        # None of the remaining candidates (data.subject, top-level sub, username)
+        # is an OIDC sub on this token type either -- all of them are the login
+        # handle -- so each must be refused, not just data.sub.
+        vr = {
+            "method": server.AUTH_METHOD_SELF_SIGNED,
+            "sub": "alice@example.com",
+            "username": "alice@example.com",
+            "data": {"subject": "alice@example.com"},
+        }
+        assert server._canonical_egress_user(vr) == ""
+
+    def test_self_signed_with_egress_user_still_resolves(self):
+        # REGRESSION: fail-closed must apply ONLY when the claim is missing. The
+        # normal, correctly-minted self-signed token keeps resolving to the OIDC
+        # sub even though its own sub/username say otherwise.
+        vr = {
+            "method": server.AUTH_METHOD_SELF_SIGNED,
+            "username": "alice@example.com",
+            "data": {"egress_user": "00000000-sub-alice", "sub": "alice@example.com"},
+        }
+        assert server._canonical_egress_user(vr) == "00000000-sub-alice"
+
+    def test_non_self_signed_oidc_chain_unchanged(self):
+        # REGRESSION: the fail-closed rule is scoped to self_signed. An IdP-issued
+        # bearer still resolves data.sub, and a cookie session its stored key.
+        bearer_vr = {
+            "method": "keycloak",
+            "username": "alice@example.com",
+            "data": {"sub": "oidc-1"},
+        }
+        cookie_vr = {
+            "method": "session_cookie",
+            "username": "alice@example.com",
+            "data": {"egress_user": "oidc-1", "subject": "oidc-1", "auth_method": "oauth2"},
+        }
+        assert server._canonical_egress_user(bearer_vr) == "oidc-1"
+        assert server._canonical_egress_user(cookie_vr) == "oidc-1"
+
+    def test_non_session_caller_without_sub_has_no_key(self):
+        # A non-session, non-self-signed caller with no sub anywhere carries only
+        # its login, which an IdP may let another account hold later, so it
+        # owns no bucket. Only a session gets a username fallback key, stored at
+        # login.
+        vr = {"method": "keycloak", "username": "svc-account", "data": {}}
+        assert server._canonical_egress_user(vr) == ""
+
 
 @pytest.mark.unit
 class TestAuditIdentityDisplay:
     """`_audit_identity_display` resolves the HUMAN-READABLE audit identity
-    (email -> preferred_username -> username/sub), the counterpart to
+    (email -> preferred_username -> upn -> username/sub), the counterpart to
     `_canonical_egress_user` (which resolves the stable sub for vault keying).
     The two must NOT converge: audit prefers readability, vault prefers stability.
     """
@@ -183,6 +240,45 @@ class TestAuditIdentityDisplay:
         }
         assert server._audit_identity_display(vr) == "alice@contoso.com"
 
+    def test_falls_back_to_upn_for_entra_access_token(self):
+        # Entra ACCESS token (the OBO ingress token) omits both `email` and
+        # `preferred_username` but carries `upn`; the Entra provider resolves
+        # `username` to the opaque `sub`. Without `upn` in the chain the audit
+        # USER showed the opaque sub. It must resolve to the UPN.
+        vr = {
+            "username": "00000000-sub-alice",
+            "data": {
+                "upn": "alice@example.com",
+                "oid": "user-object-id",
+                "tid": "tenant-id",
+                "name": "Example User",
+                "sub": "00000000-sub-alice",
+            },
+        }
+        assert server._audit_identity_display(vr) == "alice@example.com"
+
+    def test_upn_wins_over_a_sub_valued_username(self):
+        # On the Entra bearer path the provider resolves `username` to the opaque
+        # `sub`, so upn must be consulted BEFORE username or the readable identity
+        # loses to the opaque one.
+        vr = {
+            "username": "00000000-sub-alice",
+            "data": {"upn": "alice@example.com", "sub": "00000000-sub-alice"},
+        }
+        assert server._audit_identity_display(vr) == "alice@example.com"
+
+    def test_non_string_claim_is_skipped_not_returned(self):
+        # A multivalued IdP mapper can emit `upn` as a JSON array. The record
+        # model types this field as `str`, so returning the list would raise
+        # ValidationError inside the best-effort audit emit and silently DROP the
+        # record. It must fall through to the next usable candidate instead.
+        vr = {
+            "username": "alice@example.com",
+            "data": {"upn": ["alice@example.com"], "sub": "00000000-sub-alice"},
+        }
+        assert server._audit_identity_display(vr) == "alice@example.com"
+        assert isinstance(server._audit_identity_display(vr), str)
+
     def test_falls_back_to_username_when_no_email_or_pref(self):
         # Session path: username is already the human handle.
         vr = {"username": "alice@example.com", "data": {"sub": "00000000-sub-alice"}}
@@ -204,11 +300,497 @@ class TestAuditIdentityDisplay:
             "method": "session_cookie",
             "username": "alice@contoso.com",
             "email": "alice@contoso.com",
-            "data": {"subject": "entra-oid-sub-123", "auth_method": "oauth2"},
+            "data": {
+                "egress_user": "entra-oid-sub-123",
+                "subject": "entra-oid-sub-123",
+                "auth_method": "oauth2",
+            },
         }
         assert server._audit_identity_display(vr) == "alice@contoso.com"
         assert server._canonical_egress_user(vr) == "entra-oid-sub-123"
         assert server._audit_identity_display(vr) != server._canonical_egress_user(vr)
+
+
+@pytest.mark.unit
+class TestAuditIntegrityDegradedMetric:
+    """Coercing a claim away is a silent audit degradation; it is counted so an
+    operator can alert on the RATE (mcpgw_registry_audit_integrity_degraded_total,
+    reason="claim_dropped").
+
+    The alertability of that series depends on one decision: an ABSENT claim is
+    normal (every IdP omits some) and must count NOTHING; only a value that was
+    actually present and had to be coerced away or truncated counts.
+    """
+
+    def _counted(self, monkeypatch, call):
+        counted: list[dict] = []
+        monkeypatch.setattr(
+            server,
+            "audit_integrity_degraded_total",
+            type("_C", (), {"add": staticmethod(lambda n, labels: counted.append(labels))})(),
+        )
+        result = call()
+        return result, counted
+
+    def test_absent_claims_count_nothing(self, monkeypatch):
+        for absent in (None, "", [], ()):
+            result, counted = self._counted(
+                monkeypatch, lambda absent=absent: server._claim_str(absent)
+            )
+            assert result is None
+            assert counted == [], absent
+
+    def test_a_token_with_no_identity_claims_at_all_is_silent(self, monkeypatch):
+        # The common non-Entra case: every field resolves to None. If this counted,
+        # the series would be a constant stream and useless for alerting.
+        _, counted = self._counted(monkeypatch, lambda: server._audit_identity_claims({}))
+        assert counted == []
+
+    def test_present_but_unusable_shapes_are_counted(self, monkeypatch):
+        for unusable in (True, {"bad": 1}, b"bytes"):
+            result, counted = self._counted(
+                monkeypatch, lambda unusable=unusable: server._claim_str(unusable)
+            )
+            assert result is None
+            assert counted == [{"reason": "claim_dropped"}], unusable
+
+    def test_truncation_is_counted(self, monkeypatch):
+        result, counted = self._counted(
+            monkeypatch, lambda: server._claim_str("u" * (server._MAX_AUDIT_CLAIM_LEN + 1))
+        )
+        assert len(result) == server._MAX_AUDIT_CLAIM_LEN
+        assert counted == [{"reason": "claim_dropped"}]
+
+    def test_a_multivalued_claim_with_a_usable_member_is_not_counted(self, monkeypatch):
+        result, counted = self._counted(
+            monkeypatch, lambda: server._claim_str(["alice@example.com", "alias@example.com"])
+        )
+        assert result == "alice@example.com"
+        assert counted == []
+
+
+@pytest.mark.unit
+class TestAuditIdentityClaims:
+    """`_audit_identity_claims` enriches an audit record with the durable and
+    IdP identity claims (sub, oid+tid canonical id, upn, appid/azp) so an
+    operator can correlate an opaque `sub` back to a user. It must
+    NOT feed auth/vault/OBO decisions -- those stay on `_canonical_egress_user`.
+    """
+
+    def test_entra_obo_access_token_full_claims(self):
+        vr = {
+            "client_id": "client-app-id",
+            "data": {
+                "sub": "00000000-sub-alice",
+                "oid": "user-object-id",
+                "tid": "tenant-id",
+                "upn": "alice@example.com",
+                "name": "Example User",
+                "azp": "client-app-id",
+                "appid": "client-app-id",
+            },
+        }
+        claims = server._audit_identity_claims(vr)
+        assert claims == {
+            "subject": "00000000-sub-alice",
+            "canonical_id": "user-object-id@tenant-id",
+            "principal_name": "alice@example.com",
+            "object_id": "user-object-id",
+            "tenant_id": "tenant-id",
+            "app_id": "client-app-id",
+        }
+
+    def test_full_name_claim_is_never_captured(self):
+        # Data minimisation (GDPR Art. 25(2)): `principal_name` already makes the
+        # actor contactable, so the `name` claim must not be persisted -- storing
+        # it would add a PII category to every audit record.
+        vr = {"data": {"sub": "s", "name": "Example User", "upn": "alice@example.com"}}
+        claims = server._audit_identity_claims(vr)
+        assert "display_name" not in claims
+        assert "Example User" not in claims.values()
+
+    def test_cookie_session_subject_populates_durable_identity(self):
+        # Cookie sessions persist the OIDC sub under `subject`, not `sub` (see
+        # resolve_session). Without that hop every browser-originated record
+        # stored a null durable identity while _canonical_egress_user resolved it.
+        vr = {"username": "alice@example.com", "data": {"subject": "oidc-sub-abc"}}
+        claims = server._audit_identity_claims(vr)
+        assert claims["subject"] == "oidc-sub-abc"
+        assert claims["canonical_id"] == "oidc-sub-abc"
+        # Must agree with the vault-keying resolver on WHICH id is the durable one.
+        assert claims["subject"] == server._canonical_egress_user(vr)
+
+    def test_self_signed_bearer_records_the_oidc_sub_not_the_login_username(self):
+        # REGRESSION: a gateway-minted USER token (Cursor/Claude bearer minted from
+        # a browser login) sets `sub` = the LOGIN USERNAME and stamps the real OIDC
+        # sub into `egress_user`. Without that hop the durable fields stored a
+        # username in a field documented as an opaque OIDC sub -- duplicating
+        # `username`, and making an exact-match lookup by the real sub return
+        # nothing for that whole auth path.
+        vr = {
+            "method": server.AUTH_METHOD_SELF_SIGNED,
+            "username": "alice",
+            "data": {"sub": "alice", "egress_user": "1a2b3c-oidc-sub-of-alice"},
+        }
+        claims = server._audit_identity_claims(vr)
+        assert claims["subject"] == "1a2b3c-oidc-sub-of-alice"
+        assert claims["canonical_id"] == "1a2b3c-oidc-sub-of-alice"
+        # The audit record must resolve the SAME human as the egress vault key, or
+        # a record cannot be joined to the consent record for that human.
+        assert claims["subject"] == server._canonical_egress_user(vr)
+
+    def test_egress_user_is_ignored_from_a_foreign_issuer(self):
+        # TRUST BOUNDARY: `egress_user` is identity-keying. From any token this
+        # gateway did not mint, an attacker could otherwise stamp a victim's id
+        # into the durable identity of their own audit records.
+        vr = {
+            "method": "entra",
+            "username": "attacker",
+            "data": {"sub": "attacker-sub", "egress_user": "victim-oidc-sub"},
+        }
+        claims = server._audit_identity_claims(vr)
+        assert claims["subject"] == "attacker-sub"
+        assert claims["canonical_id"] == "attacker-sub"
+        assert "victim-oidc-sub" not in claims.values()
+        # Same gate as the vault key, so the two cannot disagree about trust.
+        assert claims["subject"] == server._canonical_egress_user(vr)
+
+    def test_principal_name_falls_back_to_email_for_an_entra_v2_token(self):
+        # PRODUCTION-OBSERVED: an Entra v2.0 access token carries neither `upn`
+        # nor `preferred_username`, only `email`. Without email in the chain
+        # `principal_name` was null on every v2.0 deployment even though a
+        # readable handle existed in v1.0.
+        #
+        # The sub is deliberately mixed-case base64url, the real v2.0 shape: it
+        # documents why the audit filter matches opaque ids by equality with a
+        # one-directional lowercase fold, so a v2.0 sub must be pasted verbatim
+        # (see _identity_search_clause).
+        vr = {
+            "username": "Ab3Kx9QmMfE7bTn4pLsWzYcHu1JdRoAiSeXvNkGqBw0",
+            "data": {
+                "sub": "Ab3Kx9QmMfE7bTn4pLsWzYcHu1JdRoAiSeXvNkGqBw0",
+                "oid": "11111111-2222-4333-8444-555555555555",
+                "tid": "99999999-8888-4777-8666-777777777777",
+                "email": "azure@example.com",
+            },
+        }
+        claims = server._audit_identity_claims(vr)
+        assert claims["principal_name"] == "azure@example.com"
+        # The readable display and the durable ids are unaffected.
+        assert server._audit_identity_display(vr) == "azure@example.com"
+        assert claims["canonical_id"] == (
+            "11111111-2222-4333-8444-555555555555@99999999-8888-4777-8666-777777777777"
+        )
+
+    def test_principal_name_prefers_upn_over_email(self):
+        # `upn` IS the principal name on Entra; email is a contact address that
+        # may be an alias, so it must lose to both stronger claims.
+        vr = {
+            "data": {
+                "sub": "s",
+                "upn": "alice@corp.example.com",
+                "preferred_username": "alice",
+                "email": "alias@personal.example.com",
+            }
+        }
+        assert server._audit_identity_claims(vr)["principal_name"] == "alice@corp.example.com"
+
+    def test_principal_name_prefers_preferred_username_over_email(self):
+        vr = {"data": {"sub": "s", "preferred_username": "alice", "email": "a@x.com"}}
+        assert server._audit_identity_claims(vr)["principal_name"] == "alice"
+
+    def test_principal_name_reads_the_top_level_email_copy(self):
+        # Providers surface `email` at the top level as well as under `data`.
+        vr = {"email": "alice@example.com", "data": {"sub": "s"}}
+        assert server._audit_identity_claims(vr)["principal_name"] == "alice@example.com"
+
+    def test_canonical_id_falls_back_to_sub_without_oid_tid(self):
+        # Non-Entra token: no oid/tid, so the durable id is the sub itself.
+        vr = {"data": {"sub": "keycloak-sub-1", "preferred_username": "alice"}}
+        claims = server._audit_identity_claims(vr)
+        assert claims["canonical_id"] == "keycloak-sub-1"
+        assert claims["subject"] == "keycloak-sub-1"
+        assert claims["principal_name"] == "alice"
+        assert claims["object_id"] is None
+        assert claims["tenant_id"] is None
+
+    def test_app_id_comes_only_from_the_token_never_the_resolved_client_id(self):
+        # The self-signed validator resolves client_id to the literal
+        # "user-generated" sentinel (and otherwise to the GATEWAY's own client
+        # id), neither of which is the calling app. app_id must stay empty rather
+        # than record a misleading value operators would query on.
+        vr = {"client_id": "user-generated", "data": {"sub": "s"}}
+        assert server._audit_identity_claims(vr)["app_id"] is None
+
+    def test_non_string_claims_degrade_to_none(self):
+        # Same silent-drop hazard as the display resolver: a non-string claim must
+        # degrade ITS OWN field to None, leaving the rest of the record intact.
+        vr = {"data": {"sub": "s", "oid": ["o1", "o2"], "tid": 42, "upn": {"bad": 1}}}
+        claims = server._audit_identity_claims(vr)
+        assert claims["subject"] == "s"
+        assert claims["object_id"] == "o1"  # first usable member of a multivalued claim
+        assert claims["tenant_id"] == "42"  # numeric directory id stringified
+        assert claims["principal_name"] is None  # unusable shape -> absent, not fatal
+        assert claims["canonical_id"] == "o1@42"
+
+    def test_bool_claim_is_rejected_not_stringified(self):
+        # `isinstance(True, int)` is True, so without the explicit bool rejection a
+        # claim of `true` would be stored as the string "True": an identity value
+        # that looks real and identifies nobody.
+        claims = server._audit_identity_claims({"data": {"sub": True, "oid": False}})
+        assert claims["subject"] is None
+        assert claims["object_id"] is None
+
+    def test_list_claim_with_no_usable_member_degrades_to_none(self):
+        # A multivalued mapper can emit a list whose members are all unusable.
+        # Exhausting it must yield None rather than raising inside the
+        # best-effort audit emit, which would drop the whole record.
+        claims = server._audit_identity_claims({"data": {"oid": [None, {}, "  "], "sub": "s"}})
+        assert claims["object_id"] is None
+        assert claims["subject"] == "s"
+
+    def test_whitespace_only_claim_degrades_to_none(self):
+        # `"   "` is truthy, so without a strip it would be STORED as the record's
+        # principal name: a value that identifies nobody while looking like it
+        # does. An operator filtering on it finds nothing and cannot tell why.
+        vr = {"data": {"sub": "s", "upn": "   ", "oid": "\t\n ", "tid": ""}}
+        claims = server._audit_identity_claims(vr)
+        assert claims["principal_name"] is None
+        assert claims["object_id"] is None
+        assert claims["tenant_id"] is None
+        # The usable claim on the same token is unaffected.
+        assert claims["subject"] == "s"
+
+    def test_surrounding_whitespace_is_trimmed_not_stored(self):
+        # Whitespace is not part of any identifier, and an untrimmed copy would
+        # fail the equality lookup the opaque fields are searched by.
+        vr = {"data": {"sub": "  sub-123  ", "upn": " alice@contoso.com\n"}}
+        claims = server._audit_identity_claims(vr)
+        assert claims["subject"] == "sub-123"
+        assert claims["principal_name"] == "alice@contoso.com"
+
+    def test_all_none_when_no_claims(self):
+        # Nothing to surface: every field is None (the record fields are optional,
+        # so records for such tokens are unchanged).
+        assert server._audit_identity_claims({}) == {
+            "subject": None,
+            "canonical_id": None,
+            "principal_name": None,
+            "object_id": None,
+            "tenant_id": None,
+            "app_id": None,
+        }
+
+    def test_splats_into_both_audit_record_models(self):
+        # The enrichment dict must be accepted verbatim by BOTH record shapes:
+        # nested on Identity (registry_api / mcp_access) and flat on the
+        # token_mint record, which has no identity block.
+        from registry.audit.models import Identity, TokenMintAuditRecord
+
+        vr = {"data": {"sub": "s", "oid": "o", "tid": "t", "upn": "u@x.com"}}
+        claims = server._audit_identity_claims(vr)
+
+        ident = Identity(
+            username="u@x.com",
+            auth_method="entra",
+            credential_type="bearer_token",
+            **claims,
+        )
+        assert (ident.subject, ident.canonical_id, ident.object_id) == ("s", "o@t", "o")
+        assert ident.principal_name == "u@x.com"
+        assert ident.tenant_id == "t"
+
+        mint = TokenMintAuditRecord(
+            request_id="req-1",
+            username_hash="user_deadbeef",
+            auth_method="entra",
+            internal_caller="mcp-proxy",
+            token_kind="user",
+            token_path="obo_exchange",  # nosec B106 - audit metadata label
+            outcome="success",
+            **claims,
+        )
+        assert (mint.subject, mint.canonical_id, mint.object_id) == ("s", "o@t", "o")
+
+    def test_canonical_id_is_capped_like_every_other_field(self):
+        # REGRESSION: canonical_id was composed with an f-string from two
+        # already-capped halves, so it could reach 2 * _MAX_AUDIT_CLAIM_LEN + 1
+        # while every sibling field was bounded. It rides in the response header
+        # nginx copies, where an oversized value fails the request outright.
+        vr = {"data": {"sub": "s", "oid": "o" * 300, "tid": "t" * 300}}
+        claims = server._audit_identity_claims(vr)
+        assert len(claims["object_id"]) == server._MAX_AUDIT_CLAIM_LEN
+        assert len(claims["tenant_id"]) == server._MAX_AUDIT_CLAIM_LEN
+        assert len(claims["canonical_id"]) == server._MAX_AUDIT_CLAIM_LEN
+
+    def test_canonical_id_is_byte_identical_on_both_record_streams(self):
+        # The field exists to JOIN the mcp_server_access record (Identity, built
+        # from _audit_identity_claims directly) to the token_mint record (built
+        # from the hop claim, which _audit_identity_from_token re-caps). An
+        # uncapped composition landed full-length on the first and TRUNCATED on
+        # the second -- two different keys for one human, no join.
+        from registry.audit.models import Identity, TokenMintAuditRecord
+
+        vr = {"data": {"sub": "s", "oid": "o" * 200, "tid": "t" * 200}}
+        claims = server._audit_identity_claims(vr)
+        _, hop_fields = server._audit_identity_from_token(
+            {"audit_identity": server._audit_identity_token_claim(vr, "req-validate-1")}
+        )
+
+        access = Identity(
+            username="u@x.com",
+            auth_method="entra",
+            credential_type="bearer_token",
+            **claims,
+        )
+        mint = TokenMintAuditRecord(
+            request_id="req-1",
+            username_hash="user_deadbeef",
+            auth_method="entra",
+            internal_caller="mcp-proxy",
+            token_kind="user",
+            token_path="obo_exchange",  # nosec B106 - audit metadata label
+            outcome="success",
+            **{key: value for key, value in hop_fields.items() if value},
+        )
+        assert access.canonical_id == mint.canonical_id
+
+
+@pytest.mark.unit
+class TestAuditProvider:
+    """`_audit_provider` records WHICH IdP authenticated the caller.
+
+    PRODUCTION-OBSERVED: provider validators return `method` (e.g. "entra"), not
+    `provider`, so reading validation_result["provider"] alone left
+    identity.provider null on every bearer-authenticated audit record.
+    """
+
+    def test_top_level_provider_wins(self):
+        vr = {"provider": "keycloak", "data": {"provider": "entra"}}
+        assert server._audit_provider(vr) == "keycloak"
+
+    def test_falls_back_to_the_session_provider(self):
+        # The cookie session persists the provider at login.
+        vr = {"data": {"provider": "pingfederate"}}
+        assert server._audit_provider(vr) == "pingfederate"
+
+    def test_falls_back_to_the_configured_idp(self, monkeypatch):
+        # The Entra bearer path: no provider anywhere in the result, but the
+        # gateway's configured IdP is the truth for every token it accepts.
+        monkeypatch.setattr(server.settings, "auth_provider", "entra")
+        assert server._audit_provider({"data": {"sub": "s"}, "method": "entra"}) == "entra"
+
+    def test_none_when_nothing_identifies_the_idp(self, monkeypatch):
+        # Stays optional rather than inventing a value.
+        monkeypatch.setattr(server.settings, "auth_provider", "")
+        assert server._audit_provider({}) is None
+
+    def test_self_signed_is_not_attributed_to_the_configured_idp(self, monkeypatch):
+        # A gateway-minted token (Connect button, Cursor/Claude bearer) was not
+        # issued by the configured IdP, so naming that IdP would credit one that
+        # never saw the request.
+        monkeypatch.setattr(server.settings, "auth_provider", "entra")
+        vr = {"method": server.AUTH_METHOD_SELF_SIGNED, "data": {"sub": "s"}}
+        assert server._audit_provider(vr) is None
+
+    def test_self_signed_still_reports_the_provider_its_session_recorded(self, monkeypatch):
+        # Skipping the configured-IdP fallback must not discard a provider that
+        # the originating login actually established.
+        monkeypatch.setattr(server.settings, "auth_provider", "entra")
+        vr = {"method": server.AUTH_METHOD_SELF_SIGNED, "data": {"provider": "keycloak"}}
+        assert server._audit_provider(vr) == "keycloak"
+
+
+@pytest.mark.unit
+class TestAuditIdentityHopClaim:
+    """The mcp-proxy hop must attribute its OBO mint record from the SIGNED
+    `audit_identity` claim, never from the raw ingress header it also receives.
+
+    nginx forwards the client's Authorization/X-Authorization to that hop, but
+    /validate authenticates a session cookie FIRST and only falls through to a
+    bearer when no valid cookie exists -- so a cookie-authenticated request's
+    bearer header is never signature-verified. Reading identity there let a
+    caller choose what the audit trail recorded.
+    """
+
+    def test_round_trips_display_and_claims(self):
+        vr = {
+            "username": "00000000-sub-alice",
+            "data": {
+                "sub": "00000000-sub-alice",
+                "oid": "user-object-id",
+                "tid": "tenant-id",
+                "upn": "alice@example.com",
+                "appid": "client-app-id",
+            },
+        }
+        display, fields = server._audit_identity_from_token(
+            {"audit_identity": server._audit_identity_token_claim(vr, "req-validate-1")}
+        )
+        assert display == "alice@example.com"
+        assert fields == server._audit_identity_claims(vr)
+
+    def test_claim_omits_empty_values(self):
+        # The claim rides in a response header nginx copies; absent claims must
+        # not pad it with nulls.
+        claim = server._audit_identity_token_claim({"data": {"sub": "s"}}, "req-validate-1")
+        assert claim == {
+            "display": "s",
+            "subject": "s",
+            "canonical_id": "s",
+            "rid": "req-validate-1",
+        }
+
+    def test_rid_signs_the_validate_request_id_for_the_cross_stream_join(self):
+        # The mcp-proxy hop's token_mint record needs its OWN request_id (the
+        # (request_id, log_type) unique index), so the ONLY way it can be joined
+        # to the mcp_server_access record /validate wrote for the same request is
+        # this signed id, recorded there as correlation_id.
+        claim = server._audit_identity_token_claim({"data": {"sub": "s"}}, "req-validate-1")
+        assert server._audit_request_id_from_token({"audit_identity": claim}) == "req-validate-1"
+
+    def test_rid_is_not_an_identity_field(self):
+        # It is a correlation id: it must not be splatted into the record's
+        # identity fields (there is no such model field).
+        claim = server._audit_identity_token_claim({"data": {"sub": "s"}}, "req-validate-1")
+        _, fields = server._audit_identity_from_token({"audit_identity": claim})
+        assert "rid" not in fields
+
+    def test_rid_absent_on_a_legacy_or_malformed_claim(self):
+        # A hop token minted before `rid` existed (rolling deploy) must not crash
+        # the mint audit -- the record simply keeps its pre-join correlation_id.
+        assert server._audit_request_id_from_token({"audit_identity": {"display": "d"}}) is None
+        assert server._audit_request_id_from_token({}) is None
+        assert server._audit_request_id_from_token({"audit_identity": "not-a-dict"}) is None
+        assert server._audit_request_id_from_token({"audit_identity": {"rid": {"bad": 1}}}) is None
+
+    def test_rid_is_capped_like_every_other_claim(self):
+        # The claim rides back as a response header nginx copies; an oversized
+        # value there fails the request with "upstream sent too big header".
+        claim = server._audit_identity_token_claim({"data": {"sub": "s"}}, "r" * 400)
+        assert len(claim["rid"]) == server._MAX_AUDIT_CLAIM_LEN
+
+    def test_absent_claim_degrades_to_empty_not_to_header_identity(self):
+        # Rolling deploy: an in-flight token can predate the claim. The caller
+        # then falls back to the verified `sub` principal -- opaque but true.
+        assert server._audit_identity_from_token({}) == ("", {})
+        assert server._audit_identity_from_token({"audit_identity": "not-a-dict"}) == ("", {})
+
+    def test_malformed_claim_values_degrade_per_field(self):
+        display, fields = server._audit_identity_from_token(
+            {"audit_identity": {"display": ["alice@example.com"], "subject": {"bad": 1}}}
+        )
+        assert display == "alice@example.com"
+        assert fields["subject"] is None
+        # Unknown keys are dropped: only the canonical field set is accepted.
+        assert set(fields) == set(server._audit_identity_claims({}))
+
+    def test_only_canonical_keys_are_accepted(self):
+        _, fields = server._audit_identity_from_token(
+            {"audit_identity": {"display": "d", "is_admin": True, "groups": ["admin"]}}
+        )
+        assert "is_admin" not in fields
+        assert "groups" not in fields
 
 
 def _decode(token: str) -> dict:
@@ -230,10 +812,9 @@ class TestAttachMcpProxyTokenMarker:
         )
         assert "X-Internal-Token" not in resp.headers
 
-    def test_empty_marker_mints_unconditionally(self, monkeypatch):
-        # Function-level fallback only: an empty marker is rejected at startup
-        # (Settings.__init__), so this state is unreachable in a running server.
-        # Kept to pin the helper's branch behavior.
+    def test_empty_marker_does_not_mint(self, monkeypatch):
+        # An empty marker is rejected at startup (Settings.__init__); the helper
+        # still refuses on its own rather than minting for any caller.
         monkeypatch.setattr(server.settings, "auth_server_nginx_marker_secret", "")
         resp = _FakeResponse()
         server._attach_mcp_proxy_token(
@@ -244,10 +825,7 @@ class TestAttachMcpProxyTokenMarker:
             server_name="github-mcp",
             auth_method="oauth2",
         )
-        claims = _decode(resp.headers["X-Internal-Token"])
-        assert claims["sub"] == "alice"
-        assert claims["auth_method"] == "oauth2"
-        assert claims["upstream_url"] == "https://u/mcp"
+        assert "X-Internal-Token" not in resp.headers
 
     def test_marker_enabled_and_matching_mints(self, monkeypatch):
         monkeypatch.setattr(server.settings, "auth_server_nginx_marker_secret", "s3cret")
@@ -263,6 +841,78 @@ class TestAttachMcpProxyTokenMarker:
             auth_method="oauth2",
         )
         assert "X-Internal-Token" in resp.headers
+
+    def test_virtual_nested_server_claim_keeps_full_registered_path(self, monkeypatch):
+        monkeypatch.setattr(server.settings, "auth_server_nginx_marker_secret", "s3cret")
+        resp = _FakeResponse()
+        server._attach_mcp_proxy_token(
+            _FakeRequest(
+                {
+                    "X-Resolved-Upstream": "https://backend.example/peer/mcp",
+                    "X-Validate-Source-Secret": "s3cret",
+                    "X-Validate-Binding-Secret": "s3cret",
+                    "X-Original-URL": "https://gw.example/peer/mcp/mcp",
+                    "X-Registered-Server-Path": "/peer/mcp",
+                    "X-Registered-Route-Mode": "virtual",
+                    "X-Resolved-Version": "/peer/mcp:v1",
+                }
+            ),
+            resp,
+            subject="alice",
+            scopes=["peer-access"],
+            server_name="peer/mcp",
+            auth_method="oauth2",
+        )
+        claims = _decode(resp.headers["X-Internal-Token"])
+        assert claims["server"] == "peer/mcp"
+        assert claims["version_id"] == "/peer/mcp:v1"
+        assert claims["virtual_backend"] is True
+
+    def test_virtual_nested_wrong_scope_refuses_to_mint(self, monkeypatch):
+        monkeypatch.setattr(server.settings, "auth_server_nginx_marker_secret", "s3cret")
+        resp = _FakeResponse()
+        server._attach_mcp_proxy_token(
+            _FakeRequest(
+                {
+                    "X-Resolved-Upstream": "https://backend.example/peer/mcp",
+                    "X-Validate-Source-Secret": "s3cret",
+                    "X-Validate-Binding-Secret": "s3cret",
+                    "X-Original-URL": "https://gw.example/peer/mcp/mcp",
+                    "X-Registered-Server-Path": "/peer/mcp",
+                    "X-Registered-Route-Mode": "virtual",
+                }
+            ),
+            resp,
+            subject="alice",
+            scopes=["peer-access"],
+            server_name="peer",
+        )
+        assert "X-Internal-Token" not in resp.headers
+
+    def test_registration_headers_without_binding_secret_are_ignored(self, monkeypatch):
+        # Behind an older nginx the client's own registration headers pass
+        # through; only a current template's binding secret makes them count.
+        monkeypatch.setattr(server.settings, "auth_server_nginx_marker_secret", "s3cret")
+        resp = _FakeResponse()
+        server._attach_mcp_proxy_token(
+            _FakeRequest(
+                {
+                    "X-Resolved-Upstream": "https://backend.example/jira/mcp",
+                    "X-Validate-Source-Secret": "s3cret",
+                    "X-Original-URL": "https://gw.example/jira/mcp",
+                    "X-Registered-Server-Path": "/jira",
+                    "X-Registered-Route-Mode": "virtual",
+                    "X-Resolved-Version": "/jira:v9",
+                }
+            ),
+            resp,
+            subject="alice",
+            scopes=["jira-access"],
+            server_name="jira",
+        )
+        claims = _decode(resp.headers["X-Internal-Token"])
+        assert claims["virtual_backend"] is False
+        assert claims["version_id"] == ""
 
     def test_marker_enabled_and_missing_does_not_mint(self, monkeypatch):
         # Direct :8888 caller (no nginx marker) gets no egress-capable token
@@ -297,10 +947,12 @@ class TestAttachMcpProxyTokenMarker:
     def test_egress_user_claim_is_stamped(self, monkeypatch):
         # The vend path reads egress_user off this token to key the vault, so the
         # canonical per-user id must ride along even when it differs from subject.
-        monkeypatch.setattr(server.settings, "auth_server_nginx_marker_secret", "")
+        monkeypatch.setattr(server.settings, "auth_server_nginx_marker_secret", "s3cret")
         resp = _FakeResponse()
         server._attach_mcp_proxy_token(
-            _FakeRequest({"X-Resolved-Upstream": "https://u/mcp"}),
+            _FakeRequest(
+                {"X-Resolved-Upstream": "https://u/mcp", "X-Validate-Source-Secret": "s3cret"}
+            ),
             resp,
             subject="alice@example.com",
             scopes=[],
@@ -310,6 +962,107 @@ class TestAttachMcpProxyTokenMarker:
         )
         claims = _decode(resp.headers["X-Internal-Token"])
         assert claims["egress_user"] == "00000000-sub-alice"
+
+    def test_audit_identity_claim_is_signed_into_the_token(self, monkeypatch):
+        # The mcp-proxy hop attributes its OBO mint record from this claim. It is
+        # signed here precisely so that hop never has to read identity from the
+        # raw ingress header, which /validate may not have verified at all.
+        monkeypatch.setattr(server.settings, "auth_server_nginx_marker_secret", "s3cret")
+        vr = {
+            "username": "00000000-sub-alice",
+            "data": {
+                "sub": "00000000-sub-alice",
+                "oid": "user-object-id",
+                "tid": "tenant-id",
+                "upn": "alice@example.com",
+            },
+        }
+        resp = _FakeResponse()
+        server._attach_mcp_proxy_token(
+            _FakeRequest(
+                {"X-Resolved-Upstream": "https://u/mcp", "X-Validate-Source-Secret": "s3cret"}
+            ),
+            resp,
+            subject="00000000-sub-alice",
+            scopes=[],
+            server_name="github-mcp",
+            auth_method="oauth2",
+            audit_identity=server._audit_identity_token_claim(vr, "req-validate-1"),
+        )
+        claims = _decode(resp.headers["X-Internal-Token"])
+        display, fields = server._audit_identity_from_token(claims)
+        assert display == "alice@example.com"
+        assert fields["canonical_id"] == "user-object-id@tenant-id"
+        # The /validate request id rides the same signed claim, so the hop's
+        # token_mint record can be joined to this request's access record.
+        assert server._audit_request_id_from_token(claims) == "req-validate-1"
+
+    def test_audit_identity_does_not_disturb_the_egress_vault_key(self, monkeypatch):
+        # REGRESSION (3LO): the egress vend keys the per-user token vault on the
+        # `egress_user` claim of THIS token. If adding the audit claim shifted or
+        # dropped it, every user's already-consented upstream token would be
+        # written under one id and looked up under another -- a permanent vend miss
+        # presenting as "0 tools" and a re-consent prompt. Mint with and without
+        # the audit claim and require the vault-keying claims to be identical.
+        monkeypatch.setattr(server.settings, "auth_server_nginx_marker_secret", "s3cret")
+        vr = {
+            "method": server.AUTH_METHOD_SELF_SIGNED,
+            "username": "alice",
+            "data": {"sub": "alice", "egress_user": "00000000-sub-alice"},
+        }
+        minted = {}
+        for label, audit_identity in (
+            ("without", None),
+            ("with", server._audit_identity_token_claim(vr, "req-validate-1")),
+        ):
+            resp = _FakeResponse()
+            server._attach_mcp_proxy_token(
+                _FakeRequest(
+                    {"X-Resolved-Upstream": "https://u/mcp", "X-Validate-Source-Secret": "s3cret"}
+                ),
+                resp,
+                subject="alice",
+                scopes=["repo"],
+                server_name="github-mcp",
+                auth_method="oauth2",
+                egress_user=server._canonical_egress_user(vr),
+                audit_identity=audit_identity,
+            )
+            minted[label] = _decode(resp.headers["X-Internal-Token"])
+
+        # The vault bucket the registry vend resolves must not move.
+        for claim in ("egress_user", "auth_method", "sub", "server", "upstream_url"):
+            assert minted["without"][claim] == minted["with"][claim], claim
+        assert minted["with"]["egress_user"] == "00000000-sub-alice"
+        # The audit claim is additive only.
+        assert set(minted["with"]) - set(minted["without"]) == {"audit_identity"}
+
+    def test_no_audit_identity_leaves_the_claim_absent(self, monkeypatch):
+        # DECISION: the guard in mint_mcp_proxy_token is KEPT, not deleted,
+        # because this shape is reachable in production -- the static-credential
+        # /validate branches (federation-static, network-trusted) authenticate a
+        # machine credential with no IdP claims and pass no audit identity, so the
+        # response header nginx copies must not be padded with an empty claim.
+        # Deleting the guard would sign `"audit_identity": null` on those paths.
+        monkeypatch.setattr(server.settings, "auth_server_nginx_marker_secret", "s3cret")
+        resp = _FakeResponse()
+        server._attach_mcp_proxy_token(
+            _FakeRequest(
+                {"X-Resolved-Upstream": "https://u/mcp", "X-Validate-Source-Secret": "s3cret"}
+            ),
+            resp,
+            subject="federation-peer",
+            scopes=[],
+            server_name="github-mcp",
+            auth_method="oauth2",
+        )
+        claims = _decode(resp.headers["X-Internal-Token"])
+        assert "audit_identity" not in claims
+        # ...and the reader degrades to "no identity", which is what makes the
+        # omission safe: the mcp-proxy hop then attributes its record to the
+        # verified `sub`, never to the unverified ingress header.
+        assert server._audit_identity_from_token(claims) == ("", {})
+        assert server._audit_request_id_from_token(claims) is None
 
 
 @pytest.mark.unit
@@ -340,6 +1093,113 @@ class TestCanonicalEgressUser:
         vr = {"data": {"sub": "oidc-sub-idp"}}
         assert server._canonical_egress_user(vr) == "oidc-sub-idp"
 
-    def test_username_fallback_preserves_non_oidc_behavior(self):
-        vr = {"data": {}, "username": "svc-account"}
-        assert server._canonical_egress_user(vr) == "svc-account"
+
+_MARKER = "verified-marker-for-test"
+
+
+def _provider_returning(method: str):
+    """A provider whose validate_token accepts any bearer as the given IdP method."""
+    from auth_server.providers.base import AuthProvider
+
+    class _Provider:
+        recover_bearer_groups = AuthProvider.recover_bearer_groups
+        is_delegated_user = AuthProvider.is_delegated_user
+
+        def validate_token(self, token: str, extra_audiences=None) -> dict:
+            return {
+                "valid": True,
+                "username": "alice@example.com",
+                "groups": ["backend-group"],
+                "scopes": [],
+                "client_id": "ide-client",
+                "method": method,
+                "data": {"sub": "oidc-sub-alice"},
+            }
+
+        def get_provider_info(self) -> dict:
+            return {"provider_type": method}
+
+    return _Provider()
+
+
+@pytest.mark.unit
+class TestValidateSignsOboSubjectDigest:
+    """/validate signs the digest of the bearer it verified with an OBO-capable
+    IdP into the hop token, and nothing else. The hop serves an OBO token from
+    its cache only when the subject token matches that digest, so a missing
+    digest on the cookie path is what keeps a stolen cookie plus a forged
+    bearer from reading the user's cached token.
+    """
+
+    _BEARER = "opaque-idp-token"
+
+    def _hop_claims(self, *, provider, cookie_result=None) -> dict:
+        import os
+        from unittest.mock import AsyncMock, patch
+
+        from fastapi.testclient import TestClient
+
+        repo = AsyncMock()
+        repo.get_group_mappings_bulk.return_value = ["backend-only"]
+        repo.get_server_scopes.return_value = [
+            {"server": "github", "methods": ["tools/list"], "tools": []}
+        ]
+        headers = {
+            "Authorization": f"Bearer {self._BEARER}",
+            "X-Original-URL": "https://example.com/github/mcp",
+            "X-Body": '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+            "X-Resolved-Upstream": "https://api.githubcopilot.com/mcp",
+            "X-Validate-Source-Secret": _MARKER,
+        }
+        if cookie_result is not None:
+            headers["Cookie"] = "mcp_gateway_session=signed-session-value"
+            # A browser sends Origin on a POST; the gateway refuses a cookie
+            # request from any other origin (issue #1996).
+            headers["X-Original-Method"] = "POST"
+            headers["Origin"] = "https://example.com"
+        with (
+            patch(
+                "auth_server.server._gateway_trusted_origins",
+                return_value=frozenset({"https://example.com"}),
+            ),
+            patch("auth_server.server.get_scope_repository", return_value=repo),
+            patch("auth_server.server.get_auth_provider", return_value=provider),
+            patch(
+                "auth_server.server.validate_session_cookie",
+                AsyncMock(return_value=cookie_result),
+            ),
+            patch.object(server.settings, "auth_server_nginx_marker_secret", _MARKER),
+        ):
+            response = TestClient(server.app).get("/validate", headers=headers)
+        assert response.status_code == 200, response.text
+        return pyjwt.decode(
+            response.headers["X-Internal-Token"],
+            os.environ["SECRET_KEY"],
+            algorithms=["HS256"],
+            options={"verify_aud": False, "verify_iss": False},
+        )
+
+    @pytest.mark.parametrize("method", ["entra", "keycloak"])
+    def test_obo_idp_bearer_signs_its_digest(self, method):
+        claims = self._hop_claims(provider=_provider_returning(method))
+        assert claims["obo_subject_sha256"] == server._obo_subject_digest(self._BEARER)
+
+    def test_non_obo_idp_bearer_signs_no_digest(self):
+        claims = self._hop_claims(provider=_provider_returning("cognito"))
+        assert "obo_subject_sha256" not in claims
+
+    def test_cookie_request_signs_no_digest_even_with_a_bearer(self):
+        # The cookie wins at /validate, so the bearer header is never verified.
+        cookie_result = {
+            "valid": True,
+            "username": "alice@example.com",
+            "scopes": ["backend-only"],
+            "method": "session_cookie",
+            "groups": ["backend-group"],
+            "client_id": "",
+            "data": {"auth_method": "oauth2", "subject": "oidc-sub-alice"},
+        }
+        claims = self._hop_claims(
+            provider=_provider_returning("entra"), cookie_result=cookie_result
+        )
+        assert "obo_subject_sha256" not in claims

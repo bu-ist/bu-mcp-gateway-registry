@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 import registry.api.egress_auth_routes as routes
 from registry.egress_auth.schemas import StoredToken
+from registry.secrets import keys
 from registry.secrets.interfaces import SecretStoreError
 
 ADMIN = {"username": "admin", "is_admin": True, "auth_method": "oauth2", "egress_user": "admin"}
@@ -56,16 +57,16 @@ class _StubStore:
         self.put_calls: list[tuple] = []
         self.delete_calls: list[tuple] = []
 
-    async def put_token(self, auth_method, user_id, provider, server_path, token):
+    async def put_token(self, auth_method, user_id, provider, server_path, token, *, purpose):
         if self._put_error:
             raise self._put_error
-        self.put_calls.append((auth_method, user_id, provider, server_path, token))
+        self.put_calls.append((auth_method, user_id, provider, server_path, token, purpose))
 
-    async def get_token(self, auth_method, user_id, provider, server_path):
+    async def get_token(self, auth_method, user_id, provider, server_path, *, purpose):
         return self._token
 
-    async def delete_token(self, auth_method, user_id, provider, server_path):
-        self.delete_calls.append((auth_method, user_id, provider, server_path))
+    async def delete_token(self, auth_method, user_id, provider, server_path, *, purpose):
+        self.delete_calls.append((auth_method, user_id, provider, server_path, purpose))
 
 
 @pytest.fixture
@@ -125,7 +126,9 @@ class TestSetPat:
         assert "secret" not in body
         # Stored under the verified identity's canonical key.
         assert len(store.put_calls) == 1
-        auth_method, user_id, provider, path, token = store.put_calls[0]
+        auth_method, user_id, provider, path, token, purpose = store.put_calls[0]
+        # A PAT is the user's own runtime credential: egress space, never discovery.
+        assert purpose == keys.EGRESS_PURPOSE
         assert (auth_method, user_id, provider, path) == ("oauth2", "alice", "github", "/github")
         assert token.access_token == "ghp_secret"
         assert token.expires_at
@@ -160,7 +163,7 @@ class TestSetPat:
         )
         assert r.status_code == 200
         assert r.json()["sub"] == "bob"
-        auth_method, user_id, _, _, _ = store.put_calls[0]
+        auth_method, user_id, _, _, _, _ = store.put_calls[0]
         # Stored under the TARGET's (auth_method, sub), not the admin's.
         assert (auth_method, user_id) == ("oauth2", "bob")
 
@@ -174,17 +177,20 @@ class TestSetPat:
         assert store.put_calls == []
 
     def test_admin_on_behalf_uses_target_auth_method_not_admins(self, client):
-        # The admin logs in via oauth2 but the target vends via jwt: the PAT must
-        # be stored under jwt (the target's partition), never the admin's oauth2.
+        # The admin authenticates with a static key, which owns no per-user bucket;
+        # the target vends via jwt. The PAT must land in the target's canonical
+        # partition (jwt folds into oauth2, the bucket the target's vend reads),
+        # whatever the admin's own method is.
+        static_admin = {**ADMIN, "auth_method": "network-trusted"}
         store = _StubStore()
-        c = client(ADMIN, server=_server(), store=store)
+        c = client(static_admin, server=_server(), store=store)
         r = c.put(
             "/api/servers/github/egress-pat",
             json=_put_body(sub="bob", auth_method="jwt"),
         )
         assert r.status_code == 200
-        auth_method, user_id, _, _, _ = store.put_calls[0]
-        assert (auth_method, user_id) == ("jwt", "bob")
+        auth_method, user_id, _, _, _, _ = store.put_calls[0]
+        assert (auth_method, user_id) == ("oauth2", "bob")
 
     def test_admin_on_behalf_non_per_user_auth_method_403(self, client):
         # A non-per-user target auth_method can never own a per-user PAT.
@@ -230,6 +236,25 @@ class TestSetPat:
         c = client(USER, server=_server(egress_auth_mode="oauth_user"), store=store)
         r = c.put("/api/servers/github/egress-pat", json=_put_body())
         assert r.status_code == 409
+        assert store.put_calls == []
+
+    def test_unavailable_versions_is_503_not_409(self, client, monkeypatch):
+        """A linked version with no endpoint is our fault, so it must not read as a conflict.
+
+        ``registered_destinations`` raises ValueError when a linked version
+        document is missing or has no endpoint. The caller cannot fix that by
+        retrying or by changing the request, so 409 would mislead; 503 says the
+        server cannot serve the request right now. The PAT is not stored.
+        """
+        store = _StubStore()
+        monkeypatch.setattr(
+            routes,
+            "registered_destinations",
+            AsyncMock(side_effect=ValueError("linked version has no endpoint")),
+        )
+        c = client(USER, server=_server(), store=store)
+        r = c.put("/api/servers/github/egress-pat", json=_put_body())
+        assert r.status_code == 503
         assert store.put_calls == []
 
     def test_unknown_server_404(self, client):
@@ -359,7 +384,8 @@ class TestDeletePat:
         )
         assert r.status_code == 200
         kwargs = svc.delete_pat.await_args.kwargs
-        assert (kwargs["auth_method"], kwargs["user_id"]) == ("jwt", "bob")
+        # jwt folds into oauth2: the delete reaches the bucket the target vends from.
+        assert (kwargs["auth_method"], kwargs["user_id"]) == ("oauth2", "bob")
 
     def test_delete_admin_on_behalf_missing_auth_method_400(self, client):
         svc = AsyncMock()

@@ -494,6 +494,89 @@ class TestAllowlists:
             with pytest.raises(UrlValidationError):
                 url_guard.validate_url(f"http://[{host}]/x", profile=url_guard.PROXY_PROFILE)
 
+    def test_proxy_profile_cidr_allowlist_permits_reserved_istio_range(self):
+        # #2018: Istio auto-allocates ServiceEntry VIPs from 240.240.0.0/16,
+        # which Python classifies as reserved. An operator CIDR must admit it.
+        with patch.object(url_guard, "settings", _settings(ssrf_allowed_cidrs="240.240.0.0/16")):
+            with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("240.240.0.1")):
+                assert url_guard.validate_url(
+                    "http://mesh-svc.internal/mcp", profile=url_guard.PROXY_PROFILE
+                ) == ["240.240.0.1"]
+
+    def test_proxy_profile_reserved_outside_cidr_stays_denied(self):
+        with patch.object(url_guard, "settings", _settings(ssrf_allowed_cidrs="240.240.0.0/16")):
+            with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("240.1.0.1")):
+                with pytest.raises(UrlValidationError):
+                    url_guard.validate_url(
+                        "http://other.internal/x", profile=url_guard.PROXY_PROFILE
+                    )
+
+    def test_proxy_profile_trusted_host_does_not_admit_reserved(self):
+        # The exact /32 synthesized for a trusted hostname must not reopen reserved.
+        with patch.object(url_guard, "settings", _settings(ssrf_allowed_hosts="mesh-svc.internal")):
+            with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("240.240.0.1")):
+                with pytest.raises(UrlValidationError):
+                    url_guard.validate_url(
+                        "http://mesh-svc.internal/mcp", profile=url_guard.PROXY_PROFILE
+                    )
+
+    def test_proxy_profile_private_flag_does_not_admit_reserved(self):
+        with patch.object(
+            url_guard, "settings", _settings(gateway_proxy_allow_private_targets=True)
+        ):
+            with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("240.240.0.1")):
+                with pytest.raises(UrlValidationError):
+                    url_guard.validate_url(
+                        "http://mesh-svc.internal/mcp", profile=url_guard.PROXY_PROFILE
+                    )
+
+    @pytest.mark.parametrize(
+        "profile_name",
+        [
+            "SKILL_PROFILE",
+            "FEDERATION_PROFILE",
+            "CREDENTIALED_OAUTH_PROFILE",
+            "ENTRA_GRAPH_PROFILE",
+            "EGRESS_UPSTREAM_PROFILE",
+        ],
+    )
+    def test_non_proxy_profiles_never_admit_reserved(self, profile_name):
+        # #2018: only PROXY_PROFILE (and the built-in tools profile that reuses
+        # it) may carry operator CIDRs. A credentialed or federation profile
+        # that gained them would reach reserved space, so pin it with every
+        # relaxation the settings offer turned on.
+        profile = getattr(url_guard, profile_name)
+        relaxed = _settings(
+            github_extra_hosts="mesh.internal",
+            ssrf_allowed_hosts="mesh.internal",
+            ssrf_allowed_cidrs="240.240.0.0/16,0.0.0.0/0",
+            gateway_proxy_allow_private_targets=True,
+            egress_oauth_trusted_idp_hosts="mesh.internal",
+        )
+        with patch.object(url_guard, "settings", relaxed):
+            allowlist = profile.allowlist_factory()
+            assert allowlist.cidrs == ()
+            assert (
+                url_guard._is_blocked_ip(
+                    "240.240.0.1",
+                    allowlist,
+                    trusted_hostname=True,
+                    allow_private=profile.allow_private,
+                )
+                is True
+            )
+
+    def test_reserved_literal_admitted_by_operator_cidr(self):
+        allowlist = url_guard._Allowlist(cidrs=(url_guard.ipaddress.ip_network("240.240.0.0/16"),))
+        assert url_guard._is_blocked_ip("240.240.0.1", allowlist) is False
+        assert url_guard._is_blocked_ip("240.1.0.1", allowlist) is True
+
+    def test_reserved_literal_not_admitted_by_trusted_hostname(self):
+        assert (
+            url_guard._is_blocked_ip("240.240.0.1", url_guard._Allowlist(), trusted_hostname=True)
+            is True
+        )
+
     def test_skill_allowlist_does_not_leak_into_proxy_profile(self):
         with patch.object(url_guard, "settings", _settings(github_extra_hosts="github.corp")):
             with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("10.0.0.5")):
@@ -842,6 +925,142 @@ class TestCredentialedOAuthProfile:
         )
         with pytest.raises(UrlValidationError):
             transport._pin_request(httpx.Request("POST", "http://93.184.216.34/token"))
+
+
+class TestEntraGraphProfile:
+    """Only the configured Graph fetch hostname may gain private-IP trust."""
+
+    def test_default_is_public_only_https_and_credential_bearing(self, monkeypatch):
+        monkeypatch.delenv("ENTRA_GRAPH_BASE_URL", raising=False)
+        profile = url_guard.ENTRA_GRAPH_PROFILE
+        assert profile.name == "entra-graph"
+        assert profile.require_https is True
+        assert profile.credential_bearing is True
+        assert profile.allowlist_factory().hosts == frozenset()
+        assert profile.allowlist_factory().cidrs == ()
+        with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("93.184.216.34")):
+            assert url_guard.validate_url(
+                "https://graph.microsoft.com/v1.0/me/transitiveMemberOf", profile=profile
+            ) == ["93.184.216.34"]
+        with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("10.20.30.40")):
+            with pytest.raises(UrlValidationError):
+                url_guard.validate_url("https://graph.microsoft.com/v1.0/me", profile=profile)
+
+    def test_configured_private_literal_is_not_trusted_proxy_hostname(self, monkeypatch):
+        monkeypatch.setenv("ENTRA_GRAPH_BASE_URL", "https://10.20.30.40")
+        with pytest.raises(UrlValidationError):
+            url_guard.validate_url(
+                "https://10.20.30.40/v1.0/me", profile=url_guard.ENTRA_GRAPH_PROFILE
+            )
+
+    def test_only_exact_explicit_proxy_host_may_resolve_private(self, monkeypatch):
+        monkeypatch.setenv("ENTRA_GRAPH_BASE_URL", "https://graph.proxy.example.com")
+        with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("10.20.30.40")):
+            assert url_guard.validate_url(
+                "https://graph.proxy.example.com/v1.0/me/transitiveMemberOf",
+                profile=url_guard.ENTRA_GRAPH_PROFILE,
+            ) == ["10.20.30.40"]
+            for host in (
+                "other.proxy.example.com",
+                "evil.graph.proxy.example.com",
+                "graph.proxy.example.com.evil.net",
+            ):
+                with pytest.raises(UrlValidationError):
+                    url_guard.validate_url(
+                        f"https://{host}/v1.0/me", profile=url_guard.ENTRA_GRAPH_PROFILE
+                    )
+
+        with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("93.184.216.34")):
+            assert url_guard.validate_url(
+                "https://graph.microsoft.com/v1.0/me", profile=url_guard.ENTRA_GRAPH_PROFILE
+            ) == ["93.184.216.34"]
+
+    def test_dod_graph_native_fetch_remains_public_only(self, monkeypatch):
+        monkeypatch.setenv("ENTRA_GRAPH_BASE_URL", "https://dod-graph.microsoft.us")
+        profile = url_guard.ENTRA_GRAPH_PROFILE
+        with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("93.184.216.34")):
+            assert url_guard.validate_url(
+                "https://dod-graph.microsoft.us/v1.0/me", profile=profile
+            ) == ["93.184.216.34"]
+        with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("10.20.30.40")):
+            with pytest.raises(UrlValidationError):
+                url_guard.validate_url("https://dod-graph.microsoft.us/v1.0/me", profile=profile)
+
+    def test_wildcard_proxy_configuration_never_trusts_private_subdomains(self, monkeypatch):
+        monkeypatch.setenv("ENTRA_GRAPH_BASE_URL", "https://*.proxy.example.com")
+        with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("10.20.30.40")):
+            with pytest.raises(UrlValidationError):
+                url_guard.validate_url(
+                    "https://graph.proxy.example.com/v1.0/me",
+                    profile=url_guard.ENTRA_GRAPH_PROFILE,
+                )
+
+    def test_proxy_rejects_mixed_public_and_metadata_dns_answers(self, monkeypatch):
+        monkeypatch.setenv("ENTRA_GRAPH_BASE_URL", "https://graph.proxy.example.com")
+        with patch.object(
+            url_guard.socket, "getaddrinfo", _resolve_to("10.20.30.40", "169.254.169.254")
+        ):
+            with pytest.raises(UrlValidationError):
+                url_guard.validate_url(
+                    "https://graph.proxy.example.com/v1.0/me",
+                    profile=url_guard.ENTRA_GRAPH_PROFILE,
+                )
+
+    def test_proxy_trust_never_comes_from_other_allowlists_or_cidrs(self, monkeypatch):
+        monkeypatch.delenv("ENTRA_GRAPH_BASE_URL", raising=False)
+        with patch.object(
+            url_guard,
+            "settings",
+            _settings(
+                ssrf_allowed_hosts="graph.proxy.example.com", ssrf_allowed_cidrs="10.0.0.0/8"
+            ),
+        ):
+            with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("10.20.30.40")):
+                with pytest.raises(UrlValidationError):
+                    url_guard.validate_url(
+                        "https://graph.proxy.example.com/v1.0/me",
+                        profile=url_guard.ENTRA_GRAPH_PROFILE,
+                    )
+
+    def test_generic_proxy_cidr_does_not_extend_graph_private_hostname(self, monkeypatch):
+        monkeypatch.setenv("ENTRA_GRAPH_BASE_URL", "https://graph.proxy.example.com")
+        with patch.object(url_guard, "settings", _settings(ssrf_allowed_cidrs="10.0.0.0/8")):
+            with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("10.20.30.40")):
+                with pytest.raises(UrlValidationError):
+                    url_guard.validate_url(
+                        "https://other.example.com/v1.0/me",
+                        profile=url_guard.ENTRA_GRAPH_PROFILE,
+                    )
+
+    @pytest.mark.parametrize(
+        "ip", ["169.254.169.254", "169.254.170.2", "100.100.100.200", "fd00:ec2::254"]
+    )
+    def test_configured_proxy_cannot_resolve_to_metadata(self, monkeypatch, ip):
+        monkeypatch.setenv("ENTRA_GRAPH_BASE_URL", "https://graph.proxy.example.com")
+        with patch.object(url_guard.socket, "getaddrinfo", _resolve_to(ip)):
+            with pytest.raises(UrlValidationError):
+                url_guard.validate_url(
+                    "https://graph.proxy.example.com/v1.0/me",
+                    profile=url_guard.ENTRA_GRAPH_PROFILE,
+                )
+
+    def test_configured_proxy_rejects_plaintext_even_when_private_trusted(self, monkeypatch):
+        monkeypatch.setenv("ENTRA_GRAPH_BASE_URL", "https://graph.proxy.example.com")
+        with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("10.20.30.40")):
+            with pytest.raises(UrlValidationError):
+                url_guard.validate_url(
+                    "http://graph.proxy.example.com/v1.0/me", profile=url_guard.ENTRA_GRAPH_PROFILE
+                )
+
+    def test_configured_proxy_transport_pins_private_ip_preserving_host_and_sni(self, monkeypatch):
+        monkeypatch.setenv("ENTRA_GRAPH_BASE_URL", "https://graph.proxy.example.com")
+        with patch.object(url_guard.socket, "getaddrinfo", _resolve_to("10.20.30.40")):
+            pinned = url_guard.GuardedAsyncTransport(
+                guard_profile=url_guard.ENTRA_GRAPH_PROFILE
+            )._pin_request(httpx.Request("GET", "https://graph.proxy.example.com/v1.0/me"))
+        assert pinned.url.host == "10.20.30.40"
+        assert pinned.headers["Host"] == "graph.proxy.example.com"
+        assert pinned.extensions["sni_hostname"] == "graph.proxy.example.com"
 
 
 class TestEgressUpstreamProfile:
