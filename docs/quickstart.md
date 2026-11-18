@@ -41,10 +41,10 @@ node --version  # Should show v20.x.x
 
 **Install Python and UV:**
 ```bash
-sudo apt-get install -y python3.14 python3.14-venv python3-pip
+sudo apt-get install -y python3.14 python3.14-venv python3-pip pipx
 
 # Install UV package manager
-curl -LsSf https://astral.sh/uv/install.sh | sh
+pipx install uv==0.13.5
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 uv --version
@@ -107,12 +107,9 @@ KEYCLOAK_ADMIN_PASSWORD=YourSecureAdminPassword123!
 INITIAL_ADMIN_PASSWORD=YourSecureAdminPassword123!  # MUST match KEYCLOAK_ADMIN_PASSWORD
 KEYCLOAK_DB_PASSWORD=SecureKeycloakDB123!
 
-# Session cookie security (CRITICAL for local development)
-# For HTTP access (localhost): MUST be false
-SESSION_COOKIE_SECURE=false
-
-# For HTTPS access (production): set to true
-# SESSION_COOKIE_SECURE=true
+# Session cookie security: the default true works for http://localhost and
+# for HTTPS. The cookie is Secure on HTTPS and never Secure on plain HTTP.
+SESSION_COOKIE_SECURE=true
 
 # Leave these as defaults
 KEYCLOAK_URL=http://localhost:8080

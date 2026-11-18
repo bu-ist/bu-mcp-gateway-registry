@@ -94,7 +94,7 @@ When a search query arrives:
 - Uses HNSW index on DocumentDB (production) or application-level cosine similarity on MongoDB CE
 - Finds conceptually similar content even with different wording
 - Returns results sorted by cosine similarity
-- DocumentDB uses configurable `efSearch` parameter (default 100) for HNSW recall quality
+- DocumentDB uses a configurable `efSearch` parameter (default 1000) for HNSW recall quality
 - Minimum `k=50` ensures small collections are fully covered
 
 **Keyword Search (Lexical)**
@@ -149,13 +149,49 @@ This ensures the API returns meaningful 0-1 scores that the UI can display as pe
 
 ### 3b. Tool Scoring
 
-Tools within matched servers are scored independently based on how well their name and description match the query tokens:
+Tools within matched servers are scored independently based on how well their name and description match the query tokens. `_score_tool_relevance()` is the single scorer, and it blends a capped raw score with token coverage:
 
 ```
-tool_score = keyword_match_quality(tool_name, tool_description, query_tokens)
+raw       = 0.5 per query token found in the tool name
+          + 0.3 per query token found only in the description
+coverage  = matched_tokens / total_query_tokens
+score     = min(1.0, raw) * 0.7 + coverage * 0.3
 ```
 
-Only tools with a non-zero match score are included in results. Tools that don't match the query are excluded even if their parent server matched. This replaces the previous approach where all tools inherited a hardcoded 0.8 score from the server.
+Worked examples for a two-token query:
+
+| Match | Raw | Coverage | Score |
+|-------|-----|----------|-------|
+| One token in the name | 0.5 | 0.5 | 0.50 |
+| One token in the description only | 0.3 | 0.5 | 0.36 |
+| Both tokens in the name | 1.0 | 1.0 | 1.00 |
+
+Only tools with a non-zero score are included. A tool that does not match is excluded even if its parent server matched, so `matching_tools` can be shorter than the server's `num_tools`.
+
+**One scorer on every path.** The search repository has four code paths that produce `matching_tools`: the aggregation pipeline in `search()`, the keyword-merge branch of `search()`, `_client_side_search()`, and `_lexical_only_search()`. All four grade in Python with `_score_tool_relevance()`.
+
+This is an invariant worth stating because it was silently violated for four months. The MongoDB `$filter` / `$map` in `_build_text_boost_stage()` used to stamp a literal `"relevance_score": 1.0` on every keyword-matched tool, so the two aggregation-fed paths reported a perfect score for any tool whose name or description matched the query at all. Since DocumentDB supports `$search: {vectorSearch: ...}` and MongoDB CE does not, the flat score appeared on DocumentDB for every query while the local development stack looked correct. The aggregation now selects candidates and emits no score; Python grades what it selected (issue #1752).
+
+The division of labour that follows from this: **Mongo selects candidates, Python scores them.** Do not add a scoring expression to an aggregation stage. There is no way to keep it in step with `_score_tool_relevance()`, and the failure is silent.
+
+### 3c. Absolute vs Rank-Relative Scores
+
+Two different numbers reach the caller, and conflating them causes confusion:
+
+| Field | Meaning | Range | Comparable across queries |
+|-------|---------|-------|---------------------------|
+| `relevance_score` | Rank-relative, after min-max normalization | 0.0 to 1.0 | No |
+| `similarity_score` | Raw cosine similarity to the query | -1.0 to 1.0 | Yes |
+
+`relevance_score` maps the top-ranked result to exactly 1.0 on every query by construction, however weak the match. That is deliberate (see [Score Normalization](#3a-score-normalization)), because raw RRF scores land between 0.01 and 0.03 and rendered as "1% match" for the best possible hit.
+
+The consequence is that a nonsense query still returns a top hit at 1.0. `similarity_score` is the honest absolute number that sits beside it, computed by `_attach_similarity_scores()`. A server can legitimately return `relevance_score: 1.0` with `similarity_score: 0.02`, which means "this was the best of a bad set".
+
+Notes on `similarity_score`:
+
+- It is **not** a 0-to-1 confidence and must not be rendered as a percentage. Negative values are normal and mean the document is less alike than two random vectors would be.
+- It is `null` when the query was not embedded (lexical fallback mode).
+- It is `null` on tools lifted out of a parent server. Similarity is attached per indexed document path, and a lifted tool carries `server_path` rather than its own `path`. A standalone tool entity, which is its own indexed document, does get a value.
 
 ### 4. Score-Before-Filter Pattern
 
@@ -301,9 +337,12 @@ Search returns grouped results (up to `max_results` total, distributed across en
     {
       "path": "/context7",
       "server_name": "Context7 MCP Server",
+      "num_tools": 4,
       "relevance_score": 1.0,
+      "similarity_score": 0.6412,
       "matching_tools": [
-        {"tool_name": "query-docs", "description": "..."}
+        {"tool_name": "query-docs", "description": "...", "relevance_score": 0.9},
+        {"tool_name": "resolve-library-id", "description": "...", "relevance_score": 0.31}
       ]
     }
   ],
@@ -311,6 +350,8 @@ Search returns grouped results (up to `max_results` total, distributed across en
     {
       "server_path": "/context7",
       "tool_name": "query-docs",
+      "relevance_score": 0.9,
+      "similarity_score": null,
       "inputSchema": {...}
     }
   ],
@@ -320,8 +361,13 @@ Search returns grouped results (up to `max_results` total, distributed across en
       "path": "/virtual/dev-tools",
       "server_name": "Dev Tools",
       "relevance_score": 0.85,
+      "similarity_score": 0.5107,
       "backend_paths": ["/github", "/jira"],
-      "tool_count": 5
+      "backend_count": 2,
+      "num_tools": 5,
+      "matching_tools": [
+        {"tool_name": "create_issue", "description": "...", "relevance_score": 0.45}
+      ]
     }
   ],
   "skills": [...]
@@ -392,7 +438,7 @@ Search returns grouped results (up to `max_results` total, distributed across en
 - Not indexed separately - extracted from parent server documents
 - When a server matches, its tools are checked for keyword matches
 - Top-level `tools[]` array contains full schema (inputSchema)
-- `matching_tools` in server results is a lightweight reference (no schema)
+- `matching_tools` in server results is a lightweight reference (no schema) carrying `tool_name`, `description`, `relevance_score` and `match_context`, sorted best first
 
 ### Virtual MCP Servers
 
@@ -433,16 +479,27 @@ Virtual MCP Servers are indexed in the unified `mcp_embeddings_{dimensions}` col
       "server_name": "Dev Tools",
       "description": "Aggregated development tools",
       "relevance_score": 0.85,
+      "similarity_score": 0.5107,
       "tags": ["development", "tools"],
       "backend_paths": ["/github", "/jira"],
-      "tool_count": 5,
+      "backend_count": 2,
+      "num_tools": 5,
       "matching_tools": [
-        {"tool_name": "github_search"}
+        {"tool_name": "github_search", "relevance_score": 0.45}
       ]
     }
   ]
 }
 ```
+
+**Two shapes, one set of counts.** Note where `num_tools`, `backend_count` and `backend_paths` live in each representation:
+
+| Representation | Location |
+|----------------|----------|
+| Stored document | nested under `metadata` |
+| Search result entry | flattened onto the entry, with no `metadata` key |
+
+The repository's three `virtual_server` branches copy them out of `metadata` onto the result entry. Response projection must therefore read them from the entry, not from `entry["metadata"]`, which does not exist. Reading only the nested location reported `num_tools: 0` and `backend_count: 0` for every virtual server in search results while `matching_tools` was populated, which is the giveaway that the two shapes were confused.
 
 ## Metadata in Search
 
@@ -490,21 +547,30 @@ For hybrid (vector + keyword) search, use `POST /api/search/semantic` instead.
 
 ### DocumentDB (Production)
 - Native HNSW vector index with `$search` aggregation pipeline
-- **Per-entity-type vector search**: Runs separate `$search vectorSearch` pipelines for each entity type (mcp_server, a2a_agent, skill, virtual_server) to ensure fair candidate representation. In large registries (1000+ documents), a single global search would be dominated by whichever entity type has the most documents, making agents and skills invisible.
-- Each per-type pipeline retrieves `k_per_type = max(max_results * 2, 30)` candidates, then all candidates are merged and deduplicated before RRF scoring
+- **One global vector search**, then filter and distribute in Python
+- `k = min(max_results * VECTOR_SEARCH_OVERREQUEST, efSearch)` candidates, over-requested because the filters run after the search
 - Keyword query runs separately and merges results (no `$unionWith` support)
 - Text boost calculated in aggregation pipeline using `$regexMatch`
 
 ```
 Query: "flight booking"
-  Pipeline 1: $search vectorSearch (k=30) + $match entity_type=mcp_server  -> top 30 servers
-  Pipeline 2: $search vectorSearch (k=30) + $match entity_type=a2a_agent   -> top 30 agents
-  Pipeline 3: $search vectorSearch (k=30) + $match entity_type=skill       -> top 30 skills
-  Pipeline 4: $search vectorSearch (k=30) + $match entity_type=virtual_server -> top 30 virtual servers
-  Keyword:    collection.find({$or: [name/path/desc/tags/tools regex match]})
+  Vector:  $search vectorSearch (k=200) + $match entity_type $in [types] + $match status
+  Keyword: collection.find({$or: [name/path/desc/tags/tools regex match]})
 
-  All candidates merged -> RRF scoring -> _distribute_results -> normalize -> response
+  Candidates merged -> RRF scoring -> _distribute_results -> normalize -> response
 ```
+
+### Why not one pipeline per entity type
+
+Between June 2026 and issue #1751 this ran a separate pipeline per entity type, intending to stop servers crowding out agents and skills (#1160). It could not work, and the reason is worth recording so nobody rebuilds it.
+
+`$search` selects the nearest `k` documents before `$match` runs. So a pipeline of `$search (k=30)` followed by `$match entity_type=skill` does not return the top 30 skills. It returns whichever of the **global** top 30 happen to be skills. Every per-type pipeline ran the same global search and differed only in what it kept afterwards, so the union across all of them was exactly `k`, never `k` per type. Measured on DocumentDB: four pipelines at `k=30` produced 30 candidates in total.
+
+The loop therefore cost up to five sequential round trips (measured at 59 to 885ms) for the candidate set a single query returns.
+
+It also broke ranking. `_reciprocal_rank_fusion()` treats list position as the vector rank, and the caller passed it the per-type blocks concatenated in loop order. That made entity type outrank similarity, and made the caller's `entity_types` argument order change the results. A single query returns one list in similarity order, which is the input RRF documents.
+
+**Per-type recall needs per-type collections, not per-type queries.** Collection is the only partition DocumentDB offers for vector search: `$search` takes no filter, and vector indexes support no `partial`, `sparse` or `compound` options. Splitting the embeddings collection by entity type would make `k` genuinely per-type. That is not implemented; the trade-off is a reindex and more indexes to maintain.
 
 ### MongoDB CE (Development/Local)
 - No native vector search support (`$vectorSearch` not available)
@@ -596,20 +662,48 @@ The same boost weights from hybrid mode apply:
 | Metadata       | +1.0        |
 | Tool (each)    | +1.0        |
 
+Note that these boosts score the **document**, not its tools. Tool-level scores come from `_score_tool_relevance()` in Python on this path as well, so a lexical-only search grades tools exactly as hybrid search does. `similarity_score` is `null` in this mode, since no embedding was produced.
+
 ### Recovery
 
 When the embedding model becomes available again (e.g., after a restart with correct configuration), the system automatically returns to full hybrid search mode. The `_embedding_unavailable` flag and `_load_error` cache are per-process and reset on restart.
 
 ## HNSW Tuning (DocumentDB)
 
-The DocumentDB `$search` pipeline includes two tunable parameters:
+| Parameter | Default | Env var | Description |
+|-----------|---------|---------|-------------|
+| `k` | `min(max_results * 20, efSearch / 2)` | derived | Nearest neighbours the search returns. Over-requested on purpose, see below. |
+| `efSearch` | `1000` | `VECTOR_SEARCH_EF_SEARCH` | HNSW traversal queue size, the equivalent of `numCandidates` in MongoDB Atlas. Higher improves recall and costs latency. Range 1-1000, the DocumentDB ceiling, so a typo fails at startup rather than on every query. |
+| overrequest multiplier | `20` | `VECTOR_SEARCH_OVERREQUEST` | Multiplier on `max_results` that produces `k`. Range 1-1000. |
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `k` | `max(max_results * 3, 50)` | Number of nearest neighbors to retrieve. Minimum 50 ensures small collections are fully covered. |
-| `efSearch` | `100` (configurable via `VECTOR_SEARCH_EF_SEARCH`) | Controls HNSW recall quality. Higher values improve recall at the cost of query latency. Default DocumentDB value is ~40, which can miss documents in small collections. |
+`k` and `efSearch` answer different questions and are set independently. `efSearch` is a quality dial, an absolute ceiling on how hard the traversal works. `k` comes from the caller's `max_results`, scaled.
 
-The `efSearch` setting is configured in `registry/core/config.py` as `vector_search_ef_search`.
+They are coupled by one physical constraint: HNSW cannot return more candidates than its queue holds. `k` is clamped to **half** the queue rather than all of it, because a queue exactly the size of the result set leaves the traversal no room to explore past what it has already committed to returning, which costs recall at the tail of `k`. At the default multiplier the clamp only binds above `max_results=25`.
+
+### Why k over-requests
+
+`$search` selects the nearest `k` documents **before** any `$match` runs, and DocumentDB offers no filter option inside the operator. So the entity-type and status filters run afterwards, and whatever they discard is lost with nothing to refill it. `k` therefore has to cover the expected loss.
+
+MongoDB Atlas calls this the overrequest pattern and recommends `numCandidates` at least 20 times the returned count. The same logic applies here with `efSearch` in that role.
+
+`k` can never usefully exceed `efSearch`, because the traversal queue bounds how many candidates the search can return. Hence the `min()`.
+
+### The limit worth knowing
+
+Recall from post-filtering tracks two things: how much of the corpus `k` retrieves, and how dense the wanted documents are within it. Measured on a 396-document corpus where only 23% of documents were enabled, a narrow `entity_types=["skill"]` query recovered 8 of 8 expected results once `k` exceeded the corpus, and 0 to 5 at `k=30`.
+
+Since `efSearch` caps at 1000, `k` caps at 1000, so coverage falls as a registry grows:
+
+| Corpus | `k=1000` covers | Narrow-query parity with the client-side path |
+|--------|-----------------|-----------------------------------------------|
+| ~400 | exhaustive | exact |
+| ~1300 | 76% | exact |
+| 3000 | 34% | degraded |
+| 10,000+ | under 10% | poor |
+
+The search logs its coverage (`k`, corpus size, percentage, survivor count) on every query, and warns when the survivor count falls below `max_results` while coverage is under 50%. Two levers when that fires: raise `VECTOR_SEARCH_OVERREQUEST`, or reduce the share of disabled and draft assets, which is usually the larger factor.
+
+MongoDB CE and Atlas take the client-side path, which filters inside the `find()` before ranking. These settings are inert there.
 
 ## Lifecycle Status Filtering
 
@@ -689,7 +783,7 @@ When an asset's lifecycle status changes (e.g., from `active` to `deprecated`), 
 1. **Result Distribution**: Global ranking with competitive soft caps limits results to `max_results` (default 10, max 50). The distribution algorithm is O(n) where n is the candidate set size (at most 150 documents).
 2. **RRF is O(n)**: Merging two ranked lists by ID lookup is linear, negligible overhead.
 3. **Index Reuse**: HNSW index parameters (m=16, efConstruction=128) optimized for recall
-4. **efSearch Tuning**: Set to 100 for near-exact recall in typical deployments
+4. **efSearch Tuning**: Defaults to 1000, the DocumentDB maximum, which is near-exact for registries of a few thousand documents
 5. **Embedding Caching**: Lazy-loaded model with singleton pattern
 6. **Keyword Fallback**: Separate query ensures explicit matches are not missed
 7. **Error Caching**: Failed model loads are cached to avoid repeated download/API attempts

@@ -42,6 +42,7 @@ against Graph) and exercising the flow against the `mcp-entra` Helm release.
 - [Runtime sequence](#runtime-sequence)
 - [How `obo_exchange` differs from the 3LO vault](#how-obo_exchange-differs)
 - [Registration contract](#registration-contract)
+- [Backend discovery (health / tool-list)](#backend-discovery-for-obo_exchange-servers-health--tool-list)
 - [The RFC 8707 resource / Entra App ID URI constraint](#resource-constraint)
 - [Environment variables](#environment-variables)
 - [1. Entra app registration](#1-entra-app-registration)
@@ -210,8 +211,7 @@ sequenceDiagram
 
 Key points:
 
-- **Stateless, per-request.** The exchanged token embeds the user's `sub`; it is
-  minted fresh each request and never cached/reused across users.
+- **Stateless, per-request, by default.** The exchanged token embeds the user's `sub`; it is minted fresh each request and never reused across users. The opt-in [exchanged-token cache](egress-obo-cache.md) (`EGRESS_OBO_CACHE_ENABLED`, default off) lets one user reuse their own token for the same audience for up to `EGRESS_OBO_CACHE_MAX_TTL_SECONDS`.
 - **The user's gateway credentials never reach the MCP server.** The seam strips
   `Authorization`/`X-Authorization`/`Cookie`/`X-Internal-Token` before injecting
   the exchanged token.
@@ -235,7 +235,7 @@ the forwarded token is **sourced**.
 | Token source | Per-user vaulted third-party token | IdP token exchange, minted per request |
 | IdP relationship | Third-party provider (GitHub/Google/...) | SAME IdP as the gateway |
 | User interaction | One-time browser consent per `(provider, server)` | None (ingress token is the exchange subject) |
-| Storage | Secret store (OpenBao / Secrets Manager) + refresh | Stateless — nothing stored |
+| Storage | Secret store (OpenBao / Secrets Manager) + refresh | Stateless by default; the opt-in [exchanged-token cache](egress-obo-cache.md) stores tokens under a reserved `obo-cache` namespace |
 | Forwarded token | Provider resource token (opaque, not re-exchangeable) | IdP JWT re-audienced to the MCP server (the server may optionally exchange it again) |
 | Registration | `provider`, `client_id`, `client_secret`, scopes | `target_audience` (+ audience scopes) |
 | Credentials used | Per-server operator-supplied OAuth app | The gateway's OWN IdP client credentials |
@@ -258,6 +258,206 @@ validates the token it receives against two facts the gateway guarantees: the
 **expected `aud`** (its own app, registered as `target_audience`) and the **shared
 issuer** (the same IdP — already known). If it exchanges the token again for a
 downstream resource, it does so against those same facts.
+
+---
+
+## Backend discovery for `obo_exchange` servers (health / tool-list)
+
+`obo_exchange` sources the **runtime** token per user, per request (above). But the
+registry also runs **headless** health checks and tool discovery against the
+server — with no user present and no ingress JWT — so it cannot perform an OBO
+exchange for those calls (there is no `subject_token`). Discovery therefore
+authenticates as the **gateway itself** using the OAuth 2.0 `client_credentials`
+grant, requesting a token audienced to the server's `target_audience`. This is the
+machine-identity analogue of the per-user exchange.
+
+| | Runtime (`obo_exchange`) | Discovery (this section) |
+|---|---|---|
+| Grant | `jwt-bearer` / RFC 8693 token exchange | `client_credentials` (RFC 6749 §4.4) |
+| Identity | the end user (`sub` preserved) | the gateway app itself (no user) |
+| Where | auth-server `mcp_proxy` hop | registry (`backend_oauth.resolve_obo_discovery_bearer`) |
+| Credential | gateway IdP client creds + user JWT | gateway IdP client creds only |
+| Token claims | `aud`=server app, `sub`=user | `aud`=server app, `roles`=app role(s), **no user/`scp`** |
+
+The discovery token is used **only** for the registry's own health/tool-list calls
+(and security scan). It is never injected on the end-user egress hop — that hop
+continues to use the per-user OBO exchange (the discovery/runtime auth separation
+requested in issue #966).
+
+### Enabling it
+
+**Supported identity providers for backend discovery: Entra only.** The gateway mints this machine token
+against its own IdP, and `AUTH_PROVIDER=entra` is the only value implemented. Every
+other — including the shipped default `cognito`, plus `keycloak`, `okta`, `auth0` and
+`pingfederate` — resolves nothing, and the server reports unhealthy. `keycloak` is
+refused deliberately rather than partially working; see [Keycloak](#keycloak) below.
+Backend discovery for `obo_exchange` servers therefore requires Entra plus the manual
+app registration in the next section, and **nothing in a default deployment reaches
+it**.
+
+No extra **registry** configuration: discovery activates automatically for a server
+when `EGRESS_AUTH_ENABLED=true`, `egress_auth_mode=obo_exchange`, and the server has
+**no explicit `auth_scheme`** (`none`) — an operator's static credential always wins
+over a derived one — reusing the registered `egress_oauth.target_audience`. The
+`target_audience` is re-validated at
+mint time against the **full** registration control, not just part of it — the
+always-on first-party floor (so the machine token can never be minted for Microsoft
+Graph / ARM / Key Vault), the `EGRESS_OBO_ALLOWED_AUDIENCES` allowlist / shape rule,
+**and** the gateway's-own-audience check. That last one matters more here than for
+the runtime grant: Entra rejects a same-app OBO *exchange* at runtime, but it will
+happily issue `api://<gateway-client-id>/.default` to the gateway itself. Sending
+that upstream would hand a third-party MCP server a token audienced to this gateway,
+in the form its own ingress accepts.
+
+Sovereign clouds: set `ENTRA_LOGIN_BASE_URL` (US Gov
+`https://login.microsoftonline.us`, China `https://login.partner.microsoftonline.cn`);
+the gateway's token endpoint is derived from it.
+
+### Entra changes required
+
+A `client_credentials` (app-only) token can carry **only application permissions
+(app roles)**, never delegated scopes. So, in addition to the general app setup in
+[§1](#1-entra-app-registration):
+
+**On the TARGET internal MCP server's app registration** (the resource being
+discovered):
+
+1. **Expose an Application ID URI** — *Expose an API* → set `api://<target-client-id>`
+   (or a custom `api://<name>`). This exact value is the server's `target_audience`.
+2. **Define an App Role for applications** — *App roles* → *Create app role* →
+   **Allowed member types = Applications** (e.g. value `Discovery.Access`). An
+   assignable application app role is what lets `<target>/.default` mint a token
+   for this resource.
+
+**On the GATEWAY app registration** (the registry's existing app —
+`ENTRA_CLIENT_ID`):
+
+3. **Add API permission** — *API permissions* → *Add a permission* → **My APIs** →
+   select the target server app → **Application permissions** → check the app role
+   from step 2.
+4. **Grant admin consent** — click *Grant admin consent for <tenant>*. Application
+   permissions **always** require admin consent; without it the token request fails
+   (`AADSTS65001`).
+5. **Client secret** — reuse the gateway's existing secret (`ENTRA_CLIENT_SECRET`).
+   No new or per-server secret.
+
+**Token behavior.** The registry requests
+`POST {ENTRA_LOGIN_BASE_URL}/{tenant}/oauth2/v2.0/token` with
+`grant_type=client_credentials`, `client_id`/`client_secret` = the gateway app,
+and `scope=api://<target>/.default`. The issued token has `aud=api://<target>`, a
+`roles` claim, **no `scp`**, and its subject is the gateway service principal — no
+user. **The internal MCP server MUST accept app-only tokens** (validate `aud` +
+`roles`, tolerate the absence of a user/`scp`) for at least its discovery
+endpoints (`initialize`, `tools/list`); a server that only accepts delegated
+user tokens will still fail discovery.
+
+### Keycloak
+
+**Backend discovery is refused outright, deliberately.** `_gateway_idp_client` returns nothing for
+`AUTH_PROVIDER=keycloak` regardless of how Keycloak is configured, and logs:
+
+```
+obo discovery unavailable: AUTH_PROVIDER=keycloak is not supported for backend
+discovery. Keycloak binds the token audience with a server-side audience mapper that
+this deployment does not create, so the gateway cannot prove a token is audienced to
+the target. Use AUTH_PROVIDER=entra for obo_exchange discovery.
+```
+
+There is no configuration that enables it. That is a change from "nearly working",
+and the reason is the second of two problems:
+
+1. **`KEYCLOAK_URL` is plain HTTP on every shipped deployment.** The token request
+   carries the gateway's own `client_secret`, so it goes through the credentialed
+   OAuth SSRF profile, which requires HTTPS and refuses private hosts
+   (`http://keycloak:8080` on Compose, the headless Service on Helm). Relaxing that
+   guard is not the fix, because the alternative is posting a client secret in
+   cleartext.
+2. **Keycloak cannot be given a target audience in the request.** It binds audience
+   through a server-side **audience** protocol mapper on the gateway's service-account
+   client, not a request scope, so no `.default` is sent — and neither the charts nor
+   the realm bootstrap create that mapper.
+
+Problem 2 is why the refusal is unconditional rather than gated on HTTPS. Fixing only
+problem 1 used to get past the guard and mint a **real token audienced to whatever
+Keycloak defaults to** — not the server's `target_audience` — which was then sent to a
+third-party MCP server as `Authorization: Bearer`, with nothing downstream re-checking
+`aud`. Failing closed is the only honest state until the mapper is created and the
+audience contract is testable.
+
+Under Keycloak the affected servers record **unhealthy**, per *Failure behavior* below.
+
+### Failure behavior
+
+Fail-closed: if the token cannot be minted (feature off, gateway client
+unconfigured, target audience blocked, or the IdP rejects the request), the
+registry omits the header and the health check records the server **unhealthy** —
+the correct signal. It never falls back to an unauthenticated scan or to the
+runtime OBO path.
+
+
+### Scope and limits of "discovery"
+
+Two things this does **not** mean, both worth stating because the name invites the
+other reading:
+
+- **It is not OAuth metadata discovery.** The registry does not fetch an upstream's
+  RFC 9728 protected-resource metadata or an authorization server's RFC 8414
+  metadata, does not read a `WWW-Authenticate` challenge to locate an AS, and does
+  not perform Dynamic Client Registration (see ADR 0001). "Discovery" here means the
+  registry's *own* discovery calls — health, `tools/list`, security scan — can
+  authenticate to a server that requires OAuth. An operator supplies the authorize
+  and token endpoints; nothing is probed.
+- **It is not available to a registry-only deployment.** A borrowed OAuth 2.1
+  identity lives in the per-user credential vault, so it requires
+  `EGRESS_AUTH_ENABLED`, a configured secret store, and gateway mode. With the egress
+  feature off, a stored designation is inert; the UI says so and both resolvers log
+  which setting is wrong, rather than the server simply going unhealthy with no
+  explanation. Tier 1 (`client_credentials` from the server's own backend-auth config,
+  `auth_scheme: oauth`) has no such requirement and works in any deployment.
+
+The tier numbers below match `with_bearer` in `registry/core/backend_oauth.py`:
+**1** = `client_credentials` from the server's own config (`auth_scheme: oauth`),
+**2** = a borrowed OAuth 2.1 discovery identity from the vault (`auth_scheme: none`
+plus `oauth_discovery.enabled`), **3** = a gateway app-only token for an
+`obo_exchange` server (`auth_scheme: none`).
+
+### Operational notes
+
+- **Runtime Keycloak OBO is implemented; discovery is not.** `obo_exchange` performs
+  an RFC 8693 token exchange against Keycloak, verifies the returned token and refuses
+  it if the gateway itself would accept it. Every shipped deployment surface needs
+  operator setup first (TLS on `KEYCLOAK_URL`, the trusted IdP host, and the realm
+  audience changes); see the
+  [Keycloak prerequisites](design/egress-auth-design.md#keycloak-self-hosted-as-the-obo-identity-provider).
+  Backend discovery still refuses `AUTH_PROVIDER=keycloak` outright (see
+  [Keycloak](#keycloak)) rather than minting a token whose audience it cannot
+  constrain.
+- **Tier 2 reads the vault on every health cycle.** Unlike tiers 1 and 3 it is not
+  cached, so each cycle is a fresh secret-store read plus a possible refresh. On AWS
+  Secrets Manager that is a billed API call per server per cycle, and is subject to
+  throttling — worth accounting for when sizing the health interval against a large
+  number of servers carrying a **discovery designation** (tier 2 applies to
+  `auth_scheme: none` servers, not to `oauth`-scheme ones, which are tier 1 and are
+  cached).
+- **A private-resolving token endpoint is accepted at config time and refused at
+  use.** `PUT /oauth-config` validates `token_url` with the same credentialed profile
+  the request will run under, but with `resolve=False` so config-time validation does
+  not depend on DNS. A host like `https://idp.internal:8443` that *resolves* to a
+  private address therefore passes validation and is then refused on every health
+  cycle, logged as a policy rejection. Use a publicly resolvable HTTPS token
+  endpoint; relaxing the guard is not the fix, since it exists to stop the registry
+  posting a client secret to a private or plaintext host. An internal HTTPS IdP needs
+  an explicit entry in `EGRESS_OAUTH_TRUSTED_IDP_HOSTS` (hosts only, no CIDRs).
+- **`resource` is not the Entra spelling.** Tier 1 sends an RFC 8707 `resource`
+  parameter when one is configured. Entra v2 does not accept it — it expects the
+  target to be named as `scope=<App ID URI>/.default`. Configure scopes rather than
+  `resource` for Entra-protected servers; `resource` is for authorization servers
+  that implement RFC 8707.
+- **Revoking a designation needs the secret store reachable.** `DELETE
+  /oauth-discovery` and server deletion both revoke the vaulted credential, and that
+  path depends on `SECRET_STORE_BACKEND` rather than `EGRESS_AUTH_ENABLED` — so it
+  still works with the egress feature off. If both are cleared, the revoke cannot run
+  and the residue is logged at exception level for manual removal.
 
 ---
 
@@ -284,8 +484,13 @@ The only value satisfying all three is the **per-server connection URL**
   needs a path-qualified Entra App ID URI: every `obo_exchange` server, plus
   `oauth_user` (3LO) servers **when the gateway's IdP is Entra**. Lenient IdPs
   (Keycloak/Cognito) keep using the gateway-wide root PRM for 3LO.
-- That per-server PRM advertises `resource = https://<gateway>/<server>/mcp` and
-  scope `.../user_impersonation`, derived dynamically from the registry entry.
+- That per-server PRM advertises `resource = https://<gateway>/<server>/mcp`,
+  derived dynamically from the registry entry. On **Entra** it also advertises
+  the scope `.../user_impersonation`; on every other IdP (e.g. Keycloak) it
+  advertises the same IdP-universal scopes as the gateway-wide PRM
+  (`MCP_ADVERTISED_SCOPES`, default `openid email profile offline_access`),
+  because a scope-validating IdP rejects the unknown `.../user_impersonation`
+  scope with `invalid_scope` at login.
 - auth-server validates that per-server `aud` (built from the **public** gateway
   URL).
 
@@ -308,8 +513,8 @@ registry and uses the gateway's existing IdP credentials. Relevant existing vars
 | `AUTH_SERVER_EXTERNAL_URL` | auth-server | Public gateway URL; auth-server builds the per-server audience to validate from it (NOT the internal `REGISTRY_URL`). |
 | `REGISTRY_URL` | registry | Public gateway URL; the per-server PRM `resource` is built from it. |
 | `IDE_OAUTH_CLIENT_ID` / `IDE_OAUTH_CALLBACK_PORT` | registry | Pre-registered public client advertised to IDEs that consume the Connect config (Cursor). Claude Code passes these as CLI flags instead. |
-| `MCP_ADVERTISED_SCOPES` | registry | Affects only the gateway-wide root PRM (non-obo discovery). Leave at the chart default; obo uses the per-server PRM. |
-| `SSRF_ALLOWED_HOSTS` / `SSRF_ALLOWED_CIDRS` | registry | **Required for an in-cluster MCP server.** The registry validates each server's `proxy_pass_url` through the SSRF guard, which blocks private/cluster IPs; an internal server (private ClusterIP) is otherwise marked unhealthy and its nginx location is commented out, so requests return `405`. List the server's host (`SSRF_ALLOWED_HOSTS=obo-echo.<ns>.svc.cluster.local`) or the cluster service CIDR (`SSRF_ALLOWED_CIDRS=172.20.0.0/16`, the EKS default). Chart values: `registry.app.ssrfAllowedHosts` / `registry.app.ssrfAllowedCidrs`. |
+| `MCP_ADVERTISED_SCOPES` | registry | Scopes advertised by the gateway-wide root PRM and, on non-Entra IdPs (e.g. Keycloak), by the per-server PRM too. On Entra the per-server PRM advertises `<resource>/user_impersonation` instead, so leave this at the chart default there. |
+| `SSRF_ALLOWED_HOSTS` / `SSRF_ALLOWED_CIDRS` | registry | **Required for an in-cluster MCP server.** The registry validates each server's `proxy_pass_url` through the SSRF guard, which blocks private/cluster IPs; an internal server (private ClusterIP) is otherwise marked unhealthy and its nginx location is commented out, so requests return `405`. List the server's host (`SSRF_ALLOWED_HOSTS=obo-echo.<ns>.svc.cluster.local`) or the cluster service CIDR (`SSRF_ALLOWED_CIDRS=172.20.0.0/16`, the EKS default). Chart values: `registry.app.ssrfAllowedHosts` / `global.ssrfAllowedCidrs` (stack chart; reaches registry, auth-server and mcpgw), or `registry.app.ssrfAllowedCidrs` for a standalone registry chart. |
 
 ---
 
@@ -437,10 +642,12 @@ this automatic; the only requirements are:
 2. **Each obo server's per-server URL is in the gateway app's `identifierUris`**
    (the manual Entra step; see 3d-alt and `GET /api/egress/obo-identifier-uris`).
 
-No `MCP_ADVERTISED_SCOPES` tuning is needed for obo: the per-server PRM advertises
-the correct per-server `resource` + scope dynamically from the registry entry.
-(`MCP_ADVERTISED_SCOPES` only affects the gateway-wide root PRM used by non-obo
-discovery; leave it at the chart default `openid profile email offline_access`.)
+No `MCP_ADVERTISED_SCOPES` tuning is needed for obo on Entra: the per-server PRM
+advertises the correct per-server `resource` + scope dynamically from the registry
+entry. (On Entra `MCP_ADVERTISED_SCOPES` only affects the gateway-wide root PRM
+used by non-obo discovery; leave it at the chart default
+`openid profile email offline_access`. On non-Entra IdPs the per-server PRM
+advertises these same scopes instead of `user_impersonation`.)
 
 > For the CLI token path (3a) the `aud` is whatever resource you mint against via
 > `--scope`; for the MCP-client path it is the per-server resource the client
@@ -530,6 +737,13 @@ app's `identifierUris` array.
   ```
 - The shared `user_impersonation` scope (1a-bis) resolves under each of these
   URIs via its stable permission id -- no per-server scope or re-consent needed.
+- **Virtual MCP servers need an entry too.** A `/virtual/<id>/mcp` endpoint is an
+  ingress login endpoint like any other, so on Entra it gets its own per-server
+  PRM and its connection URL must be an `identifierUris` entry. Enabled virtual
+  servers are included in the `/api/egress/obo-identifier-uris` output above.
+  Without the entry the client fails at authorize (`AADSTS9010010`), and without
+  the per-server PRM it never gets that far: it falls back to the bare-origin
+  root PRM, whose OIDC-basics scopes Entra refuses (`AADSTS70011`).
 - **Do this AFTER registering the server (3b)** so its path exists, and BEFORE
   the client connects (3d-alt). The registry side is automatic (per-server PRM +
   audience validation); this array is the one manual Entra step per obo server.
@@ -667,8 +881,10 @@ curl -ksS -i -X POST "$GW/obo-echo/mcp" \
 >        `WWW-Authenticate: resource_metadata=<gw>/.well-known/oauth-protected-resource/<server>/mcp`
 >        (nginx per-location `set $mcp_resource_metadata`; every obo server, and
 >        `oauth_user` servers too when the gateway IdP is Entra).
->     2. That per-server PRM advertises `resource = <gw>/<server>/mcp` and
->        `scope = <gw>/<server>/mcp/user_impersonation` (dynamic, from the registry).
+>     2. That per-server PRM advertises `resource = <gw>/<server>/mcp` and, on
+>        Entra, `scope = <gw>/<server>/mcp/user_impersonation` (dynamic, from the
+>        registry). Non-Entra IdPs (Keycloak) get the gateway-wide scope list
+>        (`MCP_ADVERTISED_SCOPES`) instead, since they reject unknown scopes.
 >     3. Claude sends `resource=<gw>/<server>/mcp` verbatim (has a path -> no
 >        trailing-slash) + that scope -> Entra matches the App ID URI -> token
 >        `aud = <gw>/<server>/mcp`.
@@ -783,10 +999,12 @@ kubectl logs -n mcp-entra -l app=obo-echo --tail=80
   `<target>/.default` — every delegated permission the gateway app holds on the
   MCP server's API. Tighter scoping requires listing explicit scopes rather than
   `.default`; privilege is otherwise bounded by the app-registration grants.
-- **Stateless mint is a hard invariant.** The exchanged token embeds the user's
-  `sub`; it is minted per request and never cached or reused across users. A
-  cache-key bug would be privilege escalation; the `obo_exchange` branch shares no
-  cache with the `oauth_user` vault.
+- **Stateless mint is the default.** The exchanged token embeds the user's `sub`; it is minted per request and never
+  reused across users. The opt-in [exchanged-token cache](egress-obo-cache.md) keys each entry on the immutable user id,
+  IdP, audience and scope digest, so an entry is served only to the user it was minted for, and only when `/validate`
+  verified the exact bearer JWT being exchanged. A key bug there would be privilege escalation, which is why the key
+  carries the immutable id rather than the username. The cache lives in its own `obo-cache` namespace and shares nothing
+  with the `oauth_user` vault entries.
 - **Closed audience allowlist.** auth-server accepts a per-server `aud` only for
   the registered obo server being accessed (derived from the request path + the
   public gateway URL), never a wildcard.

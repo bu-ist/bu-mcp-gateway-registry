@@ -12,21 +12,120 @@ import logging
 import os
 import re
 import subprocess  # nosec B404
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+import certifi
 
 from ..common.log_redaction import redact_url
 from ..core.config import settings
 from ..core.endpoint_utils import get_endpoint_url
 from ..repositories.factory import get_security_scan_repository
 from ..schemas.security import SecurityScanConfig, SecurityScanResult
+from .scanner_llm_analyzer import (
+    MCP_SCANNER_LITELLM_STANDIN,
+    LLMAnalyzerUnavailableError,
+    ensure_llm_analyzer_available,
+)
 
 logger = logging.getLogger(__name__)
 
 # Constants
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "security_scans"
+
+# Name of the environment variable carrying the scan credential to the child. Private to
+# this module and the shim below; deliberately NOT one of mcp-scanner's own variables.
+_SCANNER_BEARER_ENV = "MCP_GATEWAY_SCAN_BEARER"  # nosec B105 - env var name, not a secret
+
+# Python source run inside the scanner subprocess, after the litellm stand-in. It fixes
+# when mcp-scanner falls back from MCP 2026-07-28 to the initialize handshake.
+#
+# mcp-scanner 4.8.7 sends server/discover first. When that fails it falls back to
+# initialize only for one exact message, "Bad Request: Missing session ID". A server on
+# the mcp 1.x Python SDK (FastMCP 2/3, the gateway's own mcpgw) checks the
+# MCP-Protocol-Version header first and answers -32600 "Bad Request: Unsupported
+# protocol version: 2026-07-28. Supported versions: ...", so the scan failed and,
+# with SECURITY_BLOCK_ON_SCAN_FAILURE on, the registry disabled the server.
+#
+# The 2026-07-28 spec's rule is: only the errors that 2026-07-28 itself defines
+# (-32020 HeaderMismatch, -32021 MissingRequiredClientCapability, -32022
+# UnsupportedProtocolVersion) identify a modern server. Any other error means a
+# handshake-era server, so fall back to initialize. The patch keeps every fallback
+# mcp-scanner already makes and adds that one. If the module cannot be imported or the
+# method is ever renamed, the patch does nothing rather than break the scan.
+# Spec: https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#backward-compatibility
+# Remove once cisco-ai-mcp-scanner falls back on any non-2026 discover error:
+# https://github.com/cisco-ai-defense/mcp-scanner/issues/302
+MCP_SCANNER_DISCOVER_FALLBACK_PATCH: str = (
+    "try:\n"
+    "    import mcpscanner.core.scanner as _mcps\n"
+    "except ImportError:\n"
+    "    _mcps=None\n"
+    "_mcps_original=getattr(getattr(_mcps,'Scanner',None),'_should_fallback_to_initialize',None)\n"
+    "if _mcps_original is not None:\n"
+    "    def _mcps_should_fallback(error,*,legacy_stdio=False,legacy_http=False):\n"
+    "        if _mcps_original(error,legacy_stdio=legacy_stdio,legacy_http=legacy_http):\n"
+    "            return True\n"
+    "        code=getattr(error,'code',None)\n"
+    "        if code is None:\n"
+    "            code=getattr(getattr(error,'error',None),'code',None)\n"
+    "        return code not in (-32020,-32021,-32022)\n"
+    "    _mcps.Scanner._should_fallback_to_initialize=staticmethod(_mcps_should_fallback)\n"
+)
+
+# Launched as `python -c <shim>`, so the scan credential never appears in any argv. The
+# shim pops it from the environment and re-attaches mcp-scanner's own flag inside the
+# child, then hands off to the same entry point the console script uses. Popping it also
+# keeps it out of the environment the scanner might pass to anything it spawns.
+# MCP_SCANNER_LITELLM_STANDIN runs first: mcp-scanner imports litellm at module
+# load even for a YARA-only scan, and the registry no longer installs it (#1826).
+# MCP_SCANNER_DISCOVER_FALLBACK_PATCH runs second, before the CLI starts a scan.
+_SCANNER_SHIM = (
+    MCP_SCANNER_LITELLM_STANDIN
+    + MCP_SCANNER_DISCOVER_FALLBACK_PATCH
+    + (
+        "import os,sys;"
+        "from mcpscanner.cli import cli_entry_point;"
+        f"_t=os.environ.pop({_SCANNER_BEARER_ENV!r},None);"
+        "sys.argv=['mcp-scanner']+sys.argv[1:]+(['--bearer-token',_t] if _t else []);"
+        "sys.exit(cli_entry_point())"
+    )
+)
+
+
+def _scan_failure_message(exc: BaseException, headers: str | None) -> str:
+    """Build the failure string the UI's scan modal shows.
+
+    This is the one place an operator reads about a failed scan, so it has to carry
+    something they can act on. "security scan failed (RuntimeError)" names a Python
+    exception and nothing else, which is what sent one investigation through DNS,
+    TLS and firewall rules before the real cause turned up in a log line.
+
+    When the scan carried no credential, say so. Against a server that requires
+    authentication that IS the whole explanation, and it is the common cause here: a
+    discovery identity designated but never connected, or one whose vaulted token is
+    gone (OpenBao in dev mode discards tokens on restart).
+
+    ``headers`` is the resolved auth header the caller built, so empty means the scan
+    went out unauthenticated. Shared by both failure paths -- the specific exception
+    list and the catch-all -- because a message written into only one of them is a
+    message half the failures will not carry.
+    """
+    # The 'llm' analyzer error already says what to change; a credential hint
+    # would send the operator the wrong way.
+    if isinstance(exc, LLMAnalyzerUnavailableError):
+        return str(exc)
+    message = f"security scan failed ({type(exc).__name__})"
+    if not headers:
+        message += (
+            " - the scan ran without a credential. A server that requires "
+            "authentication will refuse it. Check this server's scan/discovery "
+            "credential, then rescan."
+        )
+    return message
 
 
 def _extract_bearer_token_from_headers(headers: str) -> str | None:
@@ -157,10 +256,12 @@ class SecurityScannerService:
             enabled=settings.security_scan_enabled,
             scan_on_registration=settings.security_scan_on_registration,
             block_unsafe_servers=settings.security_block_unsafe_servers,
+            allow_unsafe_servers=settings.security_allow_unsafe_servers,
             analyzers=settings.security_analyzers,
             scan_timeout_seconds=settings.security_scan_timeout,
             llm_api_key=settings.mcp_scanner_llm_api_key or os.getenv("MCP_SCANNER_LLM_API_KEY"),
             add_security_pending_tag=settings.security_add_pending_tag,
+            block_on_scan_failure=settings.security_block_on_scan_failure,
         )
 
     async def scan_server(
@@ -256,6 +357,7 @@ class SecurityScannerService:
             # never spawned). Same profile as the pre-resolution check so the
             # built-in server's exact-identity endpoint (/mcp) is admitted.
             validate_url(server_url, profile=scan_profile)
+            ensure_llm_analyzer_available(analyzers, "SECURITY_ANALYZERS")
 
             # Run the scan in a thread pool to avoid blocking
             raw_output = await asyncio.to_thread(
@@ -303,9 +405,10 @@ class SecurityScannerService:
             RuntimeError,
             UrlValidationError,
         ) as exc:
-            failure = f"security scan failed ({type(exc).__name__})"
+            failure = _scan_failure_message(exc, headers)
             logger.error(
-                f"Security scan failed endpoint={safe_server_url} type={type(exc).__name__}",
+                f"Security scan failed endpoint={safe_server_url} type={type(exc).__name__} "
+                f"authenticated={bool(headers)}",
             )
 
             raw_output = {
@@ -334,9 +437,10 @@ class SecurityScannerService:
             await self._scan_repo.create(result.model_dump())
             return result
         except Exception as exc:
-            failure = f"security scan failed ({type(exc).__name__})"
+            failure = _scan_failure_message(exc, headers)
             logger.error(
-                f"Unexpected security scan failure endpoint={safe_server_url} type={type(exc).__name__}",
+                f"Unexpected security scan failure endpoint={safe_server_url} "
+                f"type={type(exc).__name__} authenticated={bool(headers)}",
             )
             raw_output = {
                 "error": failure,
@@ -394,9 +498,26 @@ class SecurityScannerService:
         logger.info(f"Running security scan endpoint={redact_url(server_url)}")
         logger.info(f"Using analyzers: {analyzers}")
 
-        # Build command
+        # Build command. The scanner is launched through a tiny in-process shim rather
+        # than its console script, so the credential can be handed over in the child's
+        # ENVIRONMENT instead of its argv.
+        #
+        # `mcp-scanner remote` only accepts a credential as `--bearer-token` / `--header`,
+        # both of which land in the child's argv and are therefore world-readable via
+        # `ps` and /proc/<pid>/cmdline for the life of the scan. That was tolerable when
+        # the only thing passed was an operator's static scan token; it is not once the
+        # resolver can hand over a *delegated human* OAuth token (a borrowed discovery
+        # identity) or the gateway's own app-only token. The shim re-attaches the flag
+        # inside the child, where the value is no longer externally visible.
+        #
+        # The environment is already this subprocess's channel for secrets
+        # (MCP_SCANNER_LLM_API_KEY, below), so this follows the existing convention
+        # rather than inventing one. /proc/<pid>/environ is restricted to the same
+        # uid/root, unlike cmdline, and `ps` never renders it.
         cmd = [
-            "mcp-scanner",
+            sys.executable,
+            "-c",
+            _SCANNER_SHIM,
             "--analyzers",
             analyzers,
             "--raw",  # Use raw format instead of summary
@@ -405,14 +526,17 @@ class SecurityScannerService:
             server_url,
         ]
 
-        # Add headers if provided - parse JSON and extract bearer token
+        env = os.environ.copy()
+        # mcp-scanner 4.8.7 runs on MCP SDK 2.x, whose httpx2 client reads only the
+        # operating system trust store, and the registry image ships none. Give
+        # it certifi, the trust 4.8.6 had through httpx. An operator's own
+        # SSL_CERT_FILE is left alone.
+        env.setdefault("SSL_CERT_FILE", certifi.where())
+        # Parse the resolved auth headers and hand the credential over out-of-band.
         if headers:
             bearer_token = _extract_bearer_token_from_headers(headers)
             if bearer_token:
-                cmd.extend(["--bearer-token", bearer_token])
-
-        # Set environment variable for API key if provided
-        env = os.environ.copy()
+                env[_SCANNER_BEARER_ENV] = bearer_token
         if api_key:
             env["MCP_SCANNER_LLM_API_KEY"] = api_key
 

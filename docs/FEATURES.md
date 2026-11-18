@@ -34,14 +34,15 @@ This document provides a comprehensive overview of the MCP Gateway & Registry so
 - **Self-Signed JWT Tokens**: Human users can generate tokens for CLI tools and AI coding assistants
 - **Secure Token Management**: OAuth token refresh and validation with centralized session management
 - **MCP Server Security Scanning**: Integrated vulnerability scanning with Cisco AI Defense MCP Scanner
+- **Per-Tool Blocking**: Block an individual unsafe tool instead of disabling a whole server, automatically from a security scan or by hand from the UI, CLI or API. Blocked tools are rejected on `tools/call` and hidden from tool listings and search
 - **Compliance Audit Logging**: Comprehensive audit logs for all API and MCP access events with TTL-based retention, credential masking, and admin UI for compliance monitoring
 
 ## Intelligent Tool Discovery
 - **Hybrid Search**: Combined vector similarity with tokenized keyword matching for servers, tools, and agents
-- **Semantic Search**: HNSW vector search using sentence transformers or LiteLLM-supported providers
+- **Semantic Search**: HNSW vector search using sentence transformers or a remote embeddings API
 - **Unified Search**: Single endpoint searches across MCP servers, tools, and A2A agents
 - **Tag-Based Filtering**: Multi-tag filtering with AND logic for precise tool selection
-- **Flexible Embeddings**: Local sentence-transformers, OpenAI, Amazon Bedrock Titan, or any LiteLLM-supported provider
+- **Flexible Embeddings**: Local sentence-transformers, OpenAI or any OpenAI-compatible endpoint, Azure OpenAI, or Amazon Bedrock (Titan, Cohere)
 - **Performance Optimized**: Configurable result limits and caching for fast response times
 
 ## Developer Experience

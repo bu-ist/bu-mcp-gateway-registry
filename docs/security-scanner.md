@@ -106,7 +106,7 @@ uv run python api/registry_management.py --token-file .oauth-tokens/ingress.json
 - `SECURITY_SCAN_ENABLED=true` - Enable/disable security scanning (default: true)
 - `SECURITY_SCAN_ON_REGISTRATION=true` - Scan during registration (default: true)
 - `SECURITY_SCAN_BLOCK_UNSAFE_SERVERS=true` - Auto-disable unsafe servers (default: true)
-- `SECURITY_ANALYZERS=yara` - Comma-separated list of analyzers (default: yara)
+- `SECURITY_ANALYZERS=yara` - Comma-separated list of analyzers (default: yara). The `llm` analyzer is currently unavailable; see [LLM Analyzer](#llm-analyzer).
 - `SECURITY_SCAN_TIMEOUT=60` - Scan timeout in seconds (default: 60)
 - `MCP_SCANNER_LLM_API_KEY=<key>` - API key for LLM analyzer (optional)
 
@@ -241,6 +241,106 @@ WARNING: Server failed security scan - Review required before use
 *Servers that fail security scans are automatically added in disabled state with a `security-pending` tag, requiring administrator review before being enabled.*
 
 This workflow ensures that vulnerable servers never become accessible to AI agents without explicit administrator review and remediation.
+
+## When the Scan Could Not Run at All
+
+The section above is about a scan that *found* something. A scan can also fail to produce a verdict: the endpoint refused the connection, the session timed out, the SKILL.md would not download. The scanner reports that as `scan_failed=true`, with `is_safe=false` and all four severity counts at zero, so on the numbers it looks identical to a clean pass that happened to be unsafe.
+
+`SECURITY_BLOCK_ON_SCAN_FAILURE` decides what to do with that. It applies to servers, agents and skills alike.
+
+```bash
+# Default. A scan that could not complete disables the asset, as in earlier
+# releases.
+SECURITY_BLOCK_ON_SCAN_FAILURE=true
+
+# The asset stays enabled. It is still tagged security-pending either way.
+SECURITY_BLOCK_ON_SCAN_FAILURE=false
+```
+
+The default is `true`, so behaviour is unchanged from earlier releases until you opt out.
+
+**When to set it to `false`.** Some endpoints can never produce a conclusive scan. An MCP server behind per-user egress OAuth has no credential to offer the scanner at registration, so its scan fails every time. Because registration re-runs the scan, any edit to such a server's definition disables it, and a disabled server drops out of the generated nginx config, so calls to it stop being routed at all rather than failing with a clear error. If that describes your deployment, set this to `false`.
+
+**What you give up.** An asset the scanner never assessed stays enabled and serving. You are relying on the `security-pending` tag to tell you about it, which is why that tag is applied on both paths and independently of whether blocking is on. It shows on the asset card's shield icon, in `GET /api/servers`, and in the `/security-scan` endpoints, which all return `scan_failed` so you can tell "could not reach this" apart from "found something here".
+
+Turning this off does not relax anything about assets the scanner *did* reach a verdict on. `SECURITY_BLOCK_UNSAFE_SERVERS` and its agent and skill equivalents still govern those.
+
+## Per-Tool Blocking: Keeping a Server Up With Only Its Unsafe Tools Blocked
+
+The default above is all-or-nothing. A server with twelve safe tools and one tool flagged CRITICAL is switched off entirely, and operators lose the eleven working tools to quarantine one. An AWS documentation server is a real example: a scan flagged 2 of its 6 tools for prompt injection, so the all-or-nothing response costs you the 4 clean tools as well, including `aws___list_regions` and `aws___read_documentation`.
+
+`SECURITY_ALLOW_UNSAFE_SERVERS=true` adds a middle setting. A failing scan then leaves the server **enabled** and blocks only the tools flagged CRITICAL or HIGH.
+
+```bash
+# Both are required: the opt-in only has effect while blocking is on.
+SECURITY_BLOCK_UNSAFE_SERVERS=true
+SECURITY_ALLOW_UNSAFE_SERVERS=true
+```
+
+Default is `false`, so behaviour is unchanged until you opt in.
+
+### What a blocked tool means
+
+| Surface | Behaviour |
+|---------|-----------|
+| `tools/call` | rejected with 403, ahead of the scope check, so an admin or wildcard scope cannot bypass it |
+| `tools/list` through the gateway | the tool is absent |
+| Semantic search and `intelligent_tool_finder` | the tool is absent |
+| `server.json` | the tool is absent |
+| Registry UI and `GET /api/servers` | the tool is listed, marked `blocked` with the reason, so an operator can see and act on it |
+
+Hiding a blocked tool from the agent-facing surfaces is a security requirement, not a tidiness one. A tool earns a `HIGH:PROMPT INJECTION` block because its **description** carries the injection, and `tools/list` and search are what hand descriptions to a model. Refusing the call while still advertising the description would stop the wrong half of the attack.
+
+### When the block is applied
+
+Auto-blocking runs wherever a scan completes: at registration, and on a rescan. Enabling the flag does **not** retroactively block anything, so an existing server needs a rescan before its blocks appear:
+
+```bash
+uv run python api/registry_management.py --token-file .token rescan --path /context7
+```
+
+If the scan marks a server unsafe but blames no individual tool (a server-level finding), there is nothing to block per tool and the whole server is disabled, exactly as it would be with the opt-in off. The setting narrows the response where it can; it never widens what is reachable.
+
+### Blocking or unblocking a tool by hand
+
+An administrator can override either way. In the UI, open a server's **Tools** dialog: each tool has a toggle, and a blocked tool is struck through with a `BLOCKED` badge and its reason.
+
+From the CLI, with the `toggle_service` permission:
+
+```bash
+# Block one tool. The server and its other tools keep working.
+uv run python api/registry_management.py --token-file .token \
+  toggle-tool --path /context7 --tool resolve-library-id --enabled false
+
+# Unblock it.
+uv run python api/registry_management.py --token-file .token \
+  toggle-tool --path /context7 --tool resolve-library-id --enabled true
+```
+
+Or through the Python client:
+
+```python
+from registry_client import RegistryClient
+
+client = RegistryClient(registry_url="https://your-registry", token=token)
+client.toggle_tool("/context7", "resolve-library-id", enabled=False)
+```
+
+**A manual decision outranks the scanner and survives rescans.** An unblock is stored as `source="admin"` rather than deleted, and reconciliation preserves admin entries. Without that, the next scan would re-block a tool the scanner still flags and the override would be meaningless. The same holds in reverse: a tool you blocked by hand stays blocked even if a later scan finds it clean.
+
+### Endpoints
+
+| Method | Endpoint | Authentication |
+|--------|----------|----------------|
+| POST | `/api/toggle-tool/{path}` | session cookie (used by the UI) |
+| POST | `/api/servers/toggle-tool/{path}` | bearer token (used by the CLI and client) |
+
+Both take `{"tool_name": "...", "enabled": true|false}` and enforce identical authorization.
+
+### Limitations
+
+- A tool whose name contains `.` or starts with `$` cannot be blocked, because names are stored as document keys. The API rejects the attempt rather than writing a block that would silently never apply, and auto-blocking skips such a tool with a warning.
+- When every tool on a server is blocked, the server stays enabled while serving nothing. It reads as healthy to a client and is not.
 
 ## Manual On-Demand Security Scans (API)
 
@@ -388,7 +488,7 @@ uv run python api/registry_management.py --token-file .oauth-tokens/ingress.json
 - `AGENT_SECURITY_SCAN_ENABLED=true` - Enable/disable agent security scanning (default: true)
 - `AGENT_SECURITY_SCAN_ON_REGISTRATION=true` - Scan during registration (default: true)
 - `AGENT_SECURITY_BLOCK_UNSAFE_AGENTS=true` - Auto-disable unsafe agents (default: true)
-- `AGENT_SECURITY_ANALYZERS=yara,spec` - Comma-separated list of analyzers (default: yara,spec)
+- `AGENT_SECURITY_ANALYZERS=yara,spec` - Comma-separated list of analyzers (default: yara,spec). The `llm` analyzer is currently unavailable; see [LLM Analyzer](#llm-analyzer).
 - `AGENT_SECURITY_SCAN_TIMEOUT=60` - Scan timeout in seconds (default: 60)
 - `AGENT_SECURITY_ADD_PENDING_TAG=true` - Add security-pending tag to unsafe agents (default: true)
 
@@ -536,6 +636,8 @@ If the security scan detects critical or high severity vulnerabilities:
 
 Administrators must review the security scan results and remediate any issues before manually enabling the agent.
 
+A scan that could not run at all is a separate case, governed by `SECURITY_BLOCK_ON_SCAN_FAILURE`. See [When the Scan Could Not Run at All](#when-the-scan-could-not-run-at-all); the setting is shared across servers, agents and skills.
+
 ## Agent Skills Security Scanning
 
 The registry provides comprehensive security scanning for Agent Skills (SKILL.md files) using the [Cisco AI Defense Skill Scanner](https://github.com/cisco-ai-defense/cisco-ai-skill-scanner). This ensures that skills registered in the system are safe and do not contain malicious instructions, prompt injection attempts, or other security threats before being made available to AI coding assistants.
@@ -548,7 +650,7 @@ When registering a new Agent Skill, security scanning is automatically performed
 - `SKILL_SECURITY_SCAN_ENABLED=true` - Enable/disable skill security scanning (default: true)
 - `SKILL_SECURITY_SCAN_ON_REGISTRATION=true` - Scan during registration (default: true)
 - `SKILL_SECURITY_BLOCK_UNSAFE_SKILLS=true` - Auto-disable unsafe skills (default: true)
-- `SKILL_SECURITY_ANALYZERS=static` - Comma-separated list of analyzers (default: static)
+- `SKILL_SECURITY_ANALYZERS=static` - Comma-separated list of analyzers (default: static). The `llm` analyzer is currently unavailable; see [LLM Analyzer](#llm-analyzer).
 - `SKILL_SECURITY_SCAN_TIMEOUT=120` - Scan timeout in seconds (default: 120)
 - `SKILL_SECURITY_ADD_PENDING_TAG=true` - Add security-pending tag to unsafe skills (default: true)
 - `SKILL_SECURITY_LLM_API_KEY=<key>` - API key for LLM analyzer (optional)
@@ -714,6 +816,8 @@ If the security scan detects critical or high severity vulnerabilities:
 
 Administrators must review the security scan results and remediate any issues before manually enabling the skill.
 
+A scan that could not run at all is a separate case, governed by `SECURITY_BLOCK_ON_SCAN_FAILURE`. See [When the Scan Could Not Run at All](#when-the-scan-could-not-run-at-all); the setting is shared across servers, agents and skills.
+
 ## Periodic Registry Scans
 
 Beyond initial registration security checks, the registry supports comprehensive periodic scans of all enabled servers. This ongoing monitoring detects newly discovered vulnerabilities and ensures continued security compliance.
@@ -823,6 +927,8 @@ YARA scanning is ideal for automated workflows and continuous integration pipeli
 
 ### LLM Analyzer
 
+> **Currently unavailable.** The `llm` analyzer needs the LiteLLM library, which the registry no longer installs (issue #1826). A scan configured with `llm` in `SECURITY_ANALYZERS`, `AGENT_SECURITY_ANALYZERS` or `SKILL_SECURITY_ANALYZERS` fails before the scanner starts, the entity is recorded as unsafe, and the registry prints a warning at startup naming the setting. Use `yara` (MCP servers), `yara,spec` (agents) or `static` (skills). The analyzer returns once `cisco-ai-mcp-scanner` makes LiteLLM an optional dependency ([mcp-scanner#285](https://github.com/cisco-ai-defense/mcp-scanner/issues/285)); the YARA, spec, heuristic, endpoint, static and behavioral analyzers are unaffected.
+
 **Type:** AI-powered semantic analysis
 **Speed:** Slower (requires API calls)
 **API Key Required:** Yes (OpenAI-compatible API)
@@ -860,8 +966,8 @@ MCP_SCANNER_LLM_API_KEY=sk-your-openai-api-key
 **Using Both Analyzers:**
 
 ```bash
-# During server addition
-./cli/service_mgmt.sh add config.json yara,llm
+# During server addition: set SECURITY_ANALYZERS=yara,llm on the registry, then register
+uv run python api/registry_management.py --registry-url http://localhost --token-file .token register --config config.json
 
 # During periodic scans
 uv run cli/scan_all_servers.py --base-url https://mcpgateway.example.com --analyzers yara,llm
@@ -926,6 +1032,8 @@ chmod 755 security_scans
 ### MCP Server API Endpoints
 - **Trigger Server Scan:** `POST /api/servers/{path}/rescan` - Admin-only manual security scan for MCP servers
 - **Query Server Results:** `GET /api/servers/{path}/security-scan` - Retrieve MCP server scan results
+- **Block/Unblock One Tool (API):** `POST /api/servers/toggle-tool/{path}` - Bearer-token route used by the CLI and Python client
+- **Block/Unblock One Tool (UI):** `POST /api/toggle-tool/{path}` - Session-authenticated route used by the registry UI
 
 ### A2A Agent API Endpoints
 - **Trigger Agent Scan:** `POST /api/agents/{path}/rescan` - Admin-only manual security scan for A2A agents
@@ -946,6 +1054,16 @@ uv run python api/registry_management.py --token-file .oauth-tokens/ingress.json
 # Get server scan results
 uv run python api/registry_management.py --token-file .oauth-tokens/ingress.json \
   --registry-url http://localhost security-scan --path /server-path
+
+# Block one tool, leaving the server and its other tools working
+uv run python api/registry_management.py --token-file .oauth-tokens/ingress.json \
+  --registry-url http://localhost toggle-tool --path /server-path \
+  --tool some_tool --enabled false
+
+# Unblock it (recorded as an admin decision, so a later rescan will not undo it)
+uv run python api/registry_management.py --token-file .oauth-tokens/ingress.json \
+  --registry-url http://localhost toggle-tool --path /server-path \
+  --tool some_tool --enabled true
 ```
 
 #### A2A Agent Security Commands

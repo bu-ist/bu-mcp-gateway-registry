@@ -1,6 +1,10 @@
 <!-- Budget: 350 lines max (CI-enforced). Feature announcements -> docs/overview/feature-release-highlights.md (top 3 mirrored here). Structure rationale -> docs/design/theory-of-the-system.md#6-how-to-change-this-system-without-breaking-its-theory -->
 <div align="center">
-<img src="docs/img/mcp_gateway_horizontal_white_logo.png" alt="MCP Gateway & Registry Logo" width="100%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/logo/png/lockup-horizontal-on-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/logo/png/lockup-horizontal-on-light.png">
+  <img src="docs/logo/png/lockup-horizontal-neutral.png" alt="AI Gateway & Registry" width="480">
+</picture>
 
 **Unified Agent & MCP Server Registry – Gateway for AI Development Tools**
 
@@ -10,6 +14,8 @@
 [![GitHub release](https://img.shields.io/github/v/release/agentic-community/mcp-gateway-registry?style=flat&logo=github)](https://github.com/agentic-community/mcp-gateway-registry/releases)
 
 [Get Running Now](#quick-start) | [Docs](https://agentic-community.github.io/mcp-gateway-registry/) | [Executive Brief](docs/overview/executive-brief.md) | [Slide Deck](docs/slides/mcp-gateway-registry-presentation.pdf) | [Demo Videos](docs/demo-videos.md) | [AWS Workshop](https://catalog.us-east-1.prod.workshops.aws/workshops/0c3265a6-1a4a-467b-ae56-e4d019184b0e/en-US) | [Community](#community)
+
+If your organization runs the MCP Gateway & Registry in production, please [add it to ADOPTERS.md](ADOPTERS.md). It takes about five minutes.
 
 </div>
 
@@ -25,28 +31,9 @@ Without a control plane, every team wires its own MCP servers and agents by hand
 
 This platform replaces that with **one governed entry point for every AI asset**. Register a server, agent, skill, or custom entity once; discover it by natural-language search; reach it through a single authenticated gateway that enforces access and records every call. One control plane, one access model, one audit trail, across all asset types.
 
-```
-┌─────────────────────────────────────┐     ┌──────────────────────────────────────────────────────┐
-│          BEFORE: Chaos              │     │    AFTER: MCP Gateway & Registry                     │
-├─────────────────────────────────────┤     ├──────────────────────────────────────────────────────┤
-│                                     │     │                                                      │
-│  Developer 1 ──┬──► MCP Server A    │     │  Developer 1 ──┐                  ┌─ MCP Server A    │
-│                ├──► MCP Server B    │     │                │                  ├─ MCP Server B    │
-│                └──► MCP Server C    │     │  Developer 2 ──┼──► MCP Gateway   │                  │
-│                                     │     │                │    & Registry ───┼─ MCP Server C    │
-│  Developer 2 ──┬──► MCP Server A    │ ──► │  AI Agent 1 ───┘         │        │                  │
-│                ├──► MCP Server D    │     │                          │        ├─ AI Agent 1      │
-│                └──► MCP Server E    │     │  AI Agent 2 ──────────────┤        ├─ AI Agent 2     │
-│                                     │     │                          │        │                  │
-│  AI Agent 1 ───┬──► MCP Server B    │     │  AI Agent 3 ──────────────┘        └─ AI Agent 3     │
-│                ├──► MCP Server C    │     │                                                      │
-│                └──► MCP Server F    │     │              Single Connection Point                 │
-│                                     │     │                                                      │
-│  ❌ Multiple connections per user  │     │         ✅ One gateway for all                      │
-│  ❌ No centralized control         │     │         ✅ Unified server & agent access            │
-│  ❌ Credential sprawl              │     │         ✅ Unified governance & audit trails        │
-└─────────────────────────────────────┘     └──────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="docs/img/gateway-before-after.svg" alt="Without a gateway, every developer and agent wires every MCP server with its own credentials. With the MCP Gateway and Registry, each client connects once to one entry point that authorizes, routes, and audits calls to MCP servers, A2A agents, and skills." width="100%">
+</p>
 
 **Onboard third-party OAuth MCP servers, the enterprise way.** Because the gateway provides [per-user egress authentication](docs/design/egress-auth-design.md), you can connect OAuth-protected SaaS MCP servers such as Slack, Atlassian, and GitHub without every user setting up network access to those services or storing credentials on their laptop. Each user connects their account once; the gateway runs the OAuth (3LO) flow, vaults the per-user token in a secrets manager, and injects it on egress. That collapses onboarding to a single, auditable choke point, so a team can adopt a new SaaS MCP server across the enterprise without per-laptop plumbing or scattered long-lived tokens.
 
@@ -54,18 +41,9 @@ This platform replaces that with **one governed entry point for every AI asset**
 
 The gateway is the **data plane** (a generic nginx reverse proxy: TLS, auth validation, routing to backends) and the registry is the **control plane** (a FastAPI service that owns the inventory, access model, and audit trail, and decides what the gateway may route to). An **auth server** integrates your identity provider (Keycloak, Entra ID, Okta, Auth0, Cognito, PingFederate) for OAuth2/OIDC, and **MongoDB / DocumentDB** stores configuration, embeddings, sessions, and audit records.
 
-```mermaid
-flowchart LR
-    Users["Human Users"] -->|HTTPS| GW
-    Agents["AI Agents"] -->|MCP / auth| GW
-    Assistants["Coding Assistants"] -->|MCP / OAuth| GW
-    subgraph GWBOX["MCP Gateway & Registry"]
-        GW["nginx reverse proxy<br/>(data plane)"] -->|auth_request| Auth["Auth Server"]
-        GW --> Reg["Registry API + UI<br/>(control plane)"]
-    end
-    Auth -.->|validate| IdP["Identity Provider"]
-    GW -->|routes to| Servers["MCP Servers, Agents, Skills<br/>(anywhere: EKS / ECS / Lambda / SaaS)"]
-```
+<p align="center">
+  <img src="docs/img/gateway-architecture.svg" alt="Users, AI agents, and coding assistants call the nginx gateway. nginx checks each request with the auth server, which proxies MCP calls to backend servers and agents with per-user egress credentials. The registry writes nginx config and stores inventory, scopes, and audit records in MongoDB or DocumentDB. The auth server reads scopes from the database and verifies identity with the identity provider." width="100%">
+</p>
 
 By default, the registry handles A2A discovery, authentication, and access control, and agents then communicate directly (peer-to-peer) rather than routing every call through the gateway. For the full design and its invariants, read the [Theory of the System](docs/design/theory-of-the-system.md); for layered diagrams, see [Architecture Diagrams](docs/architecture-diagrams.md).
 
@@ -135,23 +113,21 @@ Across all of them you get semantic + lexical search, UI, REST, and MCP-native i
 - **Observability**: [OpenTelemetry metrics](docs/OBSERVABILITY.md) and health monitoring built in.
 
 ## What's New
-
 <!-- Exactly the 5 most-recent highlights. Older entries live in docs/overview/feature-release-highlights.md; the release-notes skill rotates this list. Do not grow it. -->
-
-- **Gateway for Any Resource — One AI Gateway for Inference, MCP, A2A, and REST** - The gateway now fronts **any** HTTP backend, not only MCP servers, so a single authenticated entry point covers four kinds of traffic: **model inference** (OpenAI, Amazon Bedrock, or any OpenAI-compatible endpoint), **MCP servers**, **A2A agents**, and **any generic REST endpoint** registered as a custom entity. Callers hold one gateway token and reach everything through a registry URL; the backend URL and its credential stay in the registry, encrypted at rest and injected on egress, so no provider key ever lands on a laptop. Per record, each caller brings their own key (caller passthrough), which is the default and the right choice whenever a human is behind the request: the provider sees one client per user, so quota and billing stay attributable. A shared operator key is optional and meant for service-to-service traffic, where there is no end user to attribute. Per-entity response streaming carries SSE and AWS event-stream bodies incrementally, with bounded concurrency, byte, and duration ceilings, and every call goes through the same scopes, audit trail, and rate limits as the rest of the registry — a legacy `methods: ["all"]` grant authorizes no HTTP verb, so nothing gains access by accident. Off by default (`GATEWAY_GENERIC_PROXY_ENABLED=false`), per-entity opt-in, and no schema migration. [Design](docs/design/gateway-generic-proxy.md) · [Operational Guide](docs/gateway-proxy-operational-guide.md) · [FAQ: call OpenAI or Bedrock through the gateway](docs/faq/registering-model-inference-endpoints.md) · [FAQ: what an upgrade changes](docs/faq/gateway-proxy-backwards-compatibility.md)
-- **Reusable Egress Hardening & IdP-Authenticated Embeddings** - One consolidated fail-closed SSRF/egress guard now governs every outbound fetch, with decrypted credentials bound to the exact validated destination, uniformly token-free response projection across the whole entity family, and `AWS_EC2_METADATA_DISABLED=true` closing boto3's IMDS credential fallback on the auth-server and registry tasks. Semantic-search embeddings can be served by an OpenAI-compatible endpoint (e.g. LiteLLM) protected by your IdP: set `EMBEDDINGS_AUTH_MODE=idp` and the registry fetches and caches an OAuth2 client-credentials token per call, with a `raw_array` adapter for non-envelope endpoints, plus Microsoft Entra v1 `api://` scope pass-through. See the [1.29.0 release notes](docs/release-notes/1.29.0.md).
-- **Configurable MCP Access-Token TTL** - MCP access-token lifetimes are no longer hardcoded to 8 hours. Operators set a default via `MCP_TOKEN_DEFAULT_TTL_HOURS` and a hard ceiling via `MCP_TOKEN_MAX_TTL_HOURS`; a per-registration `expires_in_hours` is honored and clamped to the ceiling. The UI mint flows and the API both use the configured default, wired across Docker (including podman and prebuilt-image compose variants), Terraform/ECS, and Helm/EKS. See the [1.28.0 release notes](docs/release-notes/1.28.0.md).
-- **Application-Level Rate Limiting** - Identity/group/target-aware request limits enforced at the auth-server `/validate` hop, complementary to the coarse per-IP nginx edge limiting. Cap a caller (user or agent, by group membership), a target (MCP server / A2A agent), or **each caller independently per target** (the `caller_target` axis), each per time window, with config-time lockout-safeguard floors and a fail-open availability guardrail. A **server group** target applies the same cap to a named set of servers, each with its own independent bucket (per-member uniform, not pooled) so one definition covers many servers and members can be added or removed without new definitions. Includes **quarantine** (a kill switch): move a user, agent, or MCP server into an auto-seeded reserved group to drop all of its data-plane traffic instantly (a plain 403, not a throttle) — admin-only, from the Users / M2M rows and the Rate Limits panel, and admin-group users can never be quarantined (enforced server-side, fail-closed). Off by default; limits and quarantine are managed at runtime via the admin API / CLI / UI. [Rate Limiting Design](docs/design/rate-limiting.md) · [FAQ: Quarantine a caller or target](docs/faq/quarantine-a-caller-or-target.md).
-- **A2A Reverse-Proxy Mode** - Opt in to route agent-to-agent traffic through the gateway the same way MCP servers are proxied: each enabled agent gets authenticated `/agent/{path}` routes, its real backend stays private (`proxy_pass_url`), discovery advertises the gateway URL, and every call is gated per-agent with `invoke_agent`. [A2A Guide](docs/a2a.md#reverse-proxy-mode-routing-a2a-traffic-through-the-gateway) · [Design](docs/design/a2a-protocol-integration.md#reverse-proxy-mode-proxying-a2a-traffic).
+- **MCP 2026-07-28 Support, Session Cookie Hardening and UI Branding** - The gateway serves MCP 2026-07-28 clients, which send no `initialize` and no session id, and clients of earlier revisions on the same URLs. Virtual servers answer `server/discover` and bridge a 2026-07-28 client to handshake-era backends, and nginx rejects a request whose `Mcp-Method` or `Mcp-Name` header disagrees with its body. Tool discovery, the health check, the security scanner and mcpgw move to MCP SDK 2.x. The registry and the auth server now read the session cookie by its exact name and treat a duplicated cookie as signed out, and an opt-in `SESSION_COOKIE_HOST_PREFIX` names it `__Host-<name>` so no other subdomain can set it. A deployment can rebrand the UI (colors, logos, favicon, themes and fonts) from a folder of files at deploy time without rebuilding the image, and light and dark mode both render correctly. Before upgrading, check custom scopes that rely on `tools: ["*"]` for methods other than tools, and move any session settings you edited in `oauth2_providers.yml` to environment variables. See the [1.37.0 release notes](docs/release-notes/1.37.0.md), [MCP 2026-07-28 support](docs/mcp-2026-07-28-migration.md) and [UI branding](docs/ui-branding.md).
+- **Pooled mcpgw Connections, Calling Tools Found by Search, and an Opt-In OBO Token Cache** - mcpgw keeps one pooled HTTP client for its registry and token traffic instead of opening a new connection for every tool call, with its own copy of the registry's egress guard, and the registry and auth-server pools now use their configured 30-second keep-alive instead of the httpx default of 5. An agent that finds a tool with `search_registry` can call it right away: coding agents get curl steps in mcpgw's instructions, and applications get a helper that calls the tool through the gateway as the user, with the application keeping the token. The auth server can now cache exchanged on-behalf-of tokens per user and audience for up to five minutes, off by default. `NGINX_DISABLE_API_AUTH_REQUEST=true` works again, so remove it unless you want cookie-only `/api/`. See the [1.36.0 release notes](docs/release-notes/1.36.0.md) and the [OBO token cache guide](docs/egress-obo-cache.md).
+- **Keycloak OBO Token Exchange, Users in Many Groups, and Bounded Registrant Metadata** - Egress on-behalf-of now works with Keycloak: the auth server exchanges the user's token for one scoped to the target client (RFC 8693), verifies it, and refuses it if the gateway itself would accept it, so the upstream cannot replay it against the gateway. Users in about 180 or more IdP groups no longer get a 500 from registry API calls, because groups now cross nginx once inside the signed token and the auth subrequest has room for them. The Helm stack chart now owns `keycloak-client-secret`, so ArgoCD can sync it; existing installs adopt the Secret once before upgrading. Registrant metadata is capped at 10 KB and 8 levels, and the mcpgw discovery tools return it only when a caller names the keys it wants. See the [1.35.0 release notes](docs/release-notes/1.35.0.md), which list four breaking changes and the Helm adoption commands.
+- **Embeddings Without LiteLLM, Extra Request Headers, and Long Entries That Get Indexed** - Remote embeddings no longer go through LiteLLM: the registry calls OpenAI and any OpenAI-compatible endpoint, Azure OpenAI, and Amazon Titan and Cohere on Amazon Bedrock with about 500 lines of its own code, sends the same requests so stored vectors stay valid, and rejects a model name it cannot serve at startup instead of on the first call. Operators can add up to five headers to every embeddings request for an endpoint behind an API gateway, and set the request timeout and retry count. An entry whose text is longer than the model accepts, typically a server with many tools, used to stay out of semantic search; the registry now retries a failed embedding once with the longest tool descriptions shortened and every name kept. Entra deployments now recover group memberships from Microsoft Graph when a token omits them. Every image we build also drops the two root CAs distrusted on 2026-10-20. See [embeddings](docs/embeddings.md) and the [1.34.0 release notes](docs/release-notes/1.34.0.md), which list the three model-name forms that now stop startup.
+- **Virtual-Server Credential Brokering and Root-Endpoint Routing** - A virtual MCP server can now front a backing server that needs a per-user credential: the backend hop goes through the same vend-and-inject step a direct call uses, keyed on the resolved backing path, so two backing servers with different credential modes can sit behind one virtual server and each gets its own vend. The caller must hold a grant on both the virtual server and the backing server, checked against the exact rewritten request, and the caller's own gateway token is never forwarded to a registrant-controlled backend. The same change lets a virtual server front a stateless Streamable HTTP backend. Separately, a server registered with `append_mcp_path: false` is now reachable at the bare path it advertises, instead of only the trailing-slash form MCP clients refuse to follow a redirect to. [1.33.0 release notes](docs/release-notes/1.33.0.md)
 **Older highlights → [Feature & Release Highlights](docs/overview/feature-release-highlights.md)** · full per-version detail in the [release notes](docs/release-notes/) and on the [GitHub Releases page](https://github.com/agentic-community/mcp-gateway-registry/releases).
 
 ## Roadmap
 
-The roadmap is best tracked on the [GitHub Milestones](https://github.com/agentic-community/mcp-gateway-registry/milestones) page. Per-user egress auth (3LO and OBO) and A2A traffic routing shipped in [1.27.0](docs/release-notes/1.27.0.md); at a high level, the big features we're working on next are:
+The roadmap is best tracked on the [GitHub Milestones](https://github.com/agentic-community/mcp-gateway-registry/milestones) page. Per-user egress auth (3LO and OBO) and A2A traffic routing shipped in [1.27.0](docs/release-notes/1.27.0.md), the gateway for any HTTP resource in [1.30.0](docs/release-notes/1.30.0.md), and backend OAuth identity plus per-tool blocking in [1.31.0](docs/release-notes/1.31.0.md). At a high level, the big features we're working on next are:
 
-- **Reusable egress hardening and IdP-authenticated embeddings ([1.29.0](https://github.com/agentic-community/mcp-gateway-registry/milestones))**: a consolidated fail-closed SSRF/egress guard for all outbound fetches, OAuth2 client-credentials auth for embedding endpoints (plus a raw-array response adapter), Microsoft Entra v1 scope pass-through, and auth/infra follow-ups.
-- **CIMD and ID-JAG for coding assistants ([1.30.0](https://github.com/agentic-community/mcp-gateway-registry/milestones))**: Client ID Metadata Documents and RFC 8693 token exchange so coding assistants connect with the least friction across identity providers.
-- **Registry Copilot ([1.31.0](https://github.com/agentic-community/mcp-gateway-registry/milestones))**: an embedded chat + agent-builder experience for discovering assets and composing agents from inside the registry.
+- **Keycloak RFC 8693 token exchange for OBO ([1.32.0](https://github.com/agentic-community/mcp-gateway-registry/milestones))**: standards-based on-behalf-of exchange for Keycloak deployments, which today cannot use the OBO egress path or backend discovery because Keycloak binds the token audience with a server-side mapper rather than a request scope.
+- **Client ID Metadata Documents for coding assistants**: the registry [publishes its own CIMD](docs/release-notes/1.31.0.md) as of 1.31.0, currently shipping disabled. Next is the identity-provider side, so an assistant connects with the least friction across providers without a pre-registered client ID.
+- **Registry Copilot**: an embedded chat and agent-builder experience for discovering assets and composing agents from inside the registry. Tracked as [#744](https://github.com/agentic-community/mcp-gateway-registry/issues/744); not yet scheduled to a release.
 
 Have a feature request? Please [open a GitHub issue](https://github.com/agentic-community/mcp-gateway-registry/issues/new), we build in the open.
 
@@ -165,7 +141,7 @@ High-traffic pages by audience:
 - [Quick Start](docs/quickstart.md) · [Installation Guide](docs/installation.md) · [Configuration Reference](docs/configuration.md) · [FAQ / Troubleshooting](docs/faq/index.md)
 
 **Platform & security**
-- [Authentication Guide](docs/auth.md) · [Access Control & Scopes](docs/scopes.md) · [Gateway Proxy Guide](docs/gateway-proxy-operational-guide.md) · [AWS ECS Deployment](terraform/aws-ecs/README.md) · [Amazon EKS (Helm)](charts/README.md) · [Observability](docs/OBSERVABILITY.md) · [Federation](docs/federation.md)
+- [Authentication Guide](docs/auth.md) · [Access Control & Scopes](docs/scopes.md) · [Gateway Proxy Guide](docs/gateway-proxy-operational-guide.md) · [AWS ECS Deployment](terraform/aws-ecs/README.md) · [Amazon EKS (Helm)](charts/README.md) · [Observability](docs/OBSERVABILITY.md) · [Federation](docs/federation.md) · [Forward-Proxy Egress](docs/faq/configuring-a-forward-proxy-for-egress.md)
 
 **Architecture & development**
 - [Architecture Diagrams](docs/architecture-diagrams.md) · [API Reference](docs/registry_api.md) · [AI Coding Assistant Integration](docs/ai-coding-assistants-setup.md) · [MCP Registry CLI](docs/mcp-registry-cli.md)
@@ -182,7 +158,7 @@ The registry collects **anonymous, non-sensitive** usage telemetry (version, OS,
 - [GitHub Discussions](https://github.com/agentic-community/mcp-gateway-registry/discussions), feature requests and general discussion
 - [GitHub Issues](https://github.com/agentic-community/mcp-gateway-registry/issues), bug reports and feature requests
 - [Roadmap (GitHub Milestones)](https://github.com/agentic-community/mcp-gateway-registry/milestones), upcoming releases and their issues
-- [Contributing Guide](CONTRIBUTING.md) · [Code of Conduct](CODE_OF_CONDUCT.md) · [Security Policy](SECURITY.md)
+- [Contributing Guide](CONTRIBUTING.md) · [Code of Conduct](CODE_OF_CONDUCT.md) · [Security Policy](SECURITY.md) · [Adopters](ADOPTERS.md)
 
 ### Star History
 

@@ -178,6 +178,25 @@ health_check_total = _meter.create_counter(
 
 
 # =============================================================================
+# Forward-proxy egress routing (issue #1832)
+#
+# Bounded labels only: profile (the small fixed set of _Profile names in
+# registry/utils/url_guard.py), route (proxied/direct), outcome (ok/denied/
+# proxy_error). Never the target host, which is unbounded.
+#
+# route="direct" dominating on a deployment that has EGRESS_FORWARD_PROXY_ENABLED
+# on is the signal that NO_PROXY is too broad, or that targets are resolving to
+# internal addresses and keeping their pin.
+# =============================================================================
+
+egress_forward_proxy_requests_total = _meter.create_counter(
+    name="mcpgw_egress_forward_proxy_requests_total",
+    description="Guarded egress requests by routing decision (forward proxy vs direct)",
+    unit="1",
+)
+
+
+# =============================================================================
 # Rate limiting (issue #295)
 #
 # Bounded labels only: axis (caller/target), entity_type (small allowlist),
@@ -615,6 +634,40 @@ _internal_token_replay_check_counter = _meter.create_counter(
     unit="1",
 )
 internal_token_replay_check_total = _CounterAdapter(_internal_token_replay_check_counter)
+
+
+# Audit-trail integrity degradations. Declared identically in
+# auth_server/observability/meters.py (same name, so one PromQL query covers both
+# processes) -- same precedent as mcpgw_registry_token_mint_total, which the auth
+# server declares under the registry prefix for the same reason.
+#
+# Every degradation here used to be log-only, and a log line cannot be alerted
+# on as a RATE. reason (closed set, emitted from code -- NEVER a tenant/app id,
+# principal name, username or request id, which would be unbounded):
+#   record_dropped             - a record that should exist does not. Emitted by
+#                                registry/audit/service.py when the durable write
+#                                fails (also CRITICAL logged), and by the auth
+#                                server when the token-mint emit raises after the
+#                                mint already happened.
+#   identity_hop_claim_missing - the /mcp-proxy hop token carried no signed
+#                                audit_identity, so the record falls back to the
+#                                opaque `sub` instead of a readable identity
+#                                (auth server only).
+#   claim_dropped              - a claim that WAS present was malformed or
+#                                oversized and got coerced away/truncated. An
+#                                absent claim does not increment, or every
+#                                non-Entra request would emit a constant stream
+#                                and the rate alert would be useless
+#                                (auth server only).
+audit_integrity_degraded_total = _meter.create_counter(
+    name="mcpgw_registry_audit_integrity_degraded_total",
+    description=(
+        "Audit-integrity degradations, labeled by reason (record_dropped | "
+        "identity_hop_claim_missing | claim_dropped). Rate-alertable counterpart "
+        "to the CRITICAL/WARNING log lines."
+    ),
+    unit="1",
+)
 
 
 # =============================================================================

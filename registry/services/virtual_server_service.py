@@ -12,6 +12,7 @@ from typing import (
     Optional,
 )
 
+from ..auth.tool_filter import filter_tools_for_user
 from ..exceptions import (
     VirtualServerNotFoundError,
     VirtualServerValidationError,
@@ -38,6 +39,9 @@ from ..services.rating_service import (
     update_rating_details,
     validate_rating,
 )
+from ..services.visibility import user_can_access_server_from_doc
+from ..utils.path_utils import make_version_id
+from ..utils.tool_schema import stored_input_schema
 
 # Configure logging
 logging.basicConfig(
@@ -88,6 +92,112 @@ def _get_effective_tool_name(
 ) -> str:
     """Get the effective tool name (alias if set, otherwise original)."""
     return mapping.alias if mapping.alias else mapping.tool_name
+
+
+def _caller_has_required_scopes(
+    user_context: dict,
+    required_scopes: list[str],
+) -> bool:
+    """Return True when the caller may see a tool guarded by ``required_scopes``.
+
+    Mirrors the Lua data plane's ``_has_scopes`` drop (``virtual_router.lua``):
+    a tool with no required scopes is always visible; otherwise the caller must
+    hold every required scope. Admins bypass, matching the admin pass-through in
+    the sibling read filters (``filter_tools_for_user`` /
+    ``user_can_access_server_from_doc``). Fails closed: a caller with no scopes
+    cannot see a scope-guarded tool.
+
+    Args:
+        user_context: Authenticated caller's context (``is_admin``, ``scopes``).
+        required_scopes: Scopes the tool requires (empty = unguarded).
+
+    Returns:
+        True if the caller may see the tool.
+    """
+    if not required_scopes:
+        return True
+    if user_context.get("is_admin"):
+        return True
+    user_scopes = set(user_context.get("scopes") or [])
+    return all(scope in user_scopes for scope in required_scopes)
+
+
+def _linked_inactive_version_mismatch(
+    active: dict,
+    inactive: dict,
+    server_path: str,
+    version: str,
+) -> str | None:
+    """Name the first linkage property the inactive version fails, or None.
+
+    All nine properties must hold for an inactive version document to belong to
+    this active registration. Returning the failed one rather than a bare
+    boolean is what makes a rejection diagnosable: the user-visible symptom is a
+    virtual tool that silently disappears from the catalogue, and without this
+    an operator cannot tell a stale ``other_version_ids`` entry from a version
+    document that was never linked.
+
+    Args:
+        active: The active server document.
+        inactive: The candidate inactive version document.
+        server_path: The active server's registered path.
+        version: The version label being pinned.
+
+    Returns:
+        A short description of the first failed property, or None when the
+        version is correctly linked.
+    """
+    version_id = make_version_id(server_path, version)
+    checks: list[tuple[bool, str]] = [
+        (active.get("path") == server_path, "active path differs from the requested server path"),
+        (inactive.get("path") == version_id, f"version path is not {version_id!r}"),
+        (inactive.get("version") == version, f"version label is not {version!r}"),
+        (
+            inactive.get("active_version_id") == server_path,
+            "version does not point back at this active server",
+        ),
+        (inactive.get("is_active") is False, "version is not marked inactive"),
+        (bool(active.get("version_group")), "active server has no version group"),
+        (
+            inactive.get("version_group") == active.get("version_group"),
+            "version group differs from the active server's",
+        ),
+        (
+            isinstance(active.get("other_version_ids"), list),
+            "active server's other_version_ids is not a list",
+        ),
+        (
+            version_id in (active.get("other_version_ids") or []),
+            f"{version_id!r} is not listed in the active server's other_version_ids",
+        ),
+    ]
+    for ok, reason in checks:
+        if not ok:
+            return reason
+    return None
+
+
+def _is_linked_inactive_version(
+    active: dict,
+    inactive: dict,
+    server_path: str,
+    version: str,
+) -> bool:
+    """Whether an inactive version belongs to this active registration.
+
+    Logs the failed linkage property at debug level, so a silently dropped
+    virtual tool is traceable without changing any caller.
+    """
+    reason = _linked_inactive_version_mismatch(active, inactive, server_path, version)
+    if reason is None:
+        return True
+    logger.debug(
+        "Version %r of %s is not a linked inactive version: %s",
+        version,
+        server_path,
+        reason,
+    )
+    return False
 
 
 class VirtualServerService:
@@ -310,23 +420,28 @@ class VirtualServerService:
     async def resolve_tools(
         self,
         path: str,
+        user_context: dict | None = None,
     ) -> list[ResolvedTool]:
-        """Resolve all tools for a virtual server.
+        """Resolve all tools for a virtual server, filtered to the caller.
 
-        Fetches tool metadata from backend servers and applies
-        aliases, version pins, and scope overrides.
+        Fetches tool metadata from backend servers and applies aliases, version
+        pins, and scope overrides, then prunes the result to what ``user_context``
+        may see (see :meth:`_resolve_tool_list`).
 
         Args:
-            path: Virtual server path
+            path: Virtual server path.
+            user_context: Authenticated caller's context. When ``None`` the
+                caller is treated as unauthenticated and NO tools are returned
+                (fail closed).
 
         Returns:
-            List of resolved tools with full metadata
+            List of resolved tools the caller is authorized to see.
         """
         config = await self._repo.get(path)
         if not config:
             raise VirtualServerNotFoundError(path)
 
-        return await self._resolve_tool_list(config)
+        return await self._resolve_tool_list(config, user_context)
 
     async def rate_virtual_server(
         self,
@@ -413,35 +528,42 @@ class VirtualServerService:
         errors = []
 
         for mapping in tool_mappings:
-            # Check backend server exists
             server_path = mapping.backend_server_path
             server_info = await self._server_repo.get(server_path)
-
-            if not server_info:
+            if not isinstance(server_info, dict) or not server_info:
                 errors.append(f"Backend server '{server_path}' does not exist")
                 continue
 
-            # Check tool exists in backend
-            tool_list = server_info.get("tool_list", [])
-            tool_names = [t.get("name", "") for t in tool_list]
+            selected = server_info
+            if mapping.backend_version and mapping.backend_version != server_info.get("version"):
+                version_id = make_version_id(server_path, mapping.backend_version)
+                selected = await self._server_repo.get(version_id)
+                if not isinstance(selected, dict) or not _is_linked_inactive_version(
+                    server_info, selected, server_path, mapping.backend_version
+                ):
+                    errors.append(
+                        f"Version '{mapping.backend_version}' not found "
+                        f"for backend server '{server_path}'"
+                    )
+                    continue
+                # Newly added inactive versions lack discovered tools. A present
+                # version list is authoritative, including an empty one.
+                if "tool_list" not in selected:
+                    selected = server_info
 
+            tool_list = selected.get("tool_list")
+            if not isinstance(tool_list, list) or any(
+                not isinstance(tool, dict) for tool in tool_list
+            ):
+                errors.append(f"Invalid tool list for backend server '{server_path}'")
+                continue
+            tool_names = [tool["name"] for tool in tool_list if isinstance(tool.get("name"), str)]
             if mapping.tool_name not in tool_names:
                 errors.append(
                     f"Tool '{mapping.tool_name}' not found in backend "
                     f"server '{server_path}'. Available tools: "
                     f"{', '.join(tool_names[:10])}"
                 )
-
-            # Check version exists if pinned
-            if mapping.backend_version:
-                version_id = f"{server_path}:{mapping.backend_version}"
-                version_info = await self._server_repo.get(version_id)
-                if not version_info:
-                    errors.append(
-                        f"Version '{mapping.backend_version}' not found "
-                        f"for backend server '{server_path}'"
-                    )
-
         if errors:
             raise VirtualServerValidationError(
                 "Tool mapping validation failed:\n" + "\n".join(f"- {e}" for e in errors)
@@ -482,39 +604,146 @@ class VirtualServerService:
     async def _resolve_tool_list(
         self,
         config: VirtualServerConfig,
+        user_context: dict | None = None,
     ) -> list[ResolvedTool]:
-        """Resolve tool mappings to full tool metadata.
+        """Resolve tool mappings to full tool metadata, filtered to the caller.
+
+        Applies the same two authorization layers as every sibling read surface
+        (``/api/tool-catalog`` and semantic search), plus the per-tool scope drop
+        the Lua data plane enforces at request time:
+
+        1. Server access — a mapping's backend is only consulted when the caller
+           can access it (:func:`user_can_access_server_from_doc`).
+        2. Tool access — surviving backend tools pass through the shared
+           allowlist filter (:func:`filter_tools_for_user`); a mapped tool the
+           caller is not allowed to see is dropped.
+        3. Per-tool required scopes — a resolved tool guarded by scope overrides
+           is dropped unless the caller holds every required scope
+           (:func:`_caller_has_required_scopes`), matching ``virtual_router.lua``.
+
+        All three layers fail closed, so the resolved list cannot disclose tool
+        names, descriptions, input schemas, backend paths, or required scopes for
+        backends / tools the caller has no scope to reach.
 
         Args:
-            config: Virtual server configuration
+            config: Virtual server configuration.
+            user_context: Authenticated caller's context. When ``None`` the
+                caller is treated as unauthenticated and NO tools are returned
+                (fail closed).
 
         Returns:
-            List of ResolvedTool with full metadata from backends
+            List of ResolvedTool the caller is authorized to see.
         """
-        resolved = []
+        resolved: list[ResolvedTool] = []
+
+        # Fail closed: without a caller context the access dimension is unknown,
+        # so we must not disclose any backend's tool metadata. Every real request
+        # arrives through nginx_proxied_auth, which always supplies a context.
+        if user_context is None:
+            logger.warning(
+                "Virtual server tool resolution requested without a user context; "
+                "returning empty tool list (fail closed)"
+            )
+            return resolved
 
         # Build scope override lookup
         scope_overrides: dict[str, list[str]] = {}
         for override in config.tool_scope_overrides:
             scope_overrides[override.tool_alias] = override.required_scopes
 
+        # Cache the per-backend visible-tool-name set so filter_tools_for_user
+        # runs once per fetched backend doc rather than once per mapping.
+        allowed_names_cache: dict[str, set[str]] = {}
+        blocked_by_backend: dict[str, set[str]] = {}
+
         for mapping in config.tool_mappings:
             effective_name = _get_effective_tool_name(mapping)
 
-            # Get tool metadata from backend
-            server_path = mapping.backend_server_path
+            # Resolve metadata from the selected version, but authorize and
+            # check blocks under the active server's canonical path.
+            requested_path = mapping.backend_server_path
+            requested = await self._server_repo.get(requested_path)
+            if not isinstance(requested, dict) or not requested:
+                continue
+            server_path = requested.get("active_version_id") or requested_path
+            active = (
+                await self._server_repo.get(server_path)
+                if server_path != requested_path
+                else requested
+            )
+            if not isinstance(active, dict) or not active:
+                continue
+            if server_path != requested_path:
+                version = requested.get("version")
+                if (
+                    not isinstance(version, str)
+                    or not _is_linked_inactive_version(active, requested, server_path, version)
+                    or mapping.backend_version
+                    and mapping.backend_version != version
+                ):
+                    continue
 
-            # If version is pinned, look up version-specific server doc
-            if mapping.backend_version:
-                version_id = f"{server_path}:{mapping.backend_version}"
-                server_info = await self._server_repo.get(version_id)
-            else:
-                server_info = await self._server_repo.get(server_path)
+            server_info = requested
+            doc_key = requested_path
+            if mapping.backend_version and server_path == requested_path:
+                if mapping.backend_version != active.get("version"):
+                    doc_key = make_version_id(server_path, mapping.backend_version)
+                    selected = await self._server_repo.get(doc_key)
+                    if not isinstance(selected, dict) or not _is_linked_inactive_version(
+                        active, selected, server_path, mapping.backend_version
+                    ):
+                        continue
+                    server_info = selected
+            if "tool_list" not in server_info and server_info is not active:
+                # Only linked inactive versions may borrow the active metadata.
+                server_info = active
 
-            if not server_info:
-                logger.warning(
-                    f"Backend server '{server_path}' not found, skipping tool '{mapping.tool_name}'"
+            server_name = server_info.get("server_name", server_path)
+
+            # Layer 1: backend server access. Skip the whole backend when the
+            # caller lacks scope for it, so its tool metadata (names, schemas,
+            # backend path) never leaks. Fails closed; admin / wildcard pass.
+            if not user_can_access_server_from_doc(server_path, server_name, user_context):
+                logger.debug(
+                    "Skipping backend %s for virtual tool '%s': caller lacks server access",
+                    server_path,
+                    mapping.tool_name,
                 )
+                continue
+
+            # Layer 2: per-tool allowlist, computed once per backend doc. A
+            # caller with server access but a restricted tool set only sees the
+            # tools in that set. filter_tools_for_user fails closed (empty
+            # allowlist -> no tools) and passes through admin / wildcard.
+            if doc_key not in allowed_names_cache:
+                filtered = filter_tools_for_user(
+                    server_name,
+                    server_info.get("tool_list", []),
+                    user_context,
+                    endpoint="virtual_server_tools",
+                    server_path=server_path,
+                )
+                allowed_names: set[str] = set()
+                for tool in filtered:
+                    name = tool.get("name") if isinstance(tool, dict) else None
+                    if isinstance(name, str) and name:
+                        allowed_names.add(name)
+                allowed_names_cache[doc_key] = allowed_names
+            if mapping.tool_name not in allowed_names_cache[doc_key]:
+                logger.debug(
+                    "Dropping virtual tool '%s' from backend %s: not in caller's tool allowlist",
+                    mapping.tool_name,
+                    server_path,
+                )
+                continue
+
+            # The alias is only a display name; overrides belong to the
+            # original tool on its own backend. Fail closed on read errors.
+            if server_path not in blocked_by_backend:
+                blocked_by_backend[server_path] = await self._server_repo.get_blocked_tools(
+                    server_path
+                )
+            if mapping.tool_name in blocked_by_backend[server_path]:
                 continue
 
             # Find tool in backend's tool list
@@ -531,10 +760,22 @@ class VirtualServerService:
                 )
                 continue
 
+            tool_scopes = scope_overrides.get(effective_name, [])
+
+            # Layer 3: per-tool required scopes, matching the Lua data plane's
+            # request-time drop. A scope-guarded tool the caller cannot reach at
+            # runtime is not disclosed at discovery time either. Fails closed.
+            if not _caller_has_required_scopes(user_context, tool_scopes):
+                logger.debug(
+                    "Dropping virtual tool '%s': caller lacks required scopes %s",
+                    effective_name,
+                    tool_scopes,
+                )
+                continue
+
             # Build resolved tool
             description = mapping.description_override or tool_meta.get("description", "")
-            input_schema = tool_meta.get("inputSchema", {})
-            tool_scopes = scope_overrides.get(effective_name, [])
+            input_schema = stored_input_schema(tool_meta)
 
             resolved.append(
                 ResolvedTool(

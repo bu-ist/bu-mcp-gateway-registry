@@ -21,7 +21,7 @@ Sent once at startup:
 | `compute` | `ecs` | Compute platform (ecs, eks, kubernetes, docker, ec2, unknown) |
 | `mode` | `with-gateway` | Deployment mode |
 | `registry_mode` | `full` | Registry operating mode |
-| `storage` | `documentdb` | Storage backend (file, documentdb, mongodb-ce) |
+| `storage` | `mongodb-ce` | Storage backend (`documentdb`, `mongodb-ce`, `mongodb`, `mongodb-atlas`) |
 | `auth` | `keycloak` | Auth provider |
 | `federation` | `true` | Whether federation is enabled |
 | `search_queries_total` | `150` | Lifetime semantic search query count |
@@ -47,6 +47,30 @@ Sent at a configurable interval (default: every 24 hours). Includes all Tier 1 f
 | `embeddings_provider` | `sentence-transformers` | Embeddings code path: `sentence-transformers` or `litellm` |
 | `embeddings_backend_kind` | `bedrock` | Derived coarse backend category: `sentence-transformers`, `bedrock`, `openai`, `azure-openai`, `voyage`, `cohere`, `other`, or `unknown` (added in schema v2) |
 | `uptime_hours` | `48` | Hours since server started |
+| `auth_path_share_24h` | `{"session_cookie":62,"keycloak":31,"unknown":7}` | Which auth paths verified `/validate` traffic in the last 24 hours, as integer percentages summing to 100. `null` when nothing was counted (added in schema v6) |
+| `auth_path_volume_bucket_24h` | `100-999` | Order of magnitude of the request count behind those shares: `1-9`, `10-99`, `100-999`, `1k-9k`, `10k+`. `null` when nothing was counted (added in schema v6) |
+| `auth_path_window_hours` | `21` | Hours the 24-hour window actually covered when the heartbeat read it, clamped to 48. `null` when nothing was counted (added in schema v6) |
+
+#### Auth-path mix: shares, not counts
+
+The payload carries the mix as percentages because raw per-path counts bound to a stable
+`registry_id` would be a traffic meter, and this payload has never reported request volume. The
+shares answer which auth paths a deployment uses and say nothing about how busy it is.
+
+A share with no denominator is noise: three requests read as "100 % session_cookie" and mean
+nothing. `auth_path_volume_bucket_24h` gives a reader just enough to throw that sample away —
+one of five coarse buckets, so `100-999` separates a real day from a rounding error without
+revealing the volume. `auth_path_window_hours` is there because whichever writer touches the
+counter document first resets the 24-hour window, so the heartbeat's phase against that reset is
+arbitrary and the real window can be shorter or longer than a day. It is clamped to 48 hours, so
+a stalled reset cannot turn it into an uptime signal.
+
+When no traffic was counted, all three fields are sent as `null` — never a zero, never an empty
+mix. An unmeasured deployment must not read as a measured one.
+
+The registry builds these three fields from a counter document the auth-server writes to shared
+storage. Only the shares leave the process — no per-path counts, no usernames, no client IDs, no
+target names.
 
 ## Request Signing (HMAC)
 
@@ -67,7 +91,7 @@ X-Telemetry-Signature: 8a3f2b...c9d1e0
 {"arch":"x86_64","auth":"keycloak","cloud":"aws","compute":"ecs","embeddings_backend_kind":"bedrock","embeddings_provider":"litellm","event":"startup","federation":true,"mode":"with-gateway","os":"linux","py":"3.12","registry_id":"c546a650-8af9-4721-9efb-7df221b2a0d9","registry_mode":"full","schema_version":"2","search_queries_1h":3,"search_queries_24h":12,"search_queries_total":150,"storage":"documentdb","ts":"2026-03-18T00:00:00+00:00","v":"1.0.22"}
 ```
 
-A heartbeat event request (schema v2):
+A heartbeat event request (schema v6):
 
 ```http
 POST /v1/collect HTTP/1.1
@@ -75,14 +99,18 @@ Host: m3ijrhd020.execute-api.us-east-1.amazonaws.com
 Content-Type: application/json
 X-Telemetry-Signature: 5b7e1a...d4f2c3
 
-{"agents_count":8,"arch":"x86_64","auth":"keycloak","cloud":"aws","compute":"ecs","embeddings_backend_kind":"sentence-transformers","embeddings_provider":"sentence-transformers","event":"heartbeat","federation":true,"mode":"with-gateway","os":"linux","peers_count":2,"py":"3.12","registry_id":"c546a650-8af9-4721-9efb-7df221b2a0d9","registry_mode":"full","schema_version":"4","search_backend":"documentdb","search_queries_1h":3,"search_queries_24h":12,"search_queries_total":150,"servers_count":15,"skills_count":23,"storage":"documentdb","ts":"2026-03-18T12:00:00+00:00","uptime_hours":48,"v":"1.0.22"}
+{"agents_count":8,"arch":"x86_64","auth":"keycloak","auth_path_share_24h":{"keycloak":31,"session_cookie":62,"unknown":7},"auth_path_volume_bucket_24h":"100-999","auth_path_window_hours":21,"cloud":"aws","cloud_detection_method":"ecs_meta","compute":"ecs","embeddings_backend_kind":"sentence-transformers","embeddings_provider":"sentence-transformers","event":"heartbeat","federation":true,"internal_deployment_type":"none","internal_only_deployment":false,"mode":"with-gateway","os":"linux","peers_count":2,"py":"3.12","registry_id":"c546a650-8af9-4721-9efb-7df221b2a0d9","registry_mode":"full","schema_version":"6","search_backend":"documentdb","search_queries_1h":3,"search_queries_24h":12,"search_queries_total":150,"servers_count":15,"skills_count":23,"storage":"documentdb","ts":"2026-03-18T12:00:00+00:00","uptime_hours":48,"v":"1.0.22"}
 ```
 
 Schema versions:
 - `"1"` (pre-v1.0.22): no `embeddings_backend_kind`
 - `"2"` (v1.0.22+): adds `embeddings_backend_kind`
 - `"3"` (v1.23.0+): adds `cloud_detection_method`
-- `"4"` (this version): adds `auth`, `arch`, `os`, `py`, `mode`, `registry_mode`, `storage`, `federation` to **heartbeat** events. Startup payload shape is unchanged from v3 -- the bump just signals to downstream tooling that heartbeats now carry the same deployment-shape fields. The collector accepts all four versions.
+- `"4"`: adds `auth`, `arch`, `os`, `py`, `mode`, `registry_mode`, `storage`, `federation` to **heartbeat** events. Startup payload shape is unchanged from v3 -- the bump just signals to downstream tooling that heartbeats now carry the same deployment-shape fields.
+- `"5"`: adds `internal_only_deployment` and `internal_deployment_type` to **both** payloads (issue #1216)
+- `"6"` (this version): adds `auth_path_share_24h`, `auth_path_volume_bucket_24h`, and `auth_path_window_hours` to **heartbeat** events. Startup payload shape is unchanged from v5 -- these are 24-hour observations and a fresh process has none.
+
+The collector accepts every version side by side.
 
 Notes:
 - JSON body keys are sorted alphabetically (`sort_keys=True`) and compact (`separators=(",",":")`) for deterministic HMAC computation
@@ -135,21 +163,38 @@ Telemetry events include a `schema_version` field. We bump it whenever fields ar
 | `"1"` | Initial release | Original startup + heartbeat schema |
 | `"2"` | v1.0.22 | Added `embeddings_provider` to startup; added `embeddings_backend_kind` to both startup and heartbeat |
 | `"3"` | v1.23.0 | Added `cloud_detection_method` to both startup and heartbeat (issue #986) |
+| `"4"` | v1.24.1 | Added the deployment-shape fields -- `auth`, `arch`, `os`, `py`, `mode`, `registry_mode`, `storage`, `federation` -- to **heartbeat** events, so a long-lived instance whose startup ping predates the reporting window still reports its shape (issue #1060) |
+| `"5"` | v1.24.5 | Added `internal_only_deployment` and `internal_deployment_type` (`none`/`dev`/`workshop`/`other`) to both startup and heartbeat, so internal and workshop deployments can be told apart from real adoption (issue #1216) |
+| `"6"` | This version | Added `auth_path_share_24h`, `auth_path_volume_bucket_24h`, and `auth_path_window_hours` to **heartbeat** events (issue #1753) |
 
-Older registry versions continue to send schema v1/v2 events; the collector accepts all versions side-by-side.
+Older registry versions keep sending older schema versions; the collector accepts all of them side by side.
 
 ## Cloud Provider Detection
 
-Cloud detection cascades through env vars, DMI files, ECS task metadata, Kubernetes node-name heuristics, and (last resort) cloud IMDS endpoints. The first tier that produces a signal wins; the rest are skipped.
+Cloud detection cascades through env vars, DMI files, ECS task metadata, Kubernetes node-name heuristics, cloud IMDS endpoints, and finally a developer-machine check. The first tier that produces a signal wins; the rest are skipped.
+
+Two operator settings run before the cascade and replace it:
+
+1. `MCP_CLOUD_PROVIDER` (Helm: `app.mcpCloudProvider`), reported with method `explicit`.
+2. The answer to the admin-UI banner, reported with method `operator_declared`, or `operator_declined` with `cloud=unknown` when the operator chose Dismiss.
 
 | Method (`cloud_detection_method`) | Signal |
 |-----------------------------------|--------|
 | `env` | One of `AWS_REGION`, `AWS_DEFAULT_REGION`, `GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT`, `WEBSITE_INSTANCE_ID`, `AZURE_CLIENT_ID` is set |
 | `dmi` | `/sys/devices/virtual/dmi/id/{board_asset_tag,product_name,sys_vendor}` readable and matches known vendor strings |
 | `ecs_meta` | `ECS_CONTAINER_METADATA_URI_V4` or `ECS_CONTAINER_METADATA_URI` is set (AWS only) |
-| `k8s_heuristic` | `KUBERNETES_SERVICE_HOST` set and `NODE_NAME` matches a cloud-specific pattern (`*.compute.internal` for AWS, `gke-*` for GCP, `aks-*` for Azure) |
+| `k8s_heuristic` | `KUBERNETES_SERVICE_HOST` set and `NODE_NAME` matches a cloud-specific pattern: `*.compute.internal`, `*.ec2.internal`, or an EC2 instance ID such as `i-0123456789abcdef0` (EKS Auto Mode, Karpenter) for AWS; `gke-*` for GCP; `aks-*` for Azure |
 | `imds` | Live HTTP probe to `http://169.254.169.254/` (AWS IMDSv2, Azure) or `http://metadata.google.internal/` (GCP). 300ms timeout per provider, tried sequentially AWS -> GCP -> Azure. Worst case: ~900ms once per process at startup. |
-| `unknown` | No signal fired. |
+| `host_os` | The registry runs directly on a macOS or Windows host. Reported as `cloud=local`. |
+| `wsl` | `/proc/sys/kernel/osrelease` contains `microsoft` (WSL2). Reported as `cloud=local`. |
+| `docker_desktop` | The kernel release ends in `-linuxkit` (Docker Desktop). Reported as `cloud=local`. |
+| `unknown` | No signal fired. The registry logs a WARNING once per process naming `MCP_CLOUD_PROVIDER`, and shows admins a banner asking where it runs. |
+
+### When detection ends at `unknown`
+
+The admin UI shows a banner asking where the registry runs: AWS, Azure, GCP, on-premises, or other. The registry saves the answer on its registry card and reports it from then on, so the banner does not come back. To set the cloud at deploy time instead, set `MCP_CLOUD_PROVIDER` to one of `aws`, `azure`, `gcp`, `on_premises` or `other` (Helm: `app.mcpCloudProvider`).
+
+A self-hosted collector must run the collector code from the same release or later. An older collector rejects `cloud=local`, and rejects `aws`, `azure` or `gcp` with method `operator_declared`, and it drops a rejected event without an error.
 
 ### Zero-cost opt-in (no outbound network)
 

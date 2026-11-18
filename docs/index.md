@@ -1,5 +1,9 @@
 <div align="center">
-<img src="img/mcp_gateway_horizontal_white_logo.png" alt="MCP Gateway Logo" width="100%">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="logo/png/lockup-horizontal-on-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="logo/png/lockup-horizontal-on-light.png">
+  <img src="logo/png/lockup-horizontal-neutral.png" alt="AI Gateway & Registry" width="480">
+</picture>
 
 **Gateway for AI Development Tools**
 
@@ -252,6 +256,7 @@ Accelerate development workflows with integrated tooling:
 | [Configuration Reference](configuration.md)<br/>Environment variables and settings | [Amazon Cognito Setup](cognito.md)<br/>Step-by-step IdP configuration | [Dynamic Tool Discovery](dynamic-tool-discovery.md)<br/>Autonomous agent capabilities |
 | [Gateway Proxy Guide](gateway-proxy-operational-guide.md)<br/>Front any HTTP backend with an authenticated gateway route | [Fine-Grained Access Control](scopes.md)<br/>Permission management and security | [Deployment Guide](installation.md)<br/>Complete setup for deployment environments |
 | [Metadata Field Projection](metadata-field-projection.md)<br/>Reduce payload size on list and search APIs | [Security Scanner](security-scanner.md)<br/>MCP server supply chain security | [Troubleshooting Guide](faq/index.md)<br/>Common issues and solutions |
+| [Forward-Proxy Egress](forward-proxy-egress.md)<br/>Reach external MCP servers from a network with no direct egress | [Security Guidelines](SECURITY_GUIDELINES.md)<br/>Invariants every change must hold | [Unified Parameter Reference](unified-parameter-reference.md)<br/>Every setting across Docker, Terraform and Helm |
 
 ---
 

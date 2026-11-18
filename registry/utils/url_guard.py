@@ -20,8 +20,11 @@ implementations (``skill_service._is_safe_url`` and
   category-checked, so a private/metadata target cannot be smuggled through a
   non-canonical spelling.
 - Explicit host/CIDR allowlists can admit private, loopback, and CGNAT targets,
-  but cloud/workload credential endpoints, link-local, unspecified, reserved, and
-  multicast destinations remain hard-denied.
+  but cloud/workload credential endpoints, link-local, unspecified, and
+  multicast destinations remain hard-denied. Reserved IPv4 destinations (for example
+  Istio's ``240.240.0.0/16`` ServiceEntry range) are admitted only by an
+  operator ``SSRF_ALLOWED_CIDRS`` entry that contains them, never by hostname
+  trust or ``allow_private``.
 - Hostname trust (``ssrf_allowed_hosts`` / ``github_extra_hosts``) is a
   post-resolution relaxation, not a DNS bypass. Trusted names are still resolved,
   every answer is classified, and the request is pinned to a validated answer.
@@ -60,6 +63,11 @@ Validation profiles separate the registry's distinct outbound trust surfaces:
   inherit the proxy profile's internal-target bypass: it reads only its own
   setting, and an ``ssrf_allowed_hosts``/``github_extra_hosts`` entry cannot
   re-permit a token endpoint.
+- **Entra Graph memberships** (``ENTRA_GRAPH_PROFILE``): HTTPS-only and
+  public-only by default. An explicit ``ENTRA_GRAPH_BASE_URL`` can trust its
+  exact private reverse-proxy hostname; every answer is still classified and
+  pinned, and metadata/link-local/reserved endpoints remain forbidden. No
+  registry target or OAuth token-endpoint allowlist can relax this policy.
 
 Request lifecycle (validate -> resolve -> pin -> re-validate per redirect)::
 
@@ -90,22 +98,75 @@ Request lifecycle (validate -> resolve -> pin -> re-validate per redirect)::
 
     Fail closed everywhere: any resolution failure, un-encodable host, identity
     mismatch, or ambiguity raises UrlValidationError instead of falling through.
+
+Forward-proxy egress (``EGRESS_FORWARD_PROXY_ENABLED``, OFF by default)
+----------------------------------------------------------------------
+
+httpx wires environment-proxy support only into its own default transport
+(``allow_env_proxies = trust_env and transport is None``), so a custom transport
+such as :class:`GuardedAsyncTransport` never sees ``HTTP_PROXY`` / ``HTTPS_PROXY``.
+Where the registry has no direct internet egress, every guarded fetch therefore
+times out. Setting ``proxy=`` on the enclosing client is NOT the fix: httpx would
+mount a plain transport under ``all://`` that shadows the guarded one, silently
+removing every check in this module. The routing decision lives inside the
+transport instead, so the proxied path cannot skip the guard.
+
+When the flag is on, a target is proxied only if ALL of these hold; otherwise it
+takes the direct, pinned path above, byte for byte:
+
+1. a proxy is configured for the request's scheme, and
+2. ``NO_PROXY`` does not name the host, and
+3. every address the host resolves to is on the public internet.
+
+The relaxation this buys is narrow and is the one thing to know: **for a proxied
+target, IP-rebind pinning is dropped.** It cannot be kept. A ``CONNECT`` tunnel
+builds its TLS handshake with ``server_hostname`` taken from the request URL
+(``httpcore/_async/http_proxy.py``) and never reads the ``sni_hostname``
+extension that pinning sets, so a pinned request through a tunnel would verify
+the certificate against an IP and fail. The compensating controls:
+
+- Resolution and classification still run, in full, BEFORE any ``CONNECT``: the
+  cloud/workload-credential, metadata, link-local, unspecified, reserved and
+  multicast hard-denies, and the profile's allowlist. One blocked answer denies
+  the request.
+- Routing is derived from that classification rather than from an operator list,
+  so every internal target keeps its pin automatically, whether or not anyone
+  remembered to list it in ``NO_PROXY``. A mixed public/internal answer set
+  counts as internal and keeps the pin.
+- Per-redirect re-validation is unchanged: httpx re-invokes the transport per
+  hop, so the routing decision is remade per hop.
+- Credential-bearing profiles accept only ``https`` through a proxy, so a secret
+  rides inside the tunnel and the proxy sees only ``host:port``.
+
+What remains is that the proxy re-resolves the name when it dials, so a name
+that passes classification here and then rebinds is not caught by this module.
+Such a dial is made from the PROXY's network position, not the registry's, so
+the operator guidance is for the proxy itself to deny ``CONNECT`` to RFC-1918,
+loopback and link-local destinations. See ``docs/forward-proxy-egress.md``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import http.cookiejar
 import ipaddress
 import logging
+import os
 import socket
+import ssl
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+import certifi
 import httpx
 
+from ..common.log_redaction import redact_url
 from ..exceptions import UrlValidationError
+from .branding_files import BRANDING_PATH_SEGMENT
 
 if TYPE_CHECKING:
     from ..core.config import Settings
@@ -171,6 +232,30 @@ _TEREDO_PREFIX = ipaddress.ip_network("2001::/32")  # RFC 4380: client v4 in low
 # range, but it is internally routable (carrier NAT / on-cluster overlays), so we
 # treat it like private-unicast: denied by default, relaxable with allow_private.
 _CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+# IPv4 limited broadcast. Reserved, and never a legitimate egress target, so an
+# operator CIDR (even 0.0.0.0/0) must not relax it.
+_IPV4_BROADCAST = ipaddress.IPv4Address("255.255.255.255")
+
+
+def _operator_may_admit_reserved(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    reserved_cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+) -> bool:
+    """Return True if an operator CIDR admits this reserved address (#2018).
+
+    Only IPv4 reserved space (``240.0.0.0/4``, minus limited broadcast) is
+    relaxable. Reserved IPv6 is never relaxed: several reserved IPv6 ranges
+    carry an IPv4 address that is not unwrapped and category-checked (IPv4-
+    compatible ``::a.b.c.d``, SIIT ``::ffff:0:a.b.c.d``, RFC 8215 local-use
+    NAT64 ``64:ff9b:1::/48``), so a broad ``::/0`` or ``::/8`` entry would
+    otherwise reach IMDS. Embedded IPv4 forms that ARE unwrapped (mapped,
+    NAT64, 6to4, Teredo) arrive here as IPv4 and are judged as IPv4.
+    """
+    if not isinstance(ip, ipaddress.IPv4Address) or ip == _IPV4_BROADCAST:
+        return False
+    return any(ip in net for net in reserved_cidrs)
+
 
 # Cloud metadata and workload-identity credential endpoints. NEVER reachable:
 # not relaxable by ``allow_private`` NOR by an explicit CIDR/hostname allowlist.
@@ -302,13 +387,22 @@ def _ip_denial_reason(
     ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
     allow_private: bool,
     allowed_cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (),
+    reserved_cidrs: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (),
 ) -> str | None:
     """Return a denial reason if ``ip`` is an unsafe egress target.
 
     Embedded IPv4 forms are unwrapped first. Cloud/workload credential
-    endpoints, link-local, unspecified, multicast, and reserved destinations
-    are hard-denied before any relaxation. ``allow_private`` and explicit CIDRs
+    endpoints, link-local, unspecified, and multicast destinations are
+    hard-denied before any relaxation. ``allow_private`` and ``allowed_cidrs``
     may relax only loopback, private-unicast, and CGNAT destinations.
+
+    Reserved destinations are denied unless they fall inside
+    ``reserved_cidrs``: the operator's own ``SSRF_ALLOWED_CIDRS`` ranges (for
+    example Istio's auto-allocated ServiceEntry range ``240.240.0.0/16``).
+    Callers must pass only operator-listed CIDRs here, never the exact ``/32``
+    synthesized for a trusted hostname, so neither hostname trust nor
+    ``allow_private`` can reopen a reserved address. Only IPv4 reserved space is
+    relaxable; see ``_operator_may_admit_reserved``.
     """
     ip = _unwrap_embedded_ipv4(ip)
 
@@ -327,7 +421,7 @@ def _ip_denial_reason(
     if ip.is_loopback:
         return None if allow_private or explicitly_allowed else "loopback"
     if ip.is_reserved:
-        return "reserved"
+        return None if _operator_may_admit_reserved(ip, reserved_cidrs) else "reserved"
     if ip.is_private or (isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NET):
         return None if allow_private or explicitly_allowed else "private"
     return None
@@ -420,10 +514,11 @@ _NGINX_METACHARACTERS: frozenset[str] = frozenset(
 class _Allowlist:
     """A resolved set of hosts/CIDRs that relax the IP block.
 
-    ``cidrs`` explicitly permit private, loopback, and CGNAT destinations.
-    ``hosts`` is a post-resolution trust signal with the same limited
-    relaxation. Hard-denied credential, link-local, unspecified, reserved, and
-    multicast categories remain closed in both cases.
+    ``cidrs`` explicitly permit private, loopback, CGNAT, and (only for the
+    ranges they contain) reserved IPv4 destinations. ``hosts`` is a post-resolution
+    trust signal limited to private, loopback, and CGNAT. Hard-denied
+    credential, link-local, unspecified, and multicast categories remain closed
+    in both cases.
     """
 
     hosts: frozenset[str] = field(default_factory=frozenset)
@@ -459,6 +554,490 @@ def _parse_cidrs(
         except ValueError:
             logger.warning("SSRF guard: ignoring malformed CIDR in allowlist: %r", chunk)
     return tuple(nets)
+
+
+# ---------------------------------------------------------------------------
+# Forward-proxy egress configuration.
+# ---------------------------------------------------------------------------
+# Read from os.environ directly, NOT through _get_settings(): cli/agentcore
+# imports this module with zero registry configuration (see the `settings = None`
+# comment above), so the guard must never force Settings to be built. Matching
+# Settings fields exist for documentation, validation, and the System Config
+# page; tests/unit/utils/test_url_guard_forward_proxy.py asserts the two readers
+# agree, because a config page showing `true` while the guard behaves as `false`
+# is worse than the feature being off.
+_FORWARD_PROXY_ENABLED_ENV: str = "EGRESS_FORWARD_PROXY_ENABLED"
+_FORWARD_PROXY_CA_BUNDLE_ENV: str = "EGRESS_FORWARD_PROXY_CA_BUNDLE"
+
+# Spellings accepted as true. Must stay a superset-compatible subset of what
+# Pydantic's bool coercion accepts for the matching Settings field, which is why
+# the single-letter and whitespace forms are here.
+_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "t", "yes", "y", "on"})
+
+
+@dataclass(frozen=True)
+class _ForwardProxyConfig:
+    """Resolved forward-proxy configuration, parsed once from the environment."""
+
+    enabled: bool = False
+    http_proxy: str | None = None
+    https_proxy: str | None = None
+    no_proxy: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _RoutedRequest:
+    """A validated request plus the proxy it must be sent through.
+
+    ``proxy_url is None`` means the direct, IP-pinned path.
+    """
+
+    request: httpx.Request
+    proxy_url: str | None
+
+
+def _env_first(
+    *names: str,
+) -> str | None:
+    """Return the first non-empty environment value among ``names``, or None.
+
+    Callers pass the upper-case spelling first, so upper case wins over lower
+    case. That matches curl and httpx. Deliberate: do not "fix" it to prefer the
+    lower-case form, which some other tooling does for ``no_proxy``.
+    """
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _parse_no_proxy(
+    raw: str,
+) -> tuple[str, ...]:
+    """Parse NO_PROXY into normalized match patterns.
+
+    A leading dot is stripped so ``.example.com`` and ``example.com`` behave
+    identically, matching curl. A CIDR-shaped entry is kept (it can still match
+    an exact IP literal) but warned about, because neither curl nor httpx expands
+    a CIDR, so ``10.0.0.0/8`` silently fails to match ``10.1.2.3`` and sends
+    in-cluster traffic to the corporate proxy.
+    """
+    patterns: list[str] = []
+    for entry in (raw or "").split(","):
+        cleaned = entry.strip().lower().lstrip(".")
+        if not cleaned:
+            continue
+        if "/" in cleaned:
+            logger.warning(
+                "SSRF guard: NO_PROXY entry %r looks like a CIDR, which is not "
+                "expanded (curl and httpx do not either). Use an exact host or a "
+                "domain suffix, or those addresses will be sent to the proxy.",
+                cleaned,
+            )
+        patterns.append(cleaned)
+    return tuple(patterns)
+
+
+@lru_cache(maxsize=1)
+def _forward_proxy_config() -> _ForwardProxyConfig:
+    """Parse forward-proxy configuration once per process.
+
+    Cached like the allowlist factories, because the environment is immutable per
+    process. Tests call ``_forward_proxy_config.cache_clear()`` after patching
+    ``os.environ``.
+
+    A flag that is on with no proxy configured logs one WARNING and returns a
+    DISABLED config, so the deployment behaves exactly as if the flag were off.
+    That is deliberately not an error: an operator may enable the flag in a shared
+    values file while only some environments set a proxy.
+    """
+    raw_enabled = (os.environ.get(_FORWARD_PROXY_ENABLED_ENV) or "").strip().lower()
+    if raw_enabled not in _TRUE_VALUES:
+        return _ForwardProxyConfig()
+
+    http_proxy = _env_first("HTTP_PROXY", "http_proxy")
+    https_proxy = _env_first("HTTPS_PROXY", "https_proxy")
+
+    if http_proxy is None and https_proxy is None:
+        logger.warning(
+            "SSRF guard: %s is true but neither HTTP_PROXY nor HTTPS_PROXY is set; "
+            "egress stays direct and pinned",
+            _FORWARD_PROXY_ENABLED_ENV,
+        )
+        return _ForwardProxyConfig()
+
+    no_proxy = _parse_no_proxy(_env_first("NO_PROXY", "no_proxy") or "")
+    logger.info(
+        "SSRF guard: forward proxy enabled (http=%s https=%s no_proxy_entries=%d). "
+        "IP-rebind pinning is relaxed for targets that resolve exclusively public.",
+        redact_url(http_proxy) if http_proxy else "unset",
+        redact_url(https_proxy) if https_proxy else "unset",
+        len(no_proxy),
+    )
+    return _ForwardProxyConfig(
+        enabled=True,
+        http_proxy=http_proxy,
+        https_proxy=https_proxy,
+        no_proxy=no_proxy,
+    )
+
+
+def _validate_proxy_url(
+    proxy_url: str,
+) -> None:
+    """Raise unless a configured proxy URL is a usable http(s) endpoint.
+
+    Fails closed on a malformed proxy rather than falling back to a direct dial,
+    which would hide the misconfiguration behind the same ConnectTimeout the
+    operator is trying to fix. The proxy URL may carry basic-auth userinfo, so it
+    is redacted in the error message as well as in logs.
+    """
+    try:
+        parsed = urlsplit(proxy_url)
+        parsed.port  # noqa: B018 - forces validation of a malformed/out-of-range port
+    except (TypeError, ValueError) as exc:
+        raise UrlValidationError(
+            redact_url(proxy_url), f"proxy URL could not be parsed: {exc}"
+        ) from exc
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise UrlValidationError(
+            redact_url(proxy_url),
+            f"proxy URL scheme '{parsed.scheme}' is not supported (use http or https)",
+        )
+    if not parsed.hostname:
+        raise UrlValidationError(redact_url(proxy_url), "proxy URL has no hostname")
+
+
+@lru_cache(maxsize=1)
+def _forward_proxy_ssl_context() -> ssl.SSLContext | bool:
+    """Return the TLS context for proxied egress, or True for the default store.
+
+    Cached with ``maxsize=1`` for two reasons: the file is read once per process,
+    and ``shared_guarded_async_client`` keys its pool on ``(profile.name, verify)``
+    where an ``ssl.SSLContext`` hashes by identity, so a fresh context per call
+    would mint a new pool key every time and multiply the connection pool.
+
+    The bundle is loaded ON TOP of the default roots. This is why the setting is
+    not ``SSL_CERT_FILE``: ``ssl.create_default_context(cafile=...)`` REPLACES the
+    certifi store rather than adding to it, so an operator who points
+    ``SSL_CERT_FILE`` at the single CA their proxy team handed them loses TLS to
+    every direct-path target and gets a second, unrelated outage.
+
+    "Default roots" means certifi plus any OS-provided store, in that order,
+    because certifi is what httpx itself would have used
+    (``httpx._config.create_ssl_context`` builds from ``certifi.where()``) and
+    httpx does NOT read the operating system trust store. Seeding from certifi
+    explicitly keeps the proxied path's baseline trust identical to the direct
+    path's instead of depending on whether the base image ships
+    ``ca-certificates``.
+
+    Fails closed: a missing, unreadable, or malformed bundle raises rather than
+    falling back, because a silent fallback surfaces as a certificate error on
+    every proxied request, which reads like a bug in this feature.
+    """
+    path = (os.environ.get(_FORWARD_PROXY_CA_BUNDLE_ENV) or "").strip()
+    if not path:
+        return True  # httpx builds its own default context; unchanged behavior
+
+    if not os.path.isfile(path):
+        raise UrlValidationError(
+            path,
+            f"{_FORWARD_PROXY_CA_BUNDLE_ENV} points to '{path}', which is not a file",
+        )
+    context = ssl.create_default_context(cafile=certifi.where())
+    # Additive: picks up an OS-provided store as well, where one exists.
+    context.load_default_certs()
+    try:
+        context.load_verify_locations(cafile=path)
+    except (OSError, ssl.SSLError) as exc:
+        raise UrlValidationError(
+            path, f"failed to load {_FORWARD_PROXY_CA_BUNDLE_ENV} '{path}': {exc}"
+        ) from exc
+    logger.info("SSRF guard: loaded forward-proxy CA bundle from %s", path)
+    return context
+
+
+@lru_cache(maxsize=1)
+def egress_ssl_context() -> ssl.SSLContext:
+    """Return the TLS trust for outbound clients that are not httpx, such as httpx2.
+
+    The MCP SDK 2.x talks through httpx2, whose default context reads only the
+    operating system trust store. The registry image ships none, so every HTTPS
+    MCP server failed certificate verification. This context gives httpx2 the
+    trust the rest of the registry has: certifi, any OS store, and the
+    forward-proxy CA bundle when one is configured (same rules as
+    _forward_proxy_ssl_context, which this reuses). Cached so callers that key a
+    pool on the context get one pool.
+    """
+    proxy_context = _forward_proxy_ssl_context()
+    if isinstance(proxy_context, ssl.SSLContext):
+        return proxy_context
+    context = ssl.create_default_context(cafile=certifi.where())
+    # Additive: picks up an OS-provided store as well, where one exists.
+    context.load_default_certs()
+    return context
+
+
+def _no_proxy_matches(
+    patterns: tuple[str, ...],
+    hostname: str,
+    port: int,
+) -> bool:
+    """Return True if the target is excluded from proxying by NO_PROXY.
+
+    Supports the conventional forms: ``*`` (everything direct), an exact host, a
+    ``host:port`` pair, and a domain suffix (``example.com``, which matches
+    ``a.example.com``; a leading dot was already stripped by ``_parse_no_proxy``).
+    CIDR entries are NOT expanded, matching curl and httpx; ``_parse_no_proxy``
+    warns about one.
+
+    Module-level rather than a method because both the guarded transports and the
+    plain proxy-routed transport need it, and one matcher is the point.
+    """
+    if not patterns:
+        return False
+    host = hostname.lower()
+    host_port = f"{host}:{port}"
+    for pattern in patterns:
+        if pattern == "*":
+            return True
+        if pattern in (host, host_port):
+            return True
+        if host.endswith(f".{pattern}"):
+            return True
+    return False
+
+
+async def _resolves_exclusively_public_async(
+    hostname: str,
+    port: int,
+) -> bool | None:
+    """Return True if every address a host resolves to is on the public internet.
+
+    This is a ROUTING question, not an access-control one, and it never raises.
+    Used by the plain (un-guarded) transport, whose whole purpose is reaching
+    operator-configured targets the SSRF guard would reject, such as an in-cluster
+    ``http://keycloak:8080`` at a private address.
+
+    Returns:
+        True when every resolved address is public, so the target may be proxied.
+        False when any address is internal, so the target must stay direct.
+        None when resolution failed, in which case the caller dials direct and
+        lets httpx surface its own error rather than inventing a new failure mode.
+    """
+    literal = coerce_ip_literal(hostname)
+    if literal is not None:
+        return not _is_blocked_ip(hostname, _Allowlist(), allow_private=False)
+    try:
+        loop = asyncio.get_running_loop()
+        addr_info = await asyncio.wait_for(
+            loop.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP),
+            timeout=_DNS_RESOLUTION_TIMEOUT_SECONDS,
+        )
+    except (TimeoutError, socket.gaierror, OSError):
+        logger.debug(
+            "plain egress: could not resolve %s for a proxy routing decision; dialing direct",
+            hostname,
+        )
+        return None
+    addresses = {str(info[4][0]) for info in addr_info}
+    if not addresses:
+        return None
+    return all(not _is_blocked_ip(ip, _Allowlist(), allow_private=False) for ip in addresses)
+
+
+def _build_proxy(
+    proxy_url: str,
+) -> httpx.Proxy:
+    """Build the ``httpx.Proxy`` a delegate transport connects through.
+
+    A ``Proxy`` object rather than the raw URL string, for two reasons. httpx
+    hands ``proxy.ssl_context`` to httpcore as ``proxy_ssl_context``, and a
+    ``Proxy`` built from a string has ``ssl_context=None``, so an ``https://``
+    proxy signed by an internal CA would be verified against httpcore's default
+    context and fail. ``httpx.Proxy`` also extracts userinfo from the URL into
+    ``raw_auth`` itself, which is what keeps proxy basic auth working.
+
+    The context is attached ONLY for an ``https://`` proxy. httpcore refuses
+    ``proxy_ssl_context`` for the ``http`` scheme outright ("The
+    ``proxy_ssl_context`` argument is not allowed for the http scheme"), and it
+    raises while the delegate transport is being CONSTRUCTED, so attaching it
+    unconditionally broke every request through a plain ``http://`` CONNECT
+    proxy as soon as a bundle was configured, before the request left the
+    process. Omitting it costs nothing: the argument governs the TLS leg TO the
+    proxy, which a plain ``http://`` proxy does not have, while the upstream leg
+    inside the tunnel takes the bundle from ``verify`` in
+    ``_delegate_kwargs_with_ca_bundle``.
+    """
+    context = _forward_proxy_ssl_context()
+    proxy_is_https = urlsplit(proxy_url).scheme.lower() == "https"
+    # isinstance stays inline in the ternary so mypy narrows the bool away.
+    return httpx.Proxy(
+        url=proxy_url,
+        ssl_context=context if proxy_is_https and isinstance(context, ssl.SSLContext) else None,
+    )
+
+
+def _delegate_kwargs_with_ca_bundle(
+    base: dict[str, object],
+) -> dict[str, object]:
+    """Return delegate transport kwargs, applying the CA bundle to ``verify``.
+
+    The bundle has to reach the UPSTREAM leg (inside the tunnel) as well as the
+    leg to the proxy, and that leg is governed by ``verify``. Only the default
+    trust store is replaced: a caller that passed ``verify=False`` or its own
+    bundle path made an explicit choice that is left alone.
+    """
+    context = _forward_proxy_ssl_context()
+    kwargs = dict(base)
+    if isinstance(context, ssl.SSLContext) and kwargs.get("verify", True) is True:
+        kwargs["verify"] = context
+    return kwargs
+
+
+# Cloud credential endpoints that MUST be excluded from the forward proxy.
+#
+# These are link-local, so a proxy dialing one reaches ITS OWN host's metadata
+# service, not the caller's. Setting HTTP_PROXY re-points every proxy-aware SDK
+# in the process, and botocore is one: its credential providers will send these
+# requests to the proxy. The endpoints speak plain HTTP, so there is no CONNECT
+# tunnel and the proxy sees the full response body, which is the credential
+# document (AccessKeyId, SecretAccessKey, Token) in cleartext.
+#
+# AWS_EC2_METADATA_DISABLED=true is NOT a sufficient substitute. It is read only
+# by botocore's IMDSFetcher (botocore/utils.py), so it covers 169.254.169.254
+# alone. ContainerProvider (botocore/credentials.py) is gated purely on
+# AWS_CONTAINER_CREDENTIALS_RELATIVE_URI / _FULL_URI being present, with no such
+# check, so the ECS and EKS task-credential endpoints stay exposed. NO_PROXY is
+# the only control that covers all three.
+#
+# The IPv6 (fd00:ec2::*) and Alibaba (100.100.100.200) endpoints in
+# _CREDENTIAL_ENDPOINT_IPS are deliberately not required here: no SDK dials them
+# through HTTP_PROXY in practice, and NO_PROXY matching of a bracketed IPv6
+# literal is inconsistent across clients. This module's own transports hard-deny
+# every one of them regardless, so the requirement below exists purely to protect
+# the OTHER libraries sharing the process.
+_PROXY_REQUIRED_NO_PROXY_IPS: tuple[str, ...] = (
+    "169.254.169.254",  # EC2 IMDS
+    "169.254.170.2",  # ECS task credentials
+    "169.254.170.23",  # EKS Pod Identity
+)
+
+
+def _assert_credential_endpoints_bypass_proxy(
+    config: _ForwardProxyConfig,
+) -> None:
+    """Refuse to start when a credential endpoint could be sent to the proxy.
+
+    Fails closed rather than warning. The blocked combination is never a correct
+    configuration: no deployment legitimately wants its IAM credential requests
+    routed through a forward proxy. A warning would also be read too late, since
+    the leak happens on the first boto3 call, which can be long after startup.
+
+    This can only fire for a deployment that explicitly enabled
+    EGRESS_FORWARD_PROXY_ENABLED, so it cannot affect an existing one, and the
+    remedy is a single NO_PROXY entry.
+    """
+    if not config.enabled:
+        return
+    missing = [
+        ip for ip in _PROXY_REQUIRED_NO_PROXY_IPS if not _no_proxy_matches(config.no_proxy, ip, 80)
+    ]
+    if not missing:
+        return
+    raise UrlValidationError(
+        ",".join(missing),
+        f"{_FORWARD_PROXY_ENABLED_ENV} is true but NO_PROXY does not exclude the "
+        f"cloud credential endpoint(s) {', '.join(missing)}. Setting HTTP_PROXY "
+        "re-points every proxy-aware SDK in this process, so the AWS SDK would "
+        "send IAM credential requests to the forward proxy. Those endpoints speak "
+        "plain HTTP, so the proxy would see the returned AccessKeyId, "
+        "SecretAccessKey and Token in cleartext, and because the addresses are "
+        "link-local the proxy would be answering from its own host rather than "
+        "this one. Refusing to start. Fix: add "
+        f"'{','.join(_PROXY_REQUIRED_NO_PROXY_IPS)}' to NO_PROXY on this service "
+        "(AWS_EC2_METADATA_DISABLED=true is NOT sufficient: botocore applies it "
+        "only to 169.254.169.254, not to the container-credential endpoints). "
+        "See docs/forward-proxy-egress.md.",
+    )
+
+
+def validate_forward_proxy_config() -> None:
+    """Resolve and validate forward-proxy configuration at process startup.
+
+    Call this from each app's lifespan so a bad CA-bundle path fails the pod
+    rather than surfacing on the first proxied request, hours later and far from
+    the cause. The CA bundle is validated even when the feature flag is off, so a
+    typo is caught before the flag is flipped.
+
+    Raises:
+        UrlValidationError: If the CA bundle path is missing, unreadable, or not
+            valid PEM, or if the proxy is enabled without NO_PROXY excluding the
+            cloud credential endpoints.
+    """
+    config = _forward_proxy_config()
+    _assert_credential_endpoints_bypass_proxy(config)
+    _forward_proxy_ssl_context()
+
+
+@lru_cache(maxsize=1)
+def _egress_route_counter() -> object | None:
+    """Return the egress-route counter, or None when metrics are unavailable.
+
+    Imported lazily and best-effort: this module must stay importable from the
+    auth-server process and from cli/agentcore, neither of which owns the
+    registry meter. A missing meter makes the counter a no-op rather than an
+    error, because a metric must never be the reason egress fails.
+    """
+    try:
+        from ..observability.meters import egress_forward_proxy_requests_total
+    except Exception:  # noqa: BLE001 - metrics are strictly optional here
+        logger.debug("SSRF guard: egress route counter unavailable", exc_info=True)
+        return None
+    return egress_forward_proxy_requests_total
+
+
+def _annotate_current_span(
+    profile_name: str,
+    route: str,
+) -> None:
+    """Annotate the enclosing httpx client span with the routing decision.
+
+    No new span is created: opentelemetry-instrumentation-httpx already produces
+    one per request, and annotating it is what lets an operator see in a trace
+    whether a slow request went through the proxy. Imported lazily and
+    best-effort, for the same reason as the counter.
+    """
+    try:
+        from opentelemetry import trace
+
+        span = trace.get_current_span()
+        if not span.is_recording():
+            return
+        span.set_attribute("egress.via_forward_proxy", route == "proxied")
+        span.set_attribute("egress.guard_profile", profile_name)
+    except Exception:  # noqa: BLE001 - tracing must never break egress
+        logger.debug("SSRF guard: failed to annotate the egress span", exc_info=True)
+
+
+def _record_egress_route(
+    profile_name: str,
+    route: str,
+    outcome: str,
+) -> None:
+    """Record one egress routing decision as a metric and a span attribute.
+
+    Never raises: observability must never be the reason an egress request fails.
+    """
+    _annotate_current_span(profile_name, route)
+    counter = _egress_route_counter()
+    if counter is None:
+        return
+    try:
+        counter.add(1, {"profile": profile_name, "route": route, "outcome": outcome})  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - a metric must never break egress
+        logger.debug("SSRF guard: failed to record egress route metric", exc_info=True)
 
 
 def normalize_url_identity(url: str) -> str:
@@ -587,6 +1166,38 @@ def _credentialed_oauth_allowlist() -> _Allowlist:
     return _Allowlist(hosts=_parse_hosts(_get_settings().egress_oauth_trusted_idp_hosts))
 
 
+def _entra_graph_allowlist() -> _Allowlist:
+    """Trust only the explicitly configured Graph reverse proxy's hostname.
+
+    The auth-server reads ENTRA_GRAPH_BASE_URL directly; it cannot depend on
+    registry Settings. Microsoft-hosted Graph names stay public-only even
+    when set explicitly, so an unexpected private DNS answer fails closed.
+    """
+    override = os.environ.get("ENTRA_GRAPH_BASE_URL", "")
+    if not override:
+        return _Allowlist()
+    normalized = normalize_url_identity(override)
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme != "https"
+        or parsed.path != "/"
+        or parsed.query
+        or parsed.port not in (None, 443)
+    ):
+        raise UrlValidationError(override, "Graph base URL must be an HTTPS origin")
+    host = parsed.hostname
+    if not host or coerce_ip_literal(host) is not None:
+        return _Allowlist()
+    if host in {
+        "graph.microsoft.com",
+        "graph.microsoft.us",
+        "dod-graph.microsoft.us",
+        "microsoftgraph.chinacloudapi.cn",
+    }:
+        return _Allowlist()
+    return _Allowlist(hosts=frozenset({host}))
+
+
 def _egress_upstream_allowlist() -> _Allowlist:
     """Empty allowlist for the egress-injected proxy hop.
 
@@ -623,6 +1234,14 @@ class _Profile:
     allowed_url_identities: frozenset[str] | None = None
     require_https: bool = False
     allow_private: bool = False
+    # Profiles whose requests carry a secret (client secret, refresh token,
+    # bearer, injected egress credential). On the forward-proxied path these are
+    # HTTPS-only, so the secret rides inside a CONNECT tunnel and the proxy sees
+    # only host:port. An http target would instead be sent via httpcore's
+    # absolute-URI forward path, handing the full URL and the Authorization
+    # header to the proxy in cleartext. A field rather than a check against
+    # profile names, so a future profile has to make an explicit choice.
+    credential_bearing: bool = False
 
 
 SKILL_PROFILE = _Profile(name="skill", allowlist_factory=_skill_allowlist)
@@ -632,16 +1251,28 @@ BUILTIN_AIREGISTRY_TOOLS_PROFILE = _Profile(
     allowlist_factory=_builtin_airegistry_tools_allowlist,
     allowed_url_identities=_BUILTIN_AIREGISTRY_TOOLS_OUTBOUND_IDENTITIES,
 )
-FEDERATION_PROFILE = _Profile(name="federation", allowlist_factory=_federation_allowlist)
+FEDERATION_PROFILE = _Profile(
+    name="federation",
+    allowlist_factory=_federation_allowlist,
+    credential_bearing=True,  # attaches a peer bearer token
+)
 CREDENTIALED_OAUTH_PROFILE = _Profile(
     name="credentialed-oauth",
     allowlist_factory=_credentialed_oauth_allowlist,
     require_https=True,
+    credential_bearing=True,  # belt and braces: require_https already denies http
+)
+ENTRA_GRAPH_PROFILE = _Profile(
+    name="entra-graph",
+    allowlist_factory=_entra_graph_allowlist,
+    require_https=True,
+    credential_bearing=True,  # delegated bearer token, including through a proxy
 )
 EGRESS_UPSTREAM_PROFILE = _Profile(
     name="egress-upstream",
     allowlist_factory=_egress_upstream_allowlist,
     allow_private=True,
+    credential_bearing=True,  # carries the injected egress credential
 )
 
 
@@ -699,10 +1330,13 @@ def _is_blocked_ip(
             # (profile.allow_private, e.g. EGRESS_UPSTREAM_PROFILE=True) or the
             # allowlist (allowlist.allow_private, set from
             # gateway_proxy_allow_private_targets). Metadata/credential/link-local
-            # /reserved/multicast stay hard-denied in _ip_denial_reason before
-            # any relaxation, so this only ever relaxes loopback/private/CGNAT.
+            # /multicast stay hard-denied in _ip_denial_reason before any
+            # relaxation, so this only ever relaxes loopback/private/CGNAT.
             allow_private=allow_private or allowlist.allow_private,
             allowed_cidrs=allowed_cidrs,
+            # Only the operator's own CIDRs may admit a reserved address (#2018),
+            # never the /32 added above for a trusted hostname.
+            reserved_cidrs=allowlist.cidrs,
         )
         is not None
     )
@@ -938,14 +1572,17 @@ def validate_server_path(
     a mutating admin action masquerade as a health check and be dropped from the
     audit trail.
 
+    A path whose first segment is ``branding`` is also rejected: that prefix is
+    the public UI branding route, which a server location block would shadow.
+
     Args:
         path: The server path (e.g. ``/github``).
 
     Raises:
         UrlValidationError: If the path is empty, contains disallowed nginx
-            metacharacters, normalizes to an empty (slashes-only) path, or
+            metacharacters, normalizes to an empty (slashes-only) path,
             normalizes to a reserved cross-server wildcard or monitoring-route
-            name.
+            name, or starts with the reserved ``branding`` segment.
     """
     if not path or not isinstance(path, str):
         raise UrlValidationError(str(path), "server path is empty or not a string")
@@ -981,6 +1618,16 @@ def validate_server_path(
         raise UrlValidationError(
             path,
             f"server path '{normalized}' is reserved (shadows a built-in monitoring route)",
+        )
+
+    # The first segment "branding" is the public UI branding route
+    # ({ROOT_PATH}/branding/<name>). A server there would get an nginx location
+    # block that shadows it (and puts it behind auth_request), so reserve it.
+    if normalized.split("/", 1)[0].lower() == BRANDING_PATH_SEGMENT:
+        raise UrlValidationError(
+            path,
+            f"server path '{normalized}' is reserved (the '/{BRANDING_PATH_SEGMENT}' "
+            "prefix serves the UI branding files)",
         )
 
 
@@ -1069,9 +1716,238 @@ class _PinnedResolverMixin:
         )[0]
         return self._rewrite_to_pinned_ip(request, url, hostname, pinned_ip)
 
+    # -- Forward-proxy routing (see the module docstring) --------------------
+
+    def _forward_proxy_candidate(
+        self,
+        scheme: str,
+        hostname: str,
+        port: int,
+    ) -> str | None:
+        """Return the proxy this target COULD use, or None for certainly-direct.
+
+        A candidate, not a decision: the final call needs the resolved addresses
+        (see ``_route_request_async``), because a target that resolves to an
+        internal address goes direct even when a proxy is configured. This covers
+        only the reasons a target can never be proxied, none of which needs DNS:
+        the feature is off, ``NO_PROXY`` names the host, or no proxy is configured
+        for this scheme.
+        """
+        config = _forward_proxy_config()
+        if not config.enabled:
+            return None
+        if _no_proxy_matches(config.no_proxy, hostname, port):
+            return None
+        # No warning when the other scheme's proxy is set: a deployment with only
+        # HTTPS_PROXY is a normal configuration, and an http:// target there is
+        # correctly dialed directly.
+        proxy_url = config.https_proxy if scheme == "https" else config.http_proxy
+        if proxy_url is None:
+            return None
+        _validate_proxy_url(proxy_url)
+        return proxy_url
+
+    def _assert_proxy_allowed_for_profile(
+        self,
+        url: httpx.URL,
+        scheme: str,
+    ) -> None:
+        """Reject an http target through a proxy for credential-bearing profiles.
+
+        An https target is tunneled with CONNECT, so the proxy sees only
+        ``host:port`` and the secret stays inside TLS. An http target is sent via
+        the absolute-URI forward path, which hands the full URL and the
+        Authorization header to the proxy in cleartext. Fail closed.
+        """
+        if not self._guard_profile.credential_bearing or scheme == "https":
+            return
+        logger.warning(
+            "SSRF guard[%s]: refusing http target %s through the forward proxy "
+            "(the credential would reach the proxy in cleartext)",
+            self._guard_profile.name,
+            redact_url(str(url)),
+        )
+        raise UrlValidationError(
+            str(url),
+            "credential-bearing profile refuses an http target through a forward "
+            "proxy (the credential would reach the proxy in cleartext). Use https, "
+            "or add this host to NO_PROXY so it is dialed directly and pinned",
+        )
+
+    @staticmethod
+    def _is_internal_address(
+        ip_str: str,
+    ) -> bool:
+        """Return True if an address is internal, ignoring every relaxation.
+
+        Delegates to the canonical classifier with an EMPTY allowlist and
+        ``allow_private=False``, so this introduces no second opinion about what
+        counts as internal. An address the classifier rejects with no relaxations
+        applied is internal by definition; one it accepts is on the public
+        internet.
+
+        This is the ROUTING signal, not an access decision. Access was already
+        decided by ``_validated_addresses*``, which applied the profile's
+        allowlist and raised on anything genuinely forbidden.
+        """
+        return _is_blocked_ip(ip_str, _Allowlist(), allow_private=False)
+
+    def _validated_addresses(
+        self,
+        url: httpx.URL,
+        hostname: str,
+        port: int,
+        allowlist: _Allowlist,
+    ) -> list[str]:
+        """Resolve and classify ONCE, returning every permitted address.
+
+        Resolving a second time to make the routing decision would both waste a
+        lookup and open a window for the two answers to disagree, which is the
+        exact TOCTOU gap the pin exists to close. One lookup, reused by both
+        branches.
+        """
+        if coerce_ip_literal(hostname) is not None:
+            if _is_blocked_ip(hostname, allowlist, allow_private=self._guard_profile.allow_private):
+                raise UrlValidationError(str(url), f"targets blocked/private IP {hostname}")
+            return [hostname]
+        # Raises if ANY answer is blocked under the profile's allowlist.
+        return _resolve_public_ips(
+            hostname, port, allowlist, allow_private=self._guard_profile.allow_private
+        )
+
+    async def _validated_addresses_async(
+        self,
+        url: httpx.URL,
+        hostname: str,
+        port: int,
+        allowlist: _Allowlist,
+    ) -> list[str]:
+        """Async twin of :meth:`_validated_addresses`."""
+        if coerce_ip_literal(hostname) is not None:
+            if _is_blocked_ip(hostname, allowlist, allow_private=self._guard_profile.allow_private):
+                raise UrlValidationError(str(url), f"targets blocked/private IP {hostname}")
+            return [hostname]
+        return await _resolve_public_ips_async(
+            hostname, port, allowlist, allow_private=self._guard_profile.allow_private
+        )
+
+    def _route_on_addresses(
+        self,
+        request: httpx.Request,
+        url: httpx.URL,
+        scheme: str,
+        hostname: str,
+        addresses: list[str],
+        candidate: str,
+    ) -> _RoutedRequest:
+        """Choose proxied or direct given the already-resolved addresses.
+
+        Shared by the sync and async routers so the two cannot drift. A proxy
+        carries a target only when EVERY resolved address is on the public
+        internet, so rebinding protection is surrendered for public destinations
+        alone.
+        """
+        if any(self._is_internal_address(ip) for ip in addresses):
+            # Internal target, permitted by an operator allowlist. Keep the pin. A
+            # mixed answer set counts as internal: deliberately conservative,
+            # because the safe direction preserves a control.
+            logger.debug(
+                "SSRF guard[%s]: %s resolves internal, staying direct and pinned",
+                self._guard_profile.name,
+                hostname,
+            )
+            _record_egress_route(self._guard_profile.name, "direct", "ok")
+            if coerce_ip_literal(hostname) is not None:
+                return _RoutedRequest(request, None)  # already an address, nothing to pin
+            return _RoutedRequest(
+                self._rewrite_to_pinned_ip(request, url, hostname, addresses[0]), None
+            )
+
+        # Public destination. The resolved addresses are logged at DEBUG and then
+        # deliberately discarded: they are the only forensic handle on the
+        # rebinding gap, since the proxy resolves the name again when it dials.
+        self._assert_proxy_allowed_for_profile(url, scheme)
+        logger.debug(
+            "SSRF guard[%s]: %s resolves public %s, routing via forward proxy",
+            self._guard_profile.name,
+            hostname,
+            addresses,
+        )
+        _record_egress_route(self._guard_profile.name, "proxied", "ok")
+        # Handed over UNMODIFIED so the tunnel can name the host and verify its
+        # certificate against that name.
+        return _RoutedRequest(request, candidate)
+
+    def _excluded_from_proxy(
+        self,
+        hostname: str,
+    ) -> None:
+        """Record a target the proxy is configured for but will not carry.
+
+        Only reached when the feature is ON, so the flag-off path stays free of
+        any observability cost. Recording this is what lets an operator see a
+        proxy-only deployment still sending traffic direct, which usually means
+        NO_PROXY is too broad or no proxy is set for that scheme.
+        """
+        logger.debug(
+            "SSRF guard[%s]: %s excluded from the forward proxy (NO_PROXY or no "
+            "proxy for this scheme), staying direct and pinned",
+            self._guard_profile.name,
+            hostname,
+        )
+        _record_egress_route(self._guard_profile.name, "direct", "ok")
+
+    def _route_request(
+        self,
+        request: httpx.Request,
+    ) -> _RoutedRequest:
+        """Validate, resolve, then route on where the target actually lives."""
+        url, scheme, hostname, port, allowlist = self._request_target(request)
+        # NOTE: _request_target runs twice on every direct branch below, once
+        # here and once inside _pin_request. It is pure CPU validation with no
+        # DNS, and keeping _pin_request self-contained is what preserves the
+        # existing transport tests that call it directly. Do not "optimize" away.
+        if not _forward_proxy_config().enabled:
+            # Feature off: the existing path, byte for byte, and no metric.
+            return _RoutedRequest(self._pin_request(request), None)
+
+        candidate = self._forward_proxy_candidate(scheme, hostname, port)
+        if candidate is None:
+            self._excluded_from_proxy(hostname)
+            return _RoutedRequest(self._pin_request(request), None)
+
+        addresses = self._validated_addresses(url, hostname, port, allowlist)
+        return self._route_on_addresses(request, url, scheme, hostname, addresses, candidate)
+
+    async def _route_request_async(
+        self,
+        request: httpx.Request,
+    ) -> _RoutedRequest:
+        """Async twin of :meth:`_route_request`."""
+        url, scheme, hostname, port, allowlist = self._request_target(request)
+        # See the note in _route_request about the deliberate double
+        # _request_target call on the direct branches.
+        if not _forward_proxy_config().enabled:
+            return _RoutedRequest(await self._pin_request_async(request), None)
+
+        candidate = self._forward_proxy_candidate(scheme, hostname, port)
+        if candidate is None:
+            self._excluded_from_proxy(hostname)
+            return _RoutedRequest(await self._pin_request_async(request), None)
+
+        addresses = await self._validated_addresses_async(url, hostname, port, allowlist)
+        return self._route_on_addresses(request, url, scheme, hostname, addresses, candidate)
+
 
 class GuardedTransport(_PinnedResolverMixin, httpx.HTTPTransport):
-    """Synchronous httpx transport that pins requests to validated IPs."""
+    """Synchronous httpx transport that pins requests to validated IPs.
+
+    When a forward proxy applies (see the module docstring), the validated request
+    is handed to a delegate transport built with the same TLS and retry settings
+    plus ``proxy=``, because httpx builds proxy support into the transport and a
+    custom transport otherwise never sees ``HTTP_PROXY``. The guard runs in THIS
+    class either way, so the proxied path cannot skip validation.
+    """
 
     def __init__(
         self,
@@ -1080,18 +1956,111 @@ class GuardedTransport(_PinnedResolverMixin, httpx.HTTPTransport):
         **kwargs: object,
     ) -> None:
         self._guard_profile = guard_profile
+        # Captured so a proxy delegate inherits verify / retries / limits exactly,
+        # rather than silently getting different TLS settings from the direct path.
+        self._delegate_kwargs = dict(kwargs)
+        self._proxy_delegates: dict[str, httpx.HTTPTransport] = {}
+        # The sync transport can be shared across threads, so delegate creation is
+        # double-checked under a lock (the async twin needs no lock: its dict miss
+        # has no await between the read and the write).
+        self._delegate_lock = threading.Lock()
         super().__init__(**kwargs)  # type: ignore[arg-type]
+
+    def _proxy_delegate(
+        self,
+        proxy_url: str,
+    ) -> httpx.HTTPTransport:
+        """Return (creating once) the delegate transport for this proxy."""
+        delegate = self._proxy_delegates.get(proxy_url)
+        if delegate is not None:
+            return delegate
+        with self._delegate_lock:
+            delegate = self._proxy_delegates.get(proxy_url)
+            if delegate is None:
+                delegate = httpx.HTTPTransport(
+                    proxy=_build_proxy(proxy_url),
+                    **_delegate_kwargs_with_ca_bundle(self._delegate_kwargs),  # type: ignore[arg-type]
+                )
+                self._proxy_delegates[proxy_url] = delegate
+        return delegate
 
     def handle_request(
         self,
         request: httpx.Request,
     ) -> httpx.Response:
-        request = self._pin_request(request)
-        return super().handle_request(request)
+        routed = self._route_request(request)
+        if routed.proxy_url is None:
+            return super().handle_request(routed.request)
+        return self._proxy_delegate(routed.proxy_url).handle_request(routed.request)
+
+    def close(self) -> None:
+        for delegate in list(self._proxy_delegates.values()):
+            try:
+                delegate.close()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                logger.debug("error closing a forward-proxy delegate", exc_info=True)
+        self._proxy_delegates.clear()
+        super().close()
 
 
-class GuardedAsyncTransport(_PinnedResolverMixin, httpx.AsyncHTTPTransport):
-    """Async httpx transport that pins requests to validated IPs."""
+class _AsyncProxyDelegateMixin:
+    """Owns the per-proxy delegate transports for an async transport.
+
+    Shared by the guarded transport and the plain proxy-routed transport so the
+    delegate construction and teardown exist once. Copy-pasting them would be how
+    the two drift apart on TLS settings.
+    """
+
+    _delegate_kwargs: dict[str, object]
+    _proxy_delegates: dict[str, httpx.AsyncHTTPTransport]
+
+    def _init_proxy_delegates(
+        self,
+        kwargs: dict[str, object],
+    ) -> None:
+        """Capture the transport kwargs a delegate must inherit."""
+        self._delegate_kwargs = dict(kwargs)
+        self._proxy_delegates = {}
+
+    def _proxy_delegate(
+        self,
+        proxy_url: str,
+    ) -> httpx.AsyncHTTPTransport:
+        """Return (creating once) the delegate transport for this proxy.
+
+        A plain synchronous dict miss with no ``await`` between the read and the
+        write, so two coroutines on one event loop cannot interleave and create
+        two delegates.
+        """
+        delegate = self._proxy_delegates.get(proxy_url)
+        if delegate is None:
+            delegate = httpx.AsyncHTTPTransport(
+                proxy=_build_proxy(proxy_url),
+                **_delegate_kwargs_with_ca_bundle(self._delegate_kwargs),  # type: ignore[arg-type]
+            )
+            self._proxy_delegates[proxy_url] = delegate
+        return delegate
+
+    async def _aclose_proxy_delegates(self) -> None:
+        """Close every delegate, best effort."""
+        for delegate in list(self._proxy_delegates.values()):
+            try:
+                await delegate.aclose()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                logger.debug("error closing a forward-proxy delegate", exc_info=True)
+        self._proxy_delegates.clear()
+
+
+class GuardedAsyncTransport(
+    _AsyncProxyDelegateMixin, _PinnedResolverMixin, httpx.AsyncHTTPTransport
+):
+    """Async httpx transport that pins requests to validated IPs.
+
+    See :class:`GuardedTransport` for how the forward-proxy delegate works.
+    Setting ``proxy=`` on the enclosing ``httpx.AsyncClient`` instead would mount
+    a plain transport under ``all://`` that shadows this one and removes every
+    SSRF check while leaving the factory named ``guarded_async_client``.
+    """
 
     def __init__(
         self,
@@ -1100,14 +2069,118 @@ class GuardedAsyncTransport(_PinnedResolverMixin, httpx.AsyncHTTPTransport):
         **kwargs: object,
     ) -> None:
         self._guard_profile = guard_profile
+        self._init_proxy_delegates(kwargs)
         super().__init__(**kwargs)  # type: ignore[arg-type]
 
     async def handle_async_request(
         self,
         request: httpx.Request,
     ) -> httpx.Response:
-        request = await self._pin_request_async(request)
-        return await super().handle_async_request(request)
+        routed = await self._route_request_async(request)
+        if routed.proxy_url is None:
+            return await super().handle_async_request(routed.request)
+        delegate = self._proxy_delegate(routed.proxy_url)
+        return await delegate.handle_async_request(routed.request)
+
+    async def aclose(self) -> None:
+        await self._aclose_proxy_delegates()
+        await super().aclose()
+
+
+class PlainProxyRoutedAsyncTransport(_AsyncProxyDelegateMixin, httpx.AsyncHTTPTransport):
+    """Un-guarded transport that routes PUBLIC targets through the forward proxy.
+
+    Backs :func:`shared_plain_async_client` (issue #1834). That client serves
+    operator-configured, already-trusted targets: the login IdP token/userinfo
+    endpoints and the in-cluster registry vends. Two of those are public when the
+    IdP is hosted (Entra, Cognito, Auth0, Okta) and two are in-cluster by
+    construction, so the routing has to tell them apart.
+
+    Deliberately NOT a :class:`GuardedAsyncTransport` subclass, and deliberately
+    NOT pinning or denying. Its whole purpose is reaching targets the SSRF guard
+    rejects, such as an in-cluster ``http://keycloak:8080`` at a private address;
+    inheriting the guard would deny exactly the requests this client exists for.
+    Classification is used for the ROUTING decision alone, and
+    ``_resolves_exclusively_public_async`` never raises.
+
+    With the flag off this is byte-for-byte the previous behavior: no resolution,
+    no delegate, a direct dial.
+
+    Why this is needed at all: pooling the login callback behind an explicit
+    transport (commit 05bbd1a4) silently removed httpx's environment-proxy
+    support, because httpx applies its env-proxy mounts only when no custom
+    transport is supplied. Before that the callback used a bare
+    ``httpx.AsyncClient()``, which honored ``HTTPS_PROXY`` through the default
+    ``trust_env=True``. In a proxy-only network that regression is a complete
+    sign-in outage.
+    """
+
+    def __init__(
+        self,
+        **kwargs: object,
+    ) -> None:
+        self._init_proxy_delegates(kwargs)
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+
+    async def _proxy_url_for(
+        self,
+        request: httpx.Request,
+    ) -> str | None:
+        """Return the proxy to send this request through, or None for direct."""
+        config = _forward_proxy_config()
+        if not config.enabled:
+            return None
+
+        url = request.url
+        scheme = url.scheme
+        hostname = url.host
+        if not hostname:
+            return None
+        port = url.port or (443 if scheme == "https" else 80)
+
+        if _no_proxy_matches(config.no_proxy, hostname, port):
+            return None
+        proxy_url = config.https_proxy if scheme == "https" else config.http_proxy
+        if proxy_url is None:
+            return None
+
+        public = await _resolves_exclusively_public_async(hostname, port)
+        if public is not True:
+            # Internal, mixed, or unresolvable: stay direct. An in-cluster IdP and
+            # the registry vends land here, which is why they never depend on
+            # NO_PROXY being correct.
+            return None
+
+        # A public target on this client carries an operator client_secret (the
+        # IdP token POST), so refuse cleartext: httpcore's plain forward path
+        # sends the absolute URI and merges headers, handing the secret to the
+        # proxy. An in-cluster http IdP never reaches here, it resolved private.
+        if scheme != "https":
+            raise UrlValidationError(
+                str(url),
+                "refusing an http target through a forward proxy on the plain "
+                "egress client (an IdP token request carries a client secret, "
+                "which the proxy would see in cleartext). Use https, or add this "
+                "host to NO_PROXY so it is dialed directly",
+            )
+
+        _validate_proxy_url(proxy_url)
+        logger.debug("plain egress: routing %s via the forward proxy", hostname)
+        _record_egress_route("plain", "proxied", "ok")
+        return proxy_url
+
+    async def handle_async_request(
+        self,
+        request: httpx.Request,
+    ) -> httpx.Response:
+        proxy_url = await self._proxy_url_for(request)
+        if proxy_url is None:
+            return await super().handle_async_request(request)
+        return await self._proxy_delegate(proxy_url).handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._aclose_proxy_delegates()
+        await super().aclose()
 
 
 def guarded_client(
@@ -1151,3 +2224,174 @@ def guarded_async_client(
         timeout=resolved_timeout,
         **kwargs,  # type: ignore[arg-type]
     )
+
+
+# ---------------------------------------------------------------------------
+# Pooled, process-lifetime egress clients.
+# ---------------------------------------------------------------------------
+# The per-call ``guarded_async_client`` / ``httpx.AsyncClient(...)`` pattern opens
+# a fresh TCP+TLS connection for every egress request (no keep-alive reuse). The
+# accessors below return process-lifetime, connection-pooled clients safe to share
+# across requests and users:
+#   * SSRF safety is unchanged -- GuardedAsyncTransport validates + pins EVERY
+#     request before pool checkout, and the pool is keyed by the pinned IP, so a
+#     rebound hostname re-resolves to a new key and never reuses a stale connection.
+#     NOTE: because the pool key is the pinned IP (not the hostname), two different
+#     hostnames that both validate to the SAME public IP:port can coalesce onto one
+#     TLS connection whose cert was verified for whichever host opened it. This is
+#     safe -- each request is independently pinned and its Host header is correct,
+#     and reaching host C over host B's connection requires C to already resolve to
+#     that IP -- but it is a behavioral change vs the old per-call clients. Be precise
+#     about what is lost: cert scope is checked only for the hostname that OPENS the
+#     connection, since a reusing request performs no handshake. A request to C can
+#     therefore succeed over B's connection where C's own cert would have failed. Do
+#     NOT enable http2 on these clients (it would coalesce far more aggressively).
+#   * No shared default identity state -- no default auth headers (callers pass the
+#     credential per request). Cookie persistence is disabled via a no-store cookie
+#     jar (see _disable_cookie_persistence / _NoStoreCookieJar): a Set-Cookie is never
+#     stored, so it can never be replayed onto a later OR concurrent request sharing
+#     the client. Credentials never ride cookies on these paths, so this is
+#     defense-in-depth.
+# Timeouts are passed PER REQUEST at the call site; the client default is only a
+# fallback. Owned by each app's FastAPI lifespan (``aclose_shared_clients`` on
+# shutdown). ``verify`` is part of the key so a ``verify=False`` client can never be
+# reused where verification is expected.
+_shared_guarded_clients: dict[tuple[str, bool | str], httpx.AsyncClient] = {}
+_shared_plain_client: httpx.AsyncClient | None = None
+
+
+def _pool_limits() -> httpx.Limits:
+    s = _get_settings()
+    return httpx.Limits(
+        max_connections=s.egress_http_pool_max_connections,
+        max_keepalive_connections=s.egress_http_pool_max_keepalive,
+        keepalive_expiry=s.egress_http_pool_keepalive_expiry_seconds,
+    )
+
+
+class _NoStoreCookieJar(http.cookiejar.CookieJar):
+    """A cookie jar that silently drops every cookie.
+
+    Installing this on a pooled, shared client makes cookie handling stateless: a
+    ``Set-Cookie`` is never stored, so it can never be replayed onto a later or
+    concurrent request sharing the client. This is concurrency-safe by construction
+    (there is no shared cookie state to race), unlike clearing the jar after each
+    response. Credentials never ride cookies on the egress paths; this is
+    defense-in-depth against a future endpoint that sets one.
+    """
+
+    def set_cookie(self, cookie: http.cookiejar.Cookie) -> None:  # noqa: D102
+        return  # never persist
+
+
+def _disable_cookie_persistence(client: httpx.AsyncClient) -> httpx.AsyncClient:
+    """Swap in a no-store cookie jar so the shared client never persists cookies."""
+    client.cookies.jar = _NoStoreCookieJar()
+    return client
+
+
+def shared_guarded_async_client(
+    *,
+    profile: _Profile = SKILL_PROFILE,
+    verify: bool | str = True,
+) -> httpx.AsyncClient:
+    """Return a process-lifetime, connection-pooled, SSRF-guarded client, one per
+    ``(profile, verify)``. Pass the timeout PER REQUEST. Do NOT pass per-client
+    kwargs (``follow_redirects``/``base_url``/``headers``): a caller needing those
+    keeps its own instance client (see the federation clients)."""
+    key = (profile.name, verify)
+    client = _shared_guarded_clients.get(key)
+    if client is None or client.is_closed:
+        client = _disable_cookie_persistence(
+            httpx.AsyncClient(
+                transport=GuardedAsyncTransport(
+                    guard_profile=profile,
+                    verify=verify,
+                    retries=_get_settings().egress_http_pool_connect_retries,
+                    limits=_pool_limits(),
+                ),
+                timeout=_DEFAULT_TIMEOUT_SECONDS,
+            )
+        )
+        _shared_guarded_clients[key] = client
+    return client
+
+
+def shared_plain_async_client() -> httpx.AsyncClient:
+    """Return a process-lifetime, connection-pooled PLAIN (un-SSRF-guarded) client
+    for operator-configured, already-trusted targets ONLY: the in-cluster registry
+    egress-token vend and the login IdP token/userinfo endpoints (from
+    ``oauth2_providers.yml``, keyed by ``KEYCLOAK_URL`` etc.). Those are static
+    operator config -- they may be in-cluster and HTTP, so they cannot use the
+    HTTPS-only credentialed-OAuth guard -- and they are never request- or
+    stored-URL-derived. NEVER use this for a request/stored-URL-derived target (a
+    registrant proxy_pass_url, a federation peer): use ``shared_guarded_async_client``.
+
+    Forward-proxy aware since issue #1834. A HOSTED IdP (Entra, Cognito, Auth0,
+    Okta) is a public target, and in a proxy-only network a direct dial to it
+    times out, which is a complete sign-in outage. The transport therefore routes
+    a target that resolves exclusively to public addresses through the configured
+    proxy, and keeps everything else direct. No pinning and no SSRF denial are
+    added: an in-cluster ``http://keycloak:8080`` resolves private, so it stays
+    direct and needs no ``NO_PROXY`` entry, and nor do the registry vends."""
+    global _shared_plain_client
+    if _shared_plain_client is None or _shared_plain_client.is_closed:
+        _shared_plain_client = _disable_cookie_persistence(
+            httpx.AsyncClient(
+                transport=PlainProxyRoutedAsyncTransport(
+                    retries=_get_settings().egress_http_pool_connect_retries,
+                    limits=_pool_limits(),
+                ),
+                timeout=_DEFAULT_TIMEOUT_SECONDS,
+            )
+        )
+    return _shared_plain_client
+
+
+async def aclose_shared_clients() -> None:
+    """Close all pooled egress clients (call from each app's lifespan shutdown).
+    Accessors lazily rebuild the pool if used again afterwards."""
+    global _shared_plain_client
+    for client in list(_shared_guarded_clients.values()):
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            logger.debug("error closing a shared guarded client", exc_info=True)
+    _shared_guarded_clients.clear()
+    if _shared_plain_client is not None:
+        try:
+            await _shared_plain_client.aclose()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            logger.debug("error closing the shared plain client", exc_info=True)
+        _shared_plain_client = None
+
+
+def reset_shared_clients_for_tests() -> None:
+    """Drop pooled-client references without closing them (tests only)."""
+    global _shared_plain_client
+    _shared_guarded_clients.clear()
+    _shared_plain_client = None
+
+
+async def post_with_reconnect(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    on_reset: Callable[[], None] | None = None,
+    **kwargs: object,
+) -> httpx.Response:
+    """POST with a single transparent retry when a POOLED keep-alive connection was
+    closed server/LB-side while idle. httpx does not auto-retry a non-idempotent
+    POST on a half-open connection, so the first POST after an idle gap can raise
+    ``RemoteProtocolError``. The dominant case (peer sent FIN before the request was
+    written) is a clean re-POST; the rare residual (peer closed after processing)
+    re-POSTs into a terminal error that the caller fails closed on (never a silent
+    corruption). ``retries=`` on the transport covers connect failures; this covers
+    a reset on connection REUSE before the response. Streaming POSTs are NOT wrapped
+    (they are context managers); those rely on ``keepalive_expiry`` alone."""
+    try:
+        return await client.post(url, **kwargs)  # type: ignore[arg-type]
+    except httpx.RemoteProtocolError:
+        if on_reset is not None:
+            on_reset()
+        return await client.post(url, **kwargs)  # type: ignore[arg-type]

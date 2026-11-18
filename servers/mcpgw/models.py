@@ -4,6 +4,8 @@ These models define the data structures returned by the registry API
 and used by the MCP tools.
 """
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -20,6 +22,14 @@ class ServerInfo(BaseModel):
     enabled: bool = Field(..., alias="is_enabled", description="Whether the server is enabled")
     tags: list[str] = Field(default_factory=list, description="Server tags")
     tool_count: int | None = Field(None, alias="num_tools", description="Number of tools provided")
+    metadata: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Free-form metadata the registrant attached to the server, e.g. ownership "
+            "or provenance. Null unless the caller names the keys to return with "
+            "metadata_fields"
+        ),
+    )
 
 
 class AgentInfo(BaseModel):
@@ -29,6 +39,9 @@ class AgentInfo(BaseModel):
     description: str | None = Field(None, description="Agent description")
     tags: list[str] = Field(default_factory=list, description="Agent tags")
     created_at: str | None = Field(None, description="Creation timestamp")
+    metadata: dict[str, Any] | None = Field(
+        None, description="Free-form metadata the registrant attached to the agent"
+    )
 
 
 class SkillInfo(BaseModel):
@@ -42,6 +55,48 @@ class SkillInfo(BaseModel):
     tags: list[str] = Field(default_factory=list, description="Skill tags")
     target_agents: list[str] = Field(default_factory=list, description="Target agent platforms")
     created_at: str | None = Field(None, description="Creation timestamp")
+    health_status: str | None = Field(
+        None,
+        description="Result of the last SKILL.md reachability check: healthy, unhealthy, or unknown",
+    )
+    last_checked_time: str | None = Field(
+        None, description="When the registry last observed SKILL.md reachability"
+    )
+    metadata: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Skill metadata: author, version, and any free-form keys under extra, "
+            "e.g. ownership or provenance"
+        ),
+    )
+
+
+class CustomEntityInfo(BaseModel):
+    """A record of a custom catalog type the registry administrator defined.
+
+    Keeps the envelope fields an agent needs plus the type-specific attributes.
+    Access control lists (allowed_groups), per-user ratings (rating_details) and
+    proxy settings are dropped, matching how the other models slim their records.
+    """
+
+    model_config = {"populate_by_name": True}
+
+    path: str = Field(..., description="Record path, /{type}/{uuid}")
+    entity_type: str = Field(..., description="Name of the custom type")
+    name: str = Field(..., description="Display name of the record")
+    description: str | None = Field(None, description="Record description")
+    visibility: str | None = Field(None, description="Visibility (public, private or group)")
+    owner: str | None = Field(None, description="Username of the record owner")
+    tags: list[str] = Field(default_factory=list, description="Record tags")
+    enabled: bool | None = Field(
+        None, alias="is_enabled", description="Whether the record is enabled"
+    )
+    num_stars: float | None = Field(None, description="Average user rating (0-5)")
+    created_at: str | None = Field(None, description="Creation timestamp")
+    updated_at: str | None = Field(None, description="Last update timestamp")
+    attributes: dict[str, Any] = Field(
+        default_factory=dict, description="Fields defined by the record's custom type"
+    )
 
 
 class ToolSearchResult(BaseModel):

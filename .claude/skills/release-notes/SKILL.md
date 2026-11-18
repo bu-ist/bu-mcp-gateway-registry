@@ -98,8 +98,25 @@ git log {base_tag}..HEAD --oneline
 # Non-merge commits only (for detailed change analysis)
 git log {base_tag}..HEAD --oneline --no-merges
 
-# Merge commits (to extract PR numbers)
-git log {base_tag}..HEAD --oneline --grep="Merge pull request"
+# PR numbers in this release.
+#
+# DO NOT derive these from commit subjects. This repo is REBASE-AND-MERGE ONLY,
+# so there are no "Merge pull request" commits and no "(#NNNN)" suffixes:
+#   git log {base_tag}..HEAD --oneline --grep="Merge pull request"   -> 0 results
+#   git log {base_tag}..HEAD --oneline | grep -oE "\(#[0-9]+\)$"     -> 0 results
+# Those are the standard idioms on a squash-merge repo and they fail SILENTLY
+# here, returning an empty list that reads like "no PRs in this release".
+#
+# Enumerate from the GitHub API by merge time instead, and see the base-window
+# note below for which timestamp to use as the floor.
+gh pr list --state merged --limit 200 \
+  --json number,title,mergedAt,author,closingIssuesReferences \
+  --jq "sort_by(.number) | reverse | .[] | select(.mergedAt > \"$BASE_WINDOW\") | \"#\(.number)|\(.author.login)|\(.title)\""
+
+# Spot-check any individual PR's membership by ancestry, which is authoritative
+# regardless of merge strategy. Find the PR's commit on main by subject, then:
+#   git merge-base --is-ancestor <commit> {base_tag} && echo "already in {base_tag}"
+# Use this whenever a contributor asks why their PR is or is not listed.
 
 # Contributors -- direct authors of commits on main
 # WARNING: this misses co-authors of squash-merged PRs (Step 4 #10 explains).
@@ -110,7 +127,8 @@ git log {base_tag}..HEAD --format="%aN" | sort | uniq -c | sort -rn
 # the merger, so `git log` above will not show the actual code authors.
 # `gh pr view --json commits` returns the original branch commits with their
 # authors intact, which is the only reliable way to credit everyone.
-for pr in $(git log {base_tag}..HEAD --oneline --grep="Merge pull request\|(#[0-9]\+)$" | grep -oE "#[0-9]+" | tr -d '#' | sort -u); do
+# $PR_NUMBERS comes from the gh pr list call above, NOT from commit subjects.
+for pr in $PR_NUMBERS; do
   gh pr view $pr --json number,author,commits \
     --jq '"PR #\(.number) | opener: \(.author.login) | commit_authors: \([.commits[].authors[].name] | unique | join(", "))"' 2>/dev/null
 done
@@ -131,17 +149,23 @@ git diff {base_tag}..HEAD --stat -- 'charts/registry/' 'charts/auth-server/' 'ch
 # Helm chart dependency-list changes (separate signal: added/removed deps)
 git diff {base_tag}..HEAD -- charts/registry/Chart.yaml charts/auth-server/Chart.yaml charts/mcp-gateway-registry-stack/Chart.yaml charts/mcpgw/Chart.yaml
 
-# Closed issues since the base tag was cut
-# Use the base tag's date as the floor; gh issue list does not natively
-# support "closed-since-tag", so we filter by closedAt timestamp.
+# Establish the base window ONCE, and use the EARLIER of two timestamps.
+# The tag commit can be timestamped AFTER the GitHub release was published (seen
+# on 1.31.0: tag commit 2026-09-24T00:34:45Z, release published
+# 2026-09-23T22:34:13Z), in which case the tag-commit floor silently drops PRs
+# that belong in the new release. Taking the earlier of the two is inclusive, and
+# anything wrongly included is caught by the ancestry check above.
 BASE_TAG_DATE=$(git log -1 --format=%cI {base_tag})
+RELEASE_DATE=$(gh release view {base_tag} --json publishedAt --jq .publishedAt)
+BASE_WINDOW=$(printf '%s\n%s\n' "$BASE_TAG_DATE" "$RELEASE_DATE" | sort | head -1)
+echo "base window: $BASE_WINDOW"
 gh issue list --state closed --limit 200 --json number,title,closedAt,labels \
-  --jq ".[] | select(.closedAt >= \"$BASE_TAG_DATE\") | \"\(.number) | \(.title) | \(.closedAt)\""
+  --jq ".[] | select(.closedAt >= \"$BASE_WINDOW\") | \"\(.number) | \(.title) | \(.closedAt)\""
 
 # Closed issues referenced by merged PRs in this release (most reliable mapping)
 # For each PR number, the PR body usually has "Closes #N" or "Fixes #N" -- gh
 # resolves these via the closingIssuesReferences field.
-for pr in $(git log {base_tag}..HEAD --oneline --grep="Merge pull request" | grep -oE "#[0-9]+" | tr -d '#' | sort -u); do
+for pr in $PR_NUMBERS; do
   gh pr view $pr --json number,title,closingIssuesReferences \
     --jq '"\(.number) | \(.title) | closes: \(.closingIssuesReferences | map("#\(.number)") | join(","))"' 2>/dev/null
 done
@@ -395,18 +419,12 @@ After writing the release notes file:
 
 Once the user confirms the release notes are ready:
 
-1. **Confirm the new version appears in the `mkdocs.yml` Release Notes nav.** The nav uses a
-   single directory entry that auto-includes every file in `docs/release-notes/`:
-   ```yaml
-   - Release Notes:
-     - release-notes
-   ```
-   Because the whole directory is included automatically, **a new `docs/release-notes/{version}.md`
-   file needs no `mkdocs.yml` edit** — it is picked up on the next build. Verify with
-   `mkdocs build` (or check the built `site/release-notes/{version}/` directory exists) and
-   confirm no new build warnings were introduced. Do NOT hand-maintain a per-version nav list;
-   the directory entry owns ordering. If the maintainer later wants an explicit descending
-   order, that is a separate, deliberate `mkdocs.yml` change — not part of the routine release cut.
+1. **No navigation file needs editing.** There is no `mkdocs.yml` at the repo root; the only
+   one in the tree is under `.scratchpad/`, which is gitignored and unrelated. The published
+   site is built by `scripts/build_landing_page.py` (see `.github/workflows/docs.yml`), driven
+   by `README.md` and `landing/`, so a new `docs/release-notes/{version}.md` is picked up with
+   no nav change. Do NOT add `mkdocs.yml` to the release commit: it does not exist and `git add`
+   will fail.
 
 2. **Add a highlight entry and rotate the README's "What's New" (regrowth prevention).** The
    README's `## What's New` section holds **exactly the 5 most-recent highlights**; the full
@@ -417,48 +435,139 @@ Once the user confirms the release notes are ready:
      bullet format.
    - **Rotate the README:** add that same highlight as the new first bullet under `## What's New`
      in `README.md`, then **delete the now-sixth bullet** so exactly five remain (the dropped one
-     already lives in the archive — this is a delete, not a re-copy). Keep the
+     already lives in the archive, so this is a delete, not a re-copy). Keep the
      "Older highlights → Feature & Release Highlights" line in place.
    - This is the ONLY change the release cut makes to `README.md`. **Never add a new `##` section,
-     never let What's New exceed 5 bullets, and never touch any other part of the README** — those
+     never let What's New exceed 5 bullets, and never touch any other part of the README**. Those
      require their own dedicated PR. The README has a CI line-budget (350 lines) that will fail the
      build otherwise. A patch release with no user-facing feature skips this step entirely.
 
-3. **Commit the release notes, highlights, README rotation, and nav together:**
+3. **Open a PR; do not commit to `main`.** AGENTS.md requires branching first, and a direct
+   push to `main` bypasses the ~26 CI checks that gate everything else, including the README
+   line budget and the prose linter. Those are exactly the checks a release commit should face.
    ```bash
-   git add docs/release-notes/{version}.md docs/overview/feature-release-highlights.md README.md mkdocs.yml
-   git commit -m "docs: Add {version} release notes"
+   git checkout -b release/{version}
+   git add docs/release-notes/{version}.md docs/overview/feature-release-highlights.md README.md
+   git commit -m "docs: add {version} release notes"
+   git push -u origin release/{version}
+   gh pr create --base main --title "docs: add {version} release notes" --body-file <(...)
    ```
+   Wait for CI to pass, then merge. This repo is **rebase-and-merge only**, so a branch carrying
+   a merge commit cannot be merged; rebase and force-push instead.
 
-3. **Push the commit:**
+4. **Tag the merged notes commit and push the tag.** The image-tag bump PR does not exist
+   yet: `helm-chart-update.yml` runs on `workflow_run` of "Release Docker Images", which
+   only the tag push starts. So the order is tag, images, bump PR, merge, move the tag.
    ```bash
-   git push origin main
-   ```
-
-4. **Create or move the git tag** to point at this latest commit (which includes the release notes):
-   ```bash
-   # If tag already exists, delete it locally and remotely first
-   git tag -d {version} 2>/dev/null || true
-   git push origin :refs/tags/{version} 2>/dev/null || true
-
-   # Create tag on current HEAD (bare semver, no v prefix)
-   git tag {version}
-
-   # Push tag
+   git checkout main && git pull --ff-only origin main
+   git tag {version}            # lightweight: no -a, no -m
+   git cat-file -t {version}    # must print "commit"
    git push origin {version}
    ```
 
-5. **Verify:**
+   Create a LIGHTWEIGHT tag. Do not pass `-m` or `-a`: that makes an annotated tag object,
+   which every release tag in this repo is not. Pushing the tag triggers
+   `release-images.yml` ("Release Docker Images"), which builds the auth-server, registry
+   and mcpgw images for linux/amd64 and linux/arm64 and pushes them to ECR Public. Watch it
+   and stop if it fails:
    ```bash
-   git log --oneline -1
-   git tag -l {version} --format="%(refname:short) -> %(objectname:short)"
+   gh run list --workflow release-images.yml --limit 1 --json databaseId --jq '.[0].databaseId'
+   gh run watch <run-id> --exit-status
    ```
 
-6. Tell the user the release notes are committed and the tag is created and pushed.
+5. **Merge the image-tag bump PR.** When the image build succeeds, `helm-chart-update.yml`
+   opens `chore: update image tags to {version}` on the branch `release-update-{version}`.
+   It rewrites every `charts/*/values.yaml` image tag and the image defaults in
+   `terraform/aws-ecs/variables.tf` and `terraform/aws-ecs/modules/mcp-gateway/variables.tf`
+   from the previous version to this one.
+   ```bash
+   gh pr list --state open --json number,title,headRefName \
+     --jq '.[] | select(.headRefName == "release-update-{version}") | "#\(.number) \(.title)"'
+   gh pr diff <pr-number>          # expect only previous-version -> {version} lines
+   gh pr checks <pr-number> --watch
+   gh pr merge <pr-number> --rebase
+   ```
+
+   **This also changes what you write in Step 5.** The `git diff {base_tag}..HEAD -- charts/`
+   check runs before the bump PR exists, so it can report zero chart changes and tempt you
+   to write "you do not need to rebuild chart dependencies". That is wrong on any release
+   where the bump PR lands, because it rewrites five chart values files. The Helm upgrade
+   instructions MUST include `helm dependency build` and `helm dependency update`.
+
+6. **Move the tag onto the bump commit, and verify it moved.** Until it does, the tag
+   points at a commit whose charts and Terraform reference the PREVIOUS release's images,
+   and an operator who runs `git checkout {version}` then `helm upgrade` or
+   `terraform apply` installs the previous release (this happened on 1.32.1).
+
+   Merging the bump PR triggers `helm-release-retag.yml`, which is meant to move the tag.
+   Do not trust it: it skipped silently through 1.32.1 (fixed in #1857), and on 1.34.0 it
+   moved the tag on its runner but failed to push (`could not read Username`). Check where
+   the tag is, and move it yourself if it is not on the bump commit:
+   ```bash
+   git fetch --tags --force origin
+   git checkout main && git pull --ff-only origin main      # HEAD is the bump commit
+   git rev-parse --short {version}^{commit}                 # must equal HEAD
+
+   # If it does not, move it (lightweight again)
+   git tag -d {version}
+   git push origin :refs/tags/{version}
+   git tag {version} && git push origin {version}
+   ```
+
+   Moving the tag starts a second "Release Docker Images" run on the bump commit. That is
+   expected (1.33.0 and 1.34.0 both did it); wait for it to succeed. The bump workflow runs
+   again afterwards and opens no new PR, because the references are already current.
+
+7. **Verify:**
+   ```bash
+   git tag -l {version} --format="%(refname:short) -> %(objectname:short) (%(objecttype))"
+
+   # The tag must carry THIS version's image references, not the previous one's
+   git show {version}:charts/registry/values.yaml | grep -m1 'tag:'
+   git show {version}:terraform/aws-ecs/variables.tf | grep -m1 'registry:'
+
+   # The images must exist for both architectures
+   for img in registry auth-server mcpgw; do
+     docker manifest inspect public.ecr.aws/p3v1o3c6/$img:{version} >/dev/null && echo "$img ok"
+   done
+   ```
+
+8. **Publish the GitHub release page.** No workflow creates it. Use the release notes file
+   as the body and `{version} - {Short Title}` as the title, where the short title is the
+   notes file's H1 after "Release {version} - ". Run it only after the tag is on the bump
+   commit, so the release points at the final tag:
+   ```bash
+   gh release create {version} --verify-tag \
+     --title "{version} - {Short Title}" \
+     --notes-file docs/release-notes/{version}.md
+   gh release view {version} --json name,publishedAt,tagName
+   ```
+
+   Example from 1.34.0:
+   ```bash
+   gh release create 1.34.0 --verify-tag \
+     --title "1.34.0 - LiteLLM Removal, Entra Group Recovery, Embeddings Hardening, and a Trust-Store Update" \
+     --notes-file docs/release-notes/1.34.0.md
+   ```
+
+   This publishes the release and marks it Latest, so confirm with the user before running
+   it unless they have already asked for it.
+
+9. Tell the user the tag is on the bump commit, the images are published, and the release
+   page is live, with links.
 
 ## Important Rules
 
 - **Always run the Step 0 smoke-test gate first.** Confirm the end-to-end release smoke test (`tests/e2e_release_test.py`) was run and passed, or offer to run it. If it reports any FAILED test, STOP and do not cut the release. Only a user's explicit decision to skip may bypass this, and it must be warned about once.
+- **The release tag must end on the image-tag bump commit.** The bump PR only opens after
+  the tag push builds the images, so tag first, merge the `release-update-{version}` PR,
+  then make sure the tag moved onto it (Step 7.6). Do not trust `helm-release-retag.yml`
+  to move it: it skipped silently through 1.32.1 and failed to push on 1.34.0. A tag left on
+  the notes commit deploys the PREVIOUS release's images from charts and Terraform, which
+  is what went wrong on 1.32.1. Because the bump PR changes files under `charts/`, the Helm
+  upgrade instructions always need `helm dependency build` and `helm dependency update`.
+- **Always publish the GitHub release page** (Step 7.8) after the tag is final. Nothing
+  automates it.
 - **Never skip the user confirmation** for base version in Step 2. The user may want to create release notes that span multiple versions.
 - **Never include emojis** in the release notes file. The project CLAUDE.md prohibits emojis in documentation.
 - **Never include Claude Code attribution** or "Co-Authored-By" lines in commits.
@@ -467,6 +576,22 @@ Once the user confirms the release notes are ready:
 - **Always list breaking changes first** in the upgrade section -- this is the most critical information for operators.
 - **Always verify Helm Chart.yaml diffs** to detect dependency additions/removals -- these are the most common breaking changes for EKS users.
 - **Always check the full `charts/` tree diff**, not just `Chart.yaml`. If ANY file under `charts/` changed between base and HEAD, the upgrade instructions MUST include `helm dependency build` and `helm dependency update` for stack-chart consumers. The packaged `.tgz` subcharts inside `charts/mcp-gateway-registry-stack/charts/` are gitignored and only repackage when those commands run -- a plain `git pull` + `helm upgrade` will silently use stale subcharts.
+- **Never enumerate PRs from commit subjects.** This repo is rebase-and-merge
+  only, so there are no `Merge pull request` commits and no `(#NNNN)` suffixes.
+  Both standard idioms return an EMPTY list rather than an error, which reads
+  like "no PRs in this release" and is how a whole release nearly went out
+  undercounted. Enumerate with `gh pr list --state merged` filtered on
+  `mergedAt`, and verify any individual PR with
+  `git merge-base --is-ancestor <commit> <base_tag>`.
+- **Take the earlier of the tag-commit date and the release publication date**
+  as the base window. They are not the same and the tag commit can be the later
+  of the two (1.31.0: tag commit `2026-09-24T00:34:45Z`, release published
+  `2026-09-23T22:34:13Z`), so using the tag commit alone drops PRs that belong
+  in the new release.
+- **Check whether the version already exists before planning it.** `gh release
+  list` is the source of truth, not the `v1.0.x` tags in the local repo, which
+  are from the older scheme and look like the latest when sorted naively. A
+  request to "release 1.31.0" may be a request for the version after it.
 - **Always credit squash-merge co-authors.** `git log {base}..HEAD` only sees the squashed commit's single author, so co-authors on the source branch get dropped. Always also iterate every merged PR with `gh pr view <num> --json commits --jq '[.commits[].authors[].name] | unique'` and union the results into the contributor list.
 - **Never synthesize GitHub usernames from display names.** Resolve every login from a real PR (`gh pr view <num> --json author` for openers, or `.commits[].authors[].login` for co-authors), and verify uncertain ones with `gh api users/<candidate>` (404 = wrong guess). Past mistakes: "Amit Arora" -> `amitarora` (wrong; actual: `aarora79`); "Nathan Fernandes Pedroza" -> `nathanfernandes` (wrong; actual: `nathanzilgo`).
 

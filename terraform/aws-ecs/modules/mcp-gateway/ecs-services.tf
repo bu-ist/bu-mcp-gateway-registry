@@ -60,6 +60,13 @@ module "ecs_service_auth" {
     },
     var.enable_observability ? {
       AMPRemoteWrite = aws_iam_policy.adot_amp_write[0].arn
+    } : {},
+    # The OBO exchanged-token cache makes the auth-server a
+    # SecretStore client, but ONLY for its reserved "obo-cache" namespace. Attach
+    # the scoped policy (NOT the registry's full egress-vault grant) and only when
+    # the cache is enabled on the secrets-manager backend.
+    var.egress_auth_enabled && var.egress_obo_cache_enabled && var.egress_secret_store_backend == "secrets-manager" ? {
+      OboCacheVaultAccess = aws_iam_policy.ecs_auth_server_obo_cache_vault_access[0].arn
     } : {}
   )
 
@@ -194,6 +201,22 @@ module "ecs_service_auth" {
           value = var.entra_graph_base_url
         },
         {
+          name  = "ENTRA_GRAPH_RESOURCE_URL"
+          value = var.entra_graph_resource_url
+        },
+        {
+          name  = "ENTRA_BROWSER_USER_READ_ENABLED"
+          value = tostring(var.entra_browser_user_read_enabled)
+        },
+        {
+          name  = "ENTRA_GROUP_RECOVERY_ENABLED"
+          value = tostring(var.entra_group_recovery_enabled)
+        },
+        {
+          name  = "ENTRA_GROUP_CACHE_TTL_SECONDS"
+          value = tostring(var.entra_group_cache_ttl_seconds)
+        },
+        {
           name  = "ENTRA_SCOPE_FORMAT"
           value = var.entra_scope_format
         },
@@ -312,8 +335,16 @@ module "ecs_service_auth" {
           value = tostring(var.session_cookie_secure)
         },
         {
+          name  = "SESSION_MAX_AGE_SECONDS"
+          value = tostring(var.session_max_age_seconds)
+        },
+        {
           name  = "SESSION_COOKIE_DOMAIN"
           value = var.session_cookie_domain
+        },
+        {
+          name  = "SESSION_COOKIE_HOST_PREFIX"
+          value = tostring(var.session_cookie_host_prefix)
         },
         {
           # Exact-match allowlist of OAuth login/logout redirect URIs
@@ -321,6 +352,16 @@ module "ecs_service_auth" {
           # cookie-domain heuristic.
           name  = "OAUTH2_ALLOWED_REDIRECT_URIS"
           value = var.oauth2_allowed_redirect_uris
+        },
+        # The auth server mints MCP access tokens, so it reads the same TTL
+        # settings as the registry (auth_server/server.py).
+        {
+          name  = "MCP_TOKEN_DEFAULT_TTL_HOURS"
+          value = tostring(var.mcp_token_default_ttl_hours)
+        },
+        {
+          name  = "MCP_TOKEN_MAX_TTL_HOURS"
+          value = tostring(var.mcp_token_max_ttl_hours)
         },
         {
           name  = "TRUSTED_PROXY_HOPS"
@@ -592,8 +633,9 @@ module "ecs_service_auth" {
           name  = "OTEL_EXPORTER_OTLP_PROTOCOL"
           value = "grpc"
         },
-        # Per-user egress credential vault: auth-server only needs the feature
-        # flag and the internal vend URL (it does NOT touch the secret store).
+        # Per-user egress credential vault: auth-server needs the feature flag
+        # and the internal vend URL, plus  the secret-store backend
+        # env below once the OBO exchanged-token cache is enabled.
         # AUTH_SERVER_NGINX_MARKER_SECRET is injected via secrets/valueFrom below
         # (required unconditionally, not just for egress).
         {
@@ -609,6 +651,72 @@ module "ecs_service_auth" {
           # private-resolving token endpoint. Mirrors the registry container.
           name  = "EGRESS_OAUTH_TRUSTED_IDP_HOSTS"
           value = var.egress_oauth_trusted_idp_hosts
+        },
+        # Egress httpx client connection pooling (shared by url_guard). Keep the
+        # keepalive expiry below the shortest upstream/LB idle timeout.
+        {
+          name  = "EGRESS_HTTP_POOL_MAX_CONNECTIONS"
+          value = tostring(var.egress_http_pool_max_connections)
+        },
+        {
+          name  = "EGRESS_HTTP_POOL_MAX_KEEPALIVE"
+          value = tostring(var.egress_http_pool_max_keepalive)
+        },
+        {
+          name  = "EGRESS_HTTP_POOL_KEEPALIVE_EXPIRY_SECONDS"
+          value = tostring(var.egress_http_pool_keepalive_expiry_seconds)
+        },
+        {
+          name  = "EGRESS_HTTP_POOL_CONNECT_RETRIES"
+          value = tostring(var.egress_http_pool_connect_retries)
+        },
+        # SSRF guard for the generic proxy (PROXY_PROFILE): an operator CIDR may
+        # admit a reserved IPv4 address (e.g. Istio ServiceEntry VIPs in
+        # 240.240.0.0/16). Same value as the registry and mcpgw. #2018
+        {
+          name  = "SSRF_ALLOWED_CIDRS"
+          value = var.ssrf_allowed_cidrs
+        },
+        # Forward-proxy egress for the SSRF-guarded clients (issue #1832). OFF by
+        # default. HTTP_PROXY / HTTPS_PROXY / NO_PROXY are passed through the
+        # *_extra_env variables, not here, because they are standard environment
+        # variables rather than chart-managed ones.
+        {
+          name  = "EGRESS_FORWARD_PROXY_ENABLED"
+          value = tostring(var.egress_forward_proxy_enabled)
+        },
+        {
+          name  = "EGRESS_FORWARD_PROXY_CA_BUNDLE"
+          value = var.egress_forward_proxy_ca_bundle
+        },
+        # Enabling the OBO exchanged-token cache makes the
+        # auth-server a SecretStore client (previously only the registry was),
+        # so it now carries the same secret-store backend env as the registry.
+        {
+          name  = "SECRET_STORE_BACKEND"
+          value = var.egress_secret_store_backend
+        },
+        {
+          name  = "SECRETS_MANAGER_KMS_KEY_ID"
+          value = var.egress_secrets_manager_kms_key_id
+        },
+        {
+          name  = "SECRETS_MANAGER_PATH_PREFIX"
+          value = var.egress_secrets_manager_path_prefix
+        },
+        # Opt-in OBO exchanged-token cache. Default off keeps the
+        # stateless per-request exchange. Mirrors the registry container.
+        {
+          name  = "EGRESS_OBO_CACHE_ENABLED"
+          value = tostring(var.egress_obo_cache_enabled)
+        },
+        {
+          name  = "EGRESS_OBO_CACHE_MAX_TTL_SECONDS"
+          value = tostring(var.egress_obo_cache_max_ttl_seconds)
+        },
+        {
+          name  = "EGRESS_OBO_CACHE_EXPIRY_SKEW_SECONDS"
+          value = tostring(var.egress_obo_cache_expiry_skew_seconds)
         }
         ],
         # PR #947: MongoDB connection string override (plain-text variant).
@@ -710,6 +818,17 @@ module "ecs_service_auth" {
           {
             name      = "METRICS_API_KEY"
             valueFrom = aws_secretsmanager_secret.metrics_api_key[0].arn
+          }
+        ] : [],
+        # Application-layer encryption of cached OBO tokens: the same key the
+        # registry uses, injected only when an operator supplied one AND the OBO
+        # exchanged-token cache is enabled (the auth-server stores nothing
+        # otherwise). The auth task execution role already reads this secret via
+        # ecs_secrets_access.
+        var.egress_credential_encryption_key != "" && var.egress_obo_cache_enabled ? [
+          {
+            name      = "EGRESS_CREDENTIAL_ENCRYPTION_KEY"
+            valueFrom = aws_secretsmanager_secret.egress_credential_encryption_key[0].arn
           }
         ] : []
       )
@@ -1209,6 +1328,19 @@ module "ecs_service_registry" {
           name  = "EMBEDDINGS_RESPONSE_FORMAT"
           value = var.embeddings_response_format
         },
+        {
+          name  = "EMBEDDINGS_REQUEST_TIMEOUT_SECONDS"
+          value = tostring(var.embeddings_request_timeout_seconds)
+        },
+        {
+          name  = "EMBEDDINGS_MAX_RETRIES"
+          value = tostring(var.embeddings_max_retries)
+        },
+        {
+          # Empty when unset: the registry then uses the per-model default.
+          name  = "EMBEDDINGS_RETRY_MAX_INPUT_CHARS"
+          value = var.embeddings_retry_max_input_chars == null ? "" : tostring(var.embeddings_retry_max_input_chars)
+        },
         # Registration deduplication. Advisory check; never blocks
         # registration. Reuses the embeddings model above.
         {
@@ -1216,8 +1348,10 @@ module "ecs_service_registry" {
           value = tostring(var.dedup_registration_hint_enabled)
         },
         {
+          # Empty when unset: the registry then picks the default calibrated for
+          # the configured embeddings model rather than a global guess.
           name  = "DEDUP_SCORE_THRESHOLD"
-          value = tostring(var.dedup_score_threshold)
+          value = var.dedup_score_threshold == null ? "" : tostring(var.dedup_score_threshold)
         },
         {
           name  = "DEDUP_MAX_SUGGESTIONS"
@@ -1228,8 +1362,16 @@ module "ecs_service_registry" {
           value = tostring(var.session_cookie_secure)
         },
         {
+          name  = "SESSION_MAX_AGE_SECONDS"
+          value = tostring(var.session_max_age_seconds)
+        },
+        {
           name  = "SESSION_COOKIE_DOMAIN"
           value = var.session_cookie_domain
+        },
+        {
+          name  = "SESSION_COOKIE_HOST_PREFIX"
+          value = tostring(var.session_cookie_host_prefix)
         },
         {
           name  = "TRUSTED_PROXY_HOPS"
@@ -1252,6 +1394,12 @@ module "ecs_service_registry" {
           value = var.cors_allowed_origins
         },
         {
+          # Debug only: writes raw user search queries to the logs. Defaults to
+          # false; the registry warns at startup while it is on.
+          name  = "SEARCH_LOG_QUERY_TEXT"
+          value = tostring(var.search_log_query_text)
+        },
+        {
           name  = "SECURITY_SCAN_ENABLED"
           value = tostring(var.security_scan_enabled)
         },
@@ -1262,6 +1410,14 @@ module "ecs_service_registry" {
         {
           name  = "SECURITY_BLOCK_UNSAFE_SERVERS"
           value = tostring(var.security_block_unsafe_servers)
+        },
+        {
+          name  = "SECURITY_ALLOW_UNSAFE_SERVERS"
+          value = tostring(var.security_allow_unsafe_servers)
+        },
+        {
+          name  = "SECURITY_BLOCK_ON_SCAN_FAILURE"
+          value = tostring(var.security_block_on_scan_failure)
         },
         {
           name  = "SECURITY_ANALYZERS"
@@ -1552,6 +1708,35 @@ module "ecs_service_registry" {
         {
           name  = "SSRF_ALLOWED_CIDRS"
           value = var.ssrf_allowed_cidrs
+        },
+        # CIMD (Client ID Metadata Document) publisher (ships disabled by default)
+        {
+          name  = "CIMD_PUBLISHER_ENABLED"
+          value = tostring(var.cimd_publisher_enabled)
+        },
+        {
+          name  = "CIMD_CACHE_TTL"
+          value = tostring(var.cimd_cache_ttl)
+        },
+        {
+          name  = "CIMD_CLIENT_NAME"
+          value = var.cimd_client_name
+        },
+        {
+          name  = "CIMD_REDIRECT_URIS"
+          value = var.cimd_redirect_uris
+        },
+        {
+          name  = "CIMD_SCOPE"
+          value = var.cimd_scope
+        },
+        {
+          name  = "CIMD_LOGO_URI"
+          value = var.cimd_logo_uri
+        },
+        {
+          name  = "CIMD_CONTACTS"
+          value = var.cimd_contacts
         },
         # Gateway generic-proxy feature (ships disabled by default)
         {
@@ -1866,6 +2051,36 @@ module "ecs_service_registry" {
           name  = "EGRESS_STATE_TTL_SECONDS"
           value = tostring(var.egress_state_ttl_seconds)
         },
+        # Egress httpx client connection pooling (shared by url_guard). Keep the
+        # keepalive expiry below the shortest upstream/LB idle timeout.
+        {
+          name  = "EGRESS_HTTP_POOL_MAX_CONNECTIONS"
+          value = tostring(var.egress_http_pool_max_connections)
+        },
+        {
+          name  = "EGRESS_HTTP_POOL_MAX_KEEPALIVE"
+          value = tostring(var.egress_http_pool_max_keepalive)
+        },
+        {
+          name  = "EGRESS_HTTP_POOL_KEEPALIVE_EXPIRY_SECONDS"
+          value = tostring(var.egress_http_pool_keepalive_expiry_seconds)
+        },
+        {
+          name  = "EGRESS_HTTP_POOL_CONNECT_RETRIES"
+          value = tostring(var.egress_http_pool_connect_retries)
+        },
+        # Forward-proxy egress for the SSRF-guarded clients (issue #1832). OFF by
+        # default. HTTP_PROXY / HTTPS_PROXY / NO_PROXY are passed through the
+        # *_extra_env variables, not here, because they are standard environment
+        # variables rather than chart-managed ones.
+        {
+          name  = "EGRESS_FORWARD_PROXY_ENABLED"
+          value = tostring(var.egress_forward_proxy_enabled)
+        },
+        {
+          name  = "EGRESS_FORWARD_PROXY_CA_BUNDLE"
+          value = var.egress_forward_proxy_ca_bundle
+        },
         # obo_exchange target_audience allowlist (whitespace-separated). When set,
         # the authoritative positive control; when empty a shape rule applies
         # (api:// App ID URI / bare client-id only, no https host URLs), so shared
@@ -1873,6 +2088,20 @@ module "ecs_service_registry" {
         {
           name  = "EGRESS_OBO_ALLOWED_AUDIENCES"
           value = var.egress_obo_allowed_audiences
+        },
+        # Opt-in OBO exchanged-token cache in the per-user
+        # SecretStore. Default off keeps the stateless per-request exchange.
+        {
+          name  = "EGRESS_OBO_CACHE_ENABLED"
+          value = tostring(var.egress_obo_cache_enabled)
+        },
+        {
+          name  = "EGRESS_OBO_CACHE_MAX_TTL_SECONDS"
+          value = tostring(var.egress_obo_cache_max_ttl_seconds)
+        },
+        {
+          name  = "EGRESS_OBO_CACHE_EXPIRY_SKEW_SECONDS"
+          value = tostring(var.egress_obo_cache_expiry_skew_seconds)
         },
         # Hosts whose OAuth token endpoints may resolve to private addresses, for a
         # self-hosted IdP (Keycloak, Entra over Private Link). Exact hostnames only;
@@ -1891,14 +2120,6 @@ module "ecs_service_registry" {
         {
           name  = "SECRETS_MANAGER_PATH_PREFIX"
           value = var.egress_secrets_manager_path_prefix
-        },
-        {
-          name  = "MCP_TOKEN_DEFAULT_TTL_HOURS"
-          value = tostring(var.mcp_token_default_ttl_hours)
-        },
-        {
-          name  = "MCP_TOKEN_MAX_TTL_HOURS"
-          value = tostring(var.mcp_token_max_ttl_hours)
         },
         # Prevent AWS SDKs from falling back to EC2 IMDS. ECS delivers task-role
         # credentials through the container-credentials provider
@@ -1950,6 +2171,18 @@ module "ecs_service_registry" {
             value = var.registry_rum_allowed_hosts
           }
         ] : [],
+        # Runtime UI branding archive (base64 .tar.gz), extracted into
+        # /app/branding by the registry entrypoint. Only emitted when set, so
+        # a default deployment keeps the stock branding.
+        var.ui_branding_archive_b64 != "" ? [
+          {
+            name  = "UI_BRANDING_ARCHIVE_B64"
+            value = var.ui_branding_archive_b64
+          }
+        ] : [],
+        # Issue #1819: extra embeddings request headers. Empty list when the
+        # map is unset, so a default deployment gets no new variables.
+        local.embeddings_extra_header_env,
         # Extra environment variables from user (Issue #1000)
         var.registry_extra_env
       )
@@ -2518,6 +2751,36 @@ module "ecs_service_mcpgw" {
           # rejected with UNIMPLEMENTED. Disable the traces exporter. Issue #1326.
           name  = "OTEL_TRACES_EXPORTER"
           value = "none"
+        },
+        {
+          # Debug only: writes raw user search queries to the logs. Same variable
+          # the registry reads, so both containers agree. Issue #1752.
+          name  = "SEARCH_LOG_QUERY_TEXT"
+          value = tostring(var.search_log_query_text)
+        },
+        # Egress httpx client connection pooling (mcpgw registry API + Keycloak
+        # M2M hops). Keep the keepalive expiry below the shortest upstream/LB idle timeout.
+        {
+          name  = "EGRESS_HTTP_POOL_MAX_CONNECTIONS"
+          value = tostring(var.egress_http_pool_max_connections)
+        },
+        {
+          name  = "EGRESS_HTTP_POOL_MAX_KEEPALIVE"
+          value = tostring(var.egress_http_pool_max_keepalive)
+        },
+        {
+          name  = "EGRESS_HTTP_POOL_KEEPALIVE_EXPIRY_SECONDS"
+          value = tostring(var.egress_http_pool_keepalive_expiry_seconds)
+        },
+        {
+          name  = "EGRESS_HTTP_POOL_CONNECT_RETRIES"
+          value = tostring(var.egress_http_pool_connect_retries)
+        },
+        # SSRF guard: an operator CIDR may admit a reserved address (e.g. Istio
+        # ServiceEntry VIPs in 240.240.0.0/16). Same value as the registry. #2018
+        {
+          name  = "SSRF_ALLOWED_CIDRS"
+          value = var.ssrf_allowed_cidrs
         }
         ],
         # Extra environment variables from user (Issue #1000)

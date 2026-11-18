@@ -14,7 +14,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ===== BACKEND BUILD STAGE =====
-FROM python:3.14.7-slim AS backend-builder
+FROM python:3.14.9-slim AS backend-builder
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -33,7 +33,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 WORKDIR /app
 
 # Install uv and create venv (rarely changes)
-RUN pip install --no-cache-dir uv==0.11.14 && \
+RUN pip install --no-cache-dir uv==0.13.5 && \
     uv venv .venv --python 3.14
 
 # Copy dependency manifests FIRST so the install layer is cached on the
@@ -65,7 +65,7 @@ RUN . .venv/bin/activate && uv pip install --no-deps -e .
 # arrays would serialize as {}. Build OpenResty's lua-cjson against the same
 # LuaJIT the nginx lua module (nginx-extras) uses, so `require "cjson"` at
 # runtime resolves to a cjson that honors empty_array_mt.
-FROM python:3.14.7-slim AS cjson-builder
+FROM python:3.14.9-slim AS cjson-builder
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git build-essential libluajit-5.1-dev lua5.1 \
@@ -86,7 +86,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 
 # ===== FINAL RUNTIME STAGE =====
-FROM python:3.14.7-slim AS runtime
+FROM python:3.14.9-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -150,6 +150,10 @@ COPY --chown=appuser:appuser docker/lua/ /app/docker/lua/
 # Invoked daily by the registry entrypoint's background loop.
 COPY docker/logrotate-nginx.conf /etc/logrotate.d/nginx-mcp
 
+# Error page for the templates' `error_page 502 /502.html`. Without it nginx
+# turns every 502 (backend startup, auth-server failure) into a 404 (issue #1939).
+COPY docker/502.html /usr/share/nginx/html/502.html
+
 # Copy entrypoint early (rarely changes)
 COPY --chown=appuser:appuser docker/registry-entrypoint.sh /app/registry-entrypoint.sh
 RUN chmod +x /app/registry-entrypoint.sh
@@ -169,6 +173,9 @@ COPY --from=frontend-builder --chown=appuser:appuser /app/frontend/build /app/fr
 # Only chown directories that are created here (not covered by COPY --chown).
 # /app/logs is still created for audit logs (see settings.audit_log_path).
 # Application logs now go to /var/log/containers/ai-registry per issue #987.
+# /app/branding is the default UI branding folder (UI_BRANDING_DIR). It ships
+# empty; operators mount a folder over it or the entrypoint extracts
+# UI_BRANDING_ARCHIVE_B64 into it, so appuser must own it.
 #
 # The `sed` rewrites the nginx pid path at image-build time to a directory the
 # non-root appuser can write to. Doing this here (instead of in the entrypoint)
@@ -180,6 +187,7 @@ RUN mkdir -p /app/logs && \
     mkdir -p /app/certs && \
     mkdir -p /app/config && \
     mkdir -p /app/security_scans /app/skill_security_scans /app/agent_security_scans && \
+    mkdir -p /app/branding && \
     mkdir -p /etc/nginx/lua/virtual_mappings && \
     rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default && \
     mkdir -p /var/lib/nginx/body /var/lib/nginx/proxy /var/lib/nginx/fastcgi /var/lib/nginx/uwsgi /var/lib/nginx/scgi && \
@@ -187,7 +195,7 @@ RUN mkdir -p /app/logs && \
     mkdir -p /var/log/containers/ai-registry && \
     mkdir -p /run/nginx && \
     sed -i 's|pid /run/nginx.pid;|pid /run/nginx/nginx.pid;|' /etc/nginx/nginx.conf && \
-    chown -R appuser:appuser /app/logs /app/certs /app/config /app/security_scans /app/skill_security_scans /app/agent_security_scans /etc/nginx /var/log/nginx /var/log/containers/ai-registry /var/lib/nginx /run/nginx
+    chown -R appuser:appuser /app/logs /app/certs /app/config /app/branding /app/security_scans /app/skill_security_scans /app/agent_security_scans /etc/nginx /var/log/nginx /var/log/containers/ai-registry /var/lib/nginx /run/nginx
 
 # Expose ports for nginx (HTTP/HTTPS on high ports for non-root) and registry
 EXPOSE 8080 8443 7860

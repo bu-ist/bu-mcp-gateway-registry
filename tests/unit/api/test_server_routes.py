@@ -12,6 +12,7 @@ Tests the main server routes including:
 
 import json
 import logging
+from copy import deepcopy
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,6 +21,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.testclient import TestClient
 
 from registry.auth.internal import generate_internal_token
+from registry.schemas.registration_gate_models import RegistrationGateResult
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +144,9 @@ def mock_server_service():
         }
     )
     mock_service.update_server = AsyncMock(return_value=True)
+    # $unset companion to update_server: the edit routes call it to genuinely remove
+    # cleared credential fields, which a {"$set"} merge cannot express.
+    mock_service.remove_server_fields = AsyncMock(return_value=None)
     mock_service.remove_server = AsyncMock(return_value=True)
     mock_service.get_enabled_services = AsyncMock(return_value=[])
     mock_service.user_can_access_server_path = AsyncMock(return_value=True)
@@ -2965,6 +2970,117 @@ class TestServersRegisterAPIMetadata:
         assert any("coerced to {}" in rec.message for rec in caplog.records)
 
 
+@pytest.mark.unit
+@pytest.mark.api
+@pytest.mark.servers
+class TestServersRegisterAPIGateMetadata:
+    """Admission control must see the metadata that registration will persist."""
+
+    _BASE_FORM = {
+        "name": "Gate Metadata Server",
+        "description": "Registration gate metadata test",
+        "path": "/gate-metadata-server",
+        "proxy_pass_url": "http://localhost:9000",
+    }
+
+    @pytest.mark.parametrize(
+        ("metadata", "expected"),
+        [
+            (None, {}),
+            ("", {}),
+            ("{}", {}),
+            ("null", {}),
+            ("[]", {}),
+            ("42", {}),
+            (
+                '{"team":"platform","deployment":{"environment":"staging"}}',
+                {"team": "platform", "deployment": {"environment": "staging"}},
+            ),
+        ],
+        ids=["omitted", "empty", "object", "null", "array", "scalar", "nested"],
+    )
+    def test_gate_receives_normalized_metadata_before_registration(
+        self,
+        test_client_admin,
+        mock_server_service,
+        metadata: str | None,
+        expected: dict[str, Any],
+    ):
+        observed_payloads = []
+
+        async def _check_gate(**kwargs):
+            # The route mutates this dict later; snapshot it at the gate call.
+            observed_payloads.append(deepcopy(kwargs["registration_payload"]))
+            return RegistrationGateResult(allowed=True)
+
+        form = dict(self._BASE_FORM)
+        if metadata is not None:
+            form["metadata"] = metadata
+        with patch(
+            "registry.api.server_routes.check_registration_gate",
+            side_effect=_check_gate,
+        ) as gate:
+            response = test_client_admin.post("/api/servers/register", data=form)
+
+        assert response.status_code == 201
+        gate.assert_awaited_once()
+        assert observed_payloads[0]["metadata"] == expected
+        assert mock_server_service.register_server.call_args.args[0]["metadata"] == expected
+
+    def test_invalid_metadata_is_rejected_before_gate_or_persistence(
+        self,
+        test_client_admin,
+        mock_server_service,
+    ):
+        with patch(
+            "registry.api.server_routes.check_registration_gate",
+            return_value=RegistrationGateResult(allowed=True),
+        ) as gate:
+            response = test_client_admin.post(
+                "/api/servers/register",
+                data={**self._BASE_FORM, "metadata": '{"team":'},
+            )
+
+        assert response.status_code == 400
+        assert response.json()["error"] == "Invalid metadata"
+        gate.assert_not_awaited()
+        mock_server_service.register_server.assert_not_awaited()
+        mock_server_service.update_server.assert_not_awaited()
+
+    @pytest.mark.parametrize("overwrite", [False, True], ids=["create", "overwrite"])
+    def test_metadata_gate_denial_prevents_persistence(
+        self,
+        test_client_admin,
+        mock_server_service,
+        overwrite: bool,
+    ):
+        if overwrite:
+            mock_server_service.get_server_info.return_value = {
+                "path": self._BASE_FORM["path"],
+                "registered_by": "admin",
+            }
+        observed_payloads = []
+
+        async def _deny_gate(**kwargs):
+            observed_payloads.append(deepcopy(kwargs["registration_payload"]))
+            return RegistrationGateResult(allowed=False, error_message="Team is not approved")
+
+        with patch(
+            "registry.api.server_routes.check_registration_gate",
+            side_effect=_deny_gate,
+        ) as gate:
+            response = test_client_admin.post(
+                "/api/servers/register",
+                data={**self._BASE_FORM, "metadata": '{"team":"unapproved"}'},
+            )
+
+        assert response.status_code == 403
+        gate.assert_awaited_once()
+        assert observed_payloads[0]["metadata"] == {"team": "unapproved"}
+        mock_server_service.register_server.assert_not_awaited()
+        mock_server_service.update_server.assert_not_awaited()
+
+
 # =============================================================================
 # TESTS — Metadata round-trip on POST /api/internal/register (#1165 follow-up)
 # =============================================================================
@@ -3831,3 +3947,520 @@ class TestMetadataFieldsProjection:
         assert server["metadata"] == {
             "config": {"region": "us-east-1", "tier": "production"},
         }
+
+
+@pytest.mark.unit
+@pytest.mark.api
+@pytest.mark.servers
+class TestToggleTool:
+    """Tests for POST /toggle-tool/{service_path:path} endpoint."""
+
+    def test_block_tool_success(
+        self,
+        test_client_admin,
+        mock_server_service,
+        sample_server_info,
+    ):
+        """Blocking a tool that exists on the server succeeds."""
+        info = dict(sample_server_info)
+        info["tool_list"] = [{"name": "healthcheck"}, {"name": "list_services"}]
+        mock_server_service.get_server_info.return_value = info
+        mock_server_service.set_tool_blocked = AsyncMock(return_value=True)
+        mock_server_service.is_safe_override_key.return_value = True
+
+        with patch(
+            "registry.auth.dependencies.user_has_ui_permission_for_service", return_value=True
+        ):
+            response = test_client_admin.post(
+                "/api/toggle-tool/test-server",
+                json={"tool_name": "healthcheck", "enabled": False},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["enabled"] is False
+        args, kwargs = mock_server_service.set_tool_blocked.call_args
+        assert args[0] == "/test-server"
+        assert args[1] == "healthcheck"
+        assert args[2] is True  # blocked = not enabled
+        assert kwargs["source"] == "admin"
+
+    def test_unknown_tool_rejected(
+        self,
+        test_client_admin,
+        mock_server_service,
+        sample_server_info,
+    ):
+        """A tool not on the server's tool_list is a 400, not a write."""
+        info = dict(sample_server_info)
+        info["tool_list"] = [{"name": "healthcheck"}]
+        mock_server_service.get_server_info.return_value = info
+
+        with patch(
+            "registry.auth.dependencies.user_has_ui_permission_for_service", return_value=True
+        ):
+            response = test_client_admin.post(
+                "/api/toggle-tool/test-server",
+                json={"tool_name": "not_a_real_tool", "enabled": False},
+            )
+
+        assert response.status_code == 400
+        mock_server_service.set_tool_blocked.assert_not_called()
+
+    def test_unknown_server_is_404(
+        self,
+        test_client_admin,
+        mock_server_service,
+    ):
+        mock_server_service.get_server_info.return_value = None
+
+        with patch(
+            "registry.auth.dependencies.user_has_ui_permission_for_service", return_value=True
+        ):
+            response = test_client_admin.post(
+                "/api/toggle-tool/nope",
+                json={"tool_name": "healthcheck", "enabled": False},
+            )
+
+        assert response.status_code == 404
+
+
+# =============================================================================
+# A scan that could not complete is not an unsafe verdict.
+#
+# scan_server() reports is_safe=False with zero findings when it raises, so
+# branching on is_safe alone disabled servers the scanner never assessed.
+# Servers that cannot be scanned anonymously (per-user egress OAuth, say) fail
+# that way on every registration, which turned any edit to their definition
+# into an outage.
+# =============================================================================
+
+
+def _scan_result(*, scan_failed: bool, critical: int = 0, high: int = 0):
+    """Build an unsafe SecurityScanResult, either inconclusive or a real finding."""
+    from registry.schemas.security import SecurityScanResult
+
+    return SecurityScanResult(
+        server_url="https://example.internal/mcp",
+        server_path="/test-server",
+        scan_timestamp="2025-01-01T00:00:00Z",
+        is_safe=False,
+        critical_issues=critical,
+        high_severity=high,
+        medium_severity=0,
+        low_severity=0,
+        analyzers_used=["yara"],
+        raw_output={},
+        scan_failed=scan_failed,
+        error_message="security scan failed (RuntimeError)" if scan_failed else None,
+    )
+
+
+class TestScanFailureDoesNotDisableServer:
+    """block_unsafe_servers must act on verdicts, not on scanner errors."""
+
+    @staticmethod
+    def _config(*, block_unsafe: bool = True, block_on_failure: bool = False):
+        from registry.schemas.security import SecurityScanConfig
+
+        return SecurityScanConfig(
+            enabled=True,
+            scan_on_registration=True,
+            block_unsafe_servers=block_unsafe,
+            add_security_pending_tag=True,
+            block_on_scan_failure=block_on_failure,
+        )
+
+    async def _run(self, scan_result, scan_config):
+        """Drive the post-registration scan helper with everything mocked."""
+        from registry.api.server_routes import _perform_security_scan_on_registration
+
+        scanner = MagicMock()
+        scanner.get_scan_config.return_value = scan_config
+        scanner.scan_server = AsyncMock(return_value=scan_result)
+
+        service = MagicMock(
+            update_server=AsyncMock(return_value=True),
+            toggle_service=AsyncMock(return_value=True),
+        )
+        search_repo = MagicMock(index_server=AsyncMock())
+        scheduler = MagicMock(mark_dirty=MagicMock())
+
+        with (
+            patch("registry.api.server_routes.security_scanner_service", new=scanner),
+            patch("registry.api.server_routes.server_service", new=service),
+            patch("registry.api.server_routes.fire_scan_complete_event", MagicMock()),
+            patch(
+                "registry.repositories.factory.get_search_repository",
+                return_value=search_repo,
+            ),
+            patch("registry.core.nginx_service.nginx_reload_scheduler", new=scheduler),
+        ):
+            await _perform_security_scan_on_registration(
+                "/test-server",
+                "https://example.internal/mcp",
+                {"tags": [], "server_name": "test"},
+            )
+
+        return service, search_repo, scheduler
+
+    @pytest.mark.asyncio
+    async def test_failed_scan_leaves_server_enabled(self):
+        """A scan that raised must not disable the server."""
+        service, _, scheduler = await self._run(_scan_result(scan_failed=True), self._config())
+
+        service.toggle_service.assert_not_awaited()
+        scheduler.mark_dirty.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_scan_still_tags_security_pending(self):
+        """The warning must stay visible even though the server stays up."""
+        service, _, _ = await self._run(_scan_result(scan_failed=True), self._config())
+
+        service.update_server.assert_awaited_once()
+        _, entry = service.update_server.await_args.args
+        assert "security-pending" in entry["tags"]
+
+    @pytest.mark.asyncio
+    async def test_real_finding_still_disables_server(self):
+        """Regression guard: an actual critical finding must still block."""
+        service, search_repo, scheduler = await self._run(
+            _scan_result(scan_failed=False, critical=1), self._config()
+        )
+
+        service.toggle_service.assert_awaited_once_with("/test-server", False)
+        search_repo.index_server.assert_awaited_once()
+        scheduler.mark_dirty.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_block_on_scan_failure_restores_fail_closed(self):
+        """Operators who want strict fail-closed registration can opt back in."""
+        service, _, _ = await self._run(
+            _scan_result(scan_failed=True),
+            self._config(block_on_failure=True),
+        )
+
+        service.toggle_service.assert_awaited_once_with("/test-server", False)
+
+
+# =============================================================================
+# TESTS — Metadata size and nesting limits on every form route (Issue #1811)
+# =============================================================================
+
+
+def _metadata_of_size(total_bytes: int) -> dict[str, str]:
+    """Return metadata whose compact UTF-8 JSON is exactly ``total_bytes``."""
+    # '{"k":""}' is 8 bytes of envelope around the value.
+    return {"k": "x" * (total_bytes - 8)}
+
+
+def _metadata_of_depth(depth: int) -> dict[str, Any]:
+    """Return metadata nested exactly ``depth`` containers deep."""
+    doc: dict[str, Any] = {"leaf": "value"}
+    for _ in range(depth - 1):
+        doc = {"n": doc}
+    return doc
+
+
+_AT_SIZE_LIMIT = _metadata_of_size(10240)
+_OVER_SIZE_LIMIT = _metadata_of_size(10241)
+_AT_DEPTH_LIMIT = _metadata_of_depth(8)
+_OVER_DEPTH_LIMIT = _metadata_of_depth(9)
+
+
+@pytest.mark.unit
+@pytest.mark.api
+@pytest.mark.servers
+class TestFormRouteMetadataLimits:
+    """Every form route that writes server metadata enforces the #1811 limits.
+
+    These routes parse metadata from a JSON string, so no Pydantic model sees
+    it; each one must check the limits itself and answer 422 before the
+    registration gate runs or anything is persisted.
+    """
+
+    _BASE_FORM = {
+        "name": "Limits Server",
+        "description": "Metadata limits test",
+        "path": "/limits-server",
+        "proxy_pass_url": "http://localhost:9000",
+    }
+
+    @staticmethod
+    def _stored(mock_server_service):
+        call_args = mock_server_service.register_server.call_args
+        return call_args.args[0] if call_args.args else call_args.kwargs.get("server_entry")
+
+    def _post_servers_register(self, client, metadata):
+        return client.post(
+            "/api/servers/register",
+            data={**self._BASE_FORM, "metadata": json.dumps(metadata)},
+        )
+
+    def _post_legacy_register(self, client, metadata):
+        with patch(
+            "registry.auth.dependencies.user_has_ui_permission_for_service",
+            return_value=True,
+        ):
+            return client.post(
+                "/api/register",
+                data={**self._BASE_FORM, "metadata": json.dumps(metadata)},
+            )
+
+    def _post_internal_register(self, client, metadata):
+        with (
+            patch.dict("os.environ", {"SECRET_KEY": "testpass"}),
+            patch("registry.utils.scopes_manager.update_server_scopes", new_callable=AsyncMock),
+        ):
+            token = generate_internal_token(subject="test-service", purpose="test")
+            return client.post(
+                "/api/internal/register",
+                data={**self._BASE_FORM, "metadata": json.dumps(metadata)},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [_AT_SIZE_LIMIT, _AT_DEPTH_LIMIT],
+        ids=["exactly-10240-bytes", "exactly-8-levels"],
+    )
+    def test_servers_register_accepts_metadata_at_the_limit(
+        self, test_client_admin, mock_server_service, metadata
+    ):
+        response = self._post_servers_register(test_client_admin, metadata)
+
+        assert response.status_code == 201
+        assert self._stored(mock_server_service)["metadata"] == metadata
+
+    @pytest.mark.parametrize(
+        ("metadata", "message"),
+        [
+            (_OVER_SIZE_LIMIT, "10241 bytes"),
+            (_OVER_DEPTH_LIMIT, "nests 9 levels deep"),
+        ],
+        ids=["one-byte-over", "nine-levels"],
+    )
+    def test_servers_register_rejects_metadata_over_the_limit(
+        self, test_client_admin, mock_server_service, metadata, message
+    ):
+        with patch("registry.api.server_routes.check_registration_gate") as gate:
+            response = self._post_servers_register(test_client_admin, metadata)
+
+        assert response.status_code == 422
+        assert message in response.json()["reason"]
+        gate.assert_not_called()
+        mock_server_service.register_server.assert_not_called()
+
+    def test_legacy_register_accepts_metadata_at_the_limit(
+        self, test_client_admin, mock_server_service
+    ):
+        response = self._post_legacy_register(test_client_admin, _AT_SIZE_LIMIT)
+
+        assert response.status_code == 201
+        assert self._stored(mock_server_service)["metadata"] == _AT_SIZE_LIMIT
+
+    @pytest.mark.parametrize(
+        ("metadata", "message"),
+        [
+            (_OVER_SIZE_LIMIT, "over the limit of 10240 bytes"),
+            (_OVER_DEPTH_LIMIT, "over the limit of 8"),
+        ],
+        ids=["one-byte-over", "nine-levels"],
+    )
+    def test_legacy_register_rejects_metadata_over_the_limit(
+        self, test_client_admin, mock_server_service, metadata, message
+    ):
+        response = self._post_legacy_register(test_client_admin, metadata)
+
+        assert response.status_code == 422
+        assert message in response.json()["detail"]
+        mock_server_service.register_server.assert_not_called()
+
+    def test_internal_register_accepts_metadata_at_the_limit(
+        self, test_client_no_auth, mock_server_service
+    ):
+        response = self._post_internal_register(test_client_no_auth, _AT_DEPTH_LIMIT)
+
+        assert response.status_code == 201
+        assert self._stored(mock_server_service)["metadata"] == _AT_DEPTH_LIMIT
+
+    def test_internal_register_rejects_metadata_over_the_limit(
+        self, test_client_no_auth, mock_server_service
+    ):
+        response = self._post_internal_register(test_client_no_auth, _OVER_SIZE_LIMIT)
+
+        assert response.status_code == 422
+        assert "over the limit of 10240 bytes" in response.json()["reason"]
+        mock_server_service.register_server.assert_not_called()
+
+    # Raw form strings, not dicts: these must reach the route as the client sent them.
+    _SURROGATE_RAW = '{"k": "\\ud800"}'
+    _UNDECODABLE_DEPTH_RAW = '{"a": ' + "[" * 100_000 + "]" * 100_000 + "}"
+
+    def _post_raw(self, client, url, raw, **kwargs):
+        return client.post(url, data={**self._BASE_FORM, "metadata": raw}, **kwargs)
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [
+            (_SURROGATE_RAW, ("not valid Unicode",)),
+            (_UNDECODABLE_DEPTH_RAW, ("too deeply to decode", "over the limit of 8")),
+        ],
+        ids=["unpaired-surrogate", "decoder-recursion"],
+    )
+    def test_servers_register_rejects_malformed_metadata_with_422(
+        self, test_client_admin, mock_server_service, raw, message
+    ):
+        response = self._post_raw(test_client_admin, "/api/servers/register", raw)
+
+        assert response.status_code == 422
+        assert any(fragment in response.json()["reason"] for fragment in message)
+        mock_server_service.register_server.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [
+            (_SURROGATE_RAW, ("not valid Unicode",)),
+            (_UNDECODABLE_DEPTH_RAW, ("too deeply to decode", "over the limit of 8")),
+        ],
+        ids=["unpaired-surrogate", "decoder-recursion"],
+    )
+    def test_legacy_register_rejects_malformed_metadata_with_422(
+        self, test_client_admin, mock_server_service, raw, message
+    ):
+        with patch(
+            "registry.auth.dependencies.user_has_ui_permission_for_service",
+            return_value=True,
+        ):
+            response = self._post_raw(test_client_admin, "/api/register", raw)
+
+        assert response.status_code == 422
+        assert any(fragment in response.json()["detail"] for fragment in message)
+        mock_server_service.register_server.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [
+            (_SURROGATE_RAW, ("not valid Unicode",)),
+            (_UNDECODABLE_DEPTH_RAW, ("too deeply to decode", "over the limit of 8")),
+        ],
+        ids=["unpaired-surrogate", "decoder-recursion"],
+    )
+    def test_internal_register_rejects_malformed_metadata_with_422(
+        self, test_client_no_auth, mock_server_service, raw, message
+    ):
+        with (
+            patch.dict("os.environ", {"SECRET_KEY": "testpass"}),
+            patch("registry.utils.scopes_manager.update_server_scopes", new_callable=AsyncMock),
+        ):
+            token = generate_internal_token(subject="test-service", purpose="test")
+            response = self._post_raw(
+                test_client_no_auth,
+                "/api/internal/register",
+                raw,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert response.status_code == 422
+        assert any(fragment in response.json()["reason"] for fragment in message)
+        mock_server_service.register_server.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [
+            (_SURROGATE_RAW, ("not valid Unicode",)),
+            (_UNDECODABLE_DEPTH_RAW, ("too deeply to decode", "over the limit of 8")),
+        ],
+        ids=["unpaired-surrogate", "decoder-recursion"],
+    )
+    def test_edit_rejects_malformed_metadata_with_422(
+        self, test_client_admin, mock_server_service, raw, message
+    ):
+        mock_server_service.get_server_info.return_value = {
+            "server_name": "Existing Remote",
+            "description": "http",
+            "path": "/remote-srv",
+            "deployment": "remote",
+            "proxy_pass_url": "http://upstream:9000",
+            "tags": [],
+            "auth_scheme": "none",
+            "registered_by": "admin",
+        }
+
+        response = test_client_admin.post(
+            "/api/edit/remote-srv",
+            headers={"accept": "application/json"},
+            data={
+                "name": "Existing Remote",
+                "description": "updated",
+                "proxy_pass_url": "http://upstream:9000",
+                "metadata": raw,
+            },
+        )
+
+        assert response.status_code == 422
+        assert any(fragment in response.json()["detail"] for fragment in message)
+        mock_server_service.update_server.assert_not_called()
+
+    def test_servers_register_keeps_400_for_invalid_json(
+        self, test_client_admin, mock_server_service
+    ):
+        """Decoding through the new helper must not change the invalid-JSON response."""
+        response = self._post_raw(test_client_admin, "/api/servers/register", "{not json")
+
+        assert response.status_code == 400
+        assert response.json()["reason"] == "metadata must be valid JSON"
+        mock_server_service.register_server.assert_not_called()
+
+    def test_edit_rejects_metadata_over_the_limit(self, test_client_admin, mock_server_service):
+        mock_server_service.get_server_info.return_value = {
+            "server_name": "Existing Remote",
+            "description": "http",
+            "path": "/remote-srv",
+            "deployment": "remote",
+            "proxy_pass_url": "http://upstream:9000",
+            "tags": [],
+            "auth_scheme": "none",
+            "registered_by": "admin",
+        }
+
+        response = test_client_admin.post(
+            "/api/edit/remote-srv",
+            headers={"accept": "application/json"},
+            data={
+                "name": "Existing Remote",
+                "description": "updated",
+                "proxy_pass_url": "http://upstream:9000",
+                "metadata": json.dumps(_OVER_DEPTH_LIMIT),
+            },
+        )
+
+        assert response.status_code == 422
+        assert "nests 9 levels deep" in response.json()["detail"]
+        mock_server_service.update_server.assert_not_called()
+
+    def test_edit_accepts_metadata_at_the_limit(self, test_client_admin, mock_server_service):
+        mock_server_service.get_server_info.return_value = {
+            "server_name": "Existing Remote",
+            "description": "http",
+            "path": "/remote-srv",
+            "deployment": "remote",
+            "proxy_pass_url": "http://upstream:9000",
+            "tags": [],
+            "auth_scheme": "none",
+            "registered_by": "admin",
+        }
+        mock_server_service.is_service_enabled.return_value = True
+
+        response = test_client_admin.post(
+            "/api/edit/remote-srv",
+            headers={"accept": "application/json"},
+            data={
+                "name": "Existing Remote",
+                "description": "updated",
+                "proxy_pass_url": "http://upstream:9000",
+                "metadata": json.dumps(_AT_SIZE_LIMIT),
+            },
+        )
+
+        assert response.status_code == 200
+        assert mock_server_service.update_server.call_args[0][1]["metadata"] == _AT_SIZE_LIMIT

@@ -18,6 +18,9 @@ from pathlib import Path
 from ..core.config import settings
 from ..repositories.factory import get_skill_security_scan_repository
 from ..schemas.skill_security import SkillSecurityScanConfig, SkillSecurityScanResult
+from .scanner_llm_analyzer import (
+    ensure_llm_analyzer_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,7 @@ class SkillScannerService:
             ai_defense_api_key=settings.skill_scanner_ai_defense_api_key
             or os.getenv("AI_DEFENSE_API_KEY"),
             add_security_pending_tag=settings.skill_security_add_pending_tag,
+            block_on_scan_failure=settings.security_block_on_scan_failure,
         )
 
     async def scan_skill(
@@ -94,6 +98,7 @@ class SkillScannerService:
         logger.info(f"Starting skill security scan for {skill_path} with analyzers: {analyzers}")
 
         try:
+            ensure_llm_analyzer_available(analyzers, "SKILL_SECURITY_ANALYZERS")
             raw_output = await asyncio.to_thread(
                 self._run_skill_scanner,
                 skill_path=skill_path,

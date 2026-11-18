@@ -73,6 +73,15 @@ sanitizer that isn't called) is equivalent to no check.
   config; the application code must never supply it as a default.
 - **Example credentials in help text/docs must be unmistakably fake** (`YOUR_*`,
   `EXAMPLE_*`). Do not alter functional lookup keys that merely resemble IDs.
+- **An IdP setup hook must not rotate OAuth client secrets during an ordinary
+  upgrade.** Pods read Kubernetes Secrets only at startup; rotating a Keycloak
+  web-client secret after the auth-server rollout leaves live pods holding a
+  stale credential, so browser code exchange fails with HTTP 401 while direct
+  password-grant tests using the newly written Secret still pass. Read the
+  existing IdP credential and synchronize the Kubernetes Secret without
+  rotation; treat intentional rotation as a separate coordinated rollout.
+  Never print bootstrap passwords in Job logs or pass them on kubectl argv —
+  deliver Secret data through stdin instead.
 - **Never log secrets, tokens, PII, or full credential/claim payloads.** Redact
   before logging; log identifiers/counts, not values. Watch: request-header
   dumps, `updates`/body dicts that contain tokens, decoded id_token claims. This
@@ -83,7 +92,12 @@ sanitizer that isn't called) is equivalent to no check.
   log the size + method/id, never the body. (b) **OAuth token-endpoint error
   bodies** (`response.text` / the full error JSON, logged OR raised) — they echo
   the `client_id` and partial credential context in `error_description`; log only
-  the standard `error` code + status. (c) **IdP group-name lists** — group names
+  the standard `error` code + status. One exception is recorded: Keycloak's
+  token-exchange `invalid_request` covers both an expired subject token and
+  configuration faults, and only its `error_description` tells them apart.
+  `auth_server/egress_obo.py` logs that one field for that one code, through
+  `_sanitize_idp_text` (non-printable characters replaced, 200-character cap),
+  and never returns it to the caller. (c) **IdP group-name lists**: group names
   are organizational PII (org units, teams, cost centers); log the count, not the
   names. A "masked" token prefix is still a leak — a base64 JWT header/signature
   fragment is reconstructable; log `<token len=N>`, not `token[:10]`. (d) **A
@@ -103,7 +117,23 @@ sanitizer that isn't called) is equivalent to no check.
   INFO in production; the `# TODO: replace with debug` marker means it was never
   meant to ship at that level. After fixing the reported site, grep the whole
   package for the same variable/pattern — these leaks travel in packs across
-  health-check, connection, and registration code paths.
+  health-check, connection, and registration code paths. (f) **User-supplied free
+  text** (a search query, a description, a prompt) is not loggable by default at
+  any level, DEBUG included. A search query holds whatever a person typed: a
+  customer name, an email address, an account number, an unannounced project. A
+  keyword denylist does not redact it, because the sensitive part is the value the
+  user typed and no denylist word appears in `invoices for jane.doe@acme.com`. Nor
+  does a partial mask (short queries are reconstructable) or a digest (a query
+  carries little entropy, so an unsalted hash falls to a wordlist). Log the token
+  count and the stage flag instead. Derived forms leak the same text: tokenized
+  query lists and a `token_regex` built by joining those tokens ARE the query minus
+  stopwords, so redacting `query` while logging either of them redacts nothing.
+  When an operator genuinely needs the text to explain a result, put it behind a
+  dangerous-toggle flag defaulting to off (`SEARCH_LOG_QUERY_TEXT`), on ONE guarded
+  line per service rather than a conditional inside each existing log call, and
+  warn at startup while it is enabled so it is not left on. Grep every service that
+  handles the same input: one process silencing the query while a second still logs
+  it leaves the text in the logs while an operator believes the flag stopped it.
 - **Never reflect an exception/stack trace into a response the caller sees**
   (CWE-209, CodeQL `py/stack-trace-exposure`). `HTTPException(detail=str(e))`,
   `return {"error": str(e)}` from a route, and `HTMLResponse(f"...{exc}...")` all
@@ -143,6 +173,35 @@ sanitizer that isn't called) is equivalent to no check.
   Alibaba ECS `100.100.100.200` — never allowlistable); unwrap scoped,
   IPv4-mapped, NAT64, 6to4, and Teredo forms before classification; require
   http/https. Fail closed. Do not create per-call-site `_is_safe_url` variants.
+- **Relax reserved space only for IPv4, and only from an operator range.** Istio
+  auto-allocates ServiceEntry addresses from `240.240.0.0/16`, which Python
+  classifies as reserved, so an operator `SSRF_ALLOWED_CIDRS` entry may admit a
+  reserved IPv4 address inside it (#2018). Exclude limited broadcast
+  `255.255.255.255`. Never relax reserved IPv6: IPv4-compatible `::a.b.c.d`, SIIT
+  `::ffff:0:a.b.c.d` and RFC 8215 local-use NAT64 `64:ff9b:1::/48` carry an IPv4
+  address the guard does not unwrap, so a broad `::/0` entry would reach IMDS
+  (`64:ff9b:1::a9fe:a9fe`). Pass only the operator's CIDRs to this check, never
+  the exact `/32` added for a trusted hostname, and never let `allow_private`
+  stand in for it. Every process that runs the guard (registry, auth-server,
+  mcpgw) must receive the same `SSRF_ALLOWED_CIDRS` value. Feed a value like this
+  from one source per surface: in Helm, a `global.*` key the subcharts read first
+  (`.Values.global.X | default .Values.app.X`), as `secretKey` does, so a
+  per-subchart key cannot drift from it.
+- **Compare reserved env names case-insensitively.** pydantic-settings reads the
+  environment with `case_sensitive=False`, so a Helm `extraEnv` entry named
+  `ssrf_allowed_cidrs` overrides the chart-managed `SSRF_ALLOWED_CIDRS` in the
+  registry while mcpgw (`os.getenv`) ignores it. Each chart's `validateExtraEnv`
+  compares names through `<chart>.envNameKey` (trimmed, upper-cased) for the
+  reserved check. Keys inside an `extraEnvFrom` source or `app.existingSecret`
+  cannot be checked at render time: a lowercase `ssrf_allowed_cidrs` there sits
+  beside the chart's `SSRF_ALLOWED_CIDRS`, and which one pydantic keeps depends on
+  the order the kubelet writes the container's environment, which the operator
+  does not control. Never put a lowercase copy of a chart-managed name
+  in those sources. The duplicate check stays exact, because `HTTPS_PROXY` and
+  `https_proxy` are two variables and proxy setups set both. Feed a
+  security-relevant chart value through `env:`, not a chart ConfigMap read via
+  `envFrom`: a user `extraEnvFrom` source renders later and wins over `envFrom`,
+  but never over `env:`.
 - **Don't rely on the language runtime's `is_private` to cover reserved ranges —
   block them explicitly and pin the range in a test.** Ranges like CGNAT / shared
   address space (`100.64.0.0/10`, RFC 6598) are only classified private on newer
@@ -157,6 +216,15 @@ sanitizer that isn't called) is equivalent to no check.
   time.** A pre-fetch check followed by a separate client call re-resolves DNS =
   TOCTOU / DNS-rebinding. Pin the validated public IP into the transport
   (preserve Host header + TLS SNI) and re-validate on every redirect hop.
+- **A delegated Microsoft Graph token needs a Graph-specific egress profile.**
+  The bearer fetch must require HTTPS and use the pinned guarded transport,
+  not a peer-federation policy whose name hides a different trust boundary.
+  When an operator sets `ENTRA_GRAPH_BASE_URL` to a private reverse proxy,
+  allow only that exact hostname to resolve private; never inherit server
+  proxy CIDRs or OAuth IdP allowlists. Check every DNS answer, refuse cloud
+  metadata and link-local addresses, and keep Graph page links on the same
+  HTTPS origin and path. Obtain the token for the login cloud's Graph resource,
+  not the private proxy hostname.
 - **Re-validate the destination through the SSRF guard at the moment a stored
   credential is attached.** Registration-time validation is not enough when the
   destination is mutable — a `proxy_pass_url`/endpoint changed after registration
@@ -173,12 +241,72 @@ sanitizer that isn't called) is equivalent to no check.
   checked leaks that secret the first time a caller forgets. Pass the destination
   into the builder and have it withhold the decrypted secret (return only
   non-secret headers) when the destination is missing or fails validation.
+- **A public backend URL can still be an unsafe self-proxy.** An agent's
+  gateway-facing `url` identifies its nginx route, while `proxy_pass_url` is the
+  backend. A remote A2A card may echo that advertised route; Pull Card must treat
+  only a raw-path-equivalent echo on the advertised listener as no backend change,
+  not save it to `proxy_pass_url`. Reject aliases, child routes, and query variants
+  on the same gateway (including its alternate HTTP/HTTPS listener) before
+  preview or apply. Compare canonical URL host/default-port identities with
+  `normalize_url_identity`, and compare route paths after
+  `normalize_request_path` has decoded escapes, collapsed repeated slashes, and
+  resolved dot segments. Classify on a segment boundary; do not conflate an
+  unrelated host or nonstandard port with the gateway. Public-IP SSRF checks
+  alone cannot detect this loop. Preserve genuinely different backends.
 - **Never build or attach credentials for a target that fails validation.**
   Validate the URL before decrypting/attaching stored credentials, so a
   malicious registered URL cannot exfiltrate them.
 - **Every fetch path uses the guarded client** — grep for raw `httpx`/SDK clients
   and third-party SDKs that own their own client. Internal targets are opt-in via
   an explicit allowlist (`SSRF_ALLOWED_HOSTS`/`SSRF_ALLOWED_CIDRS`), default deny.
+- **A transport-level egress relaxation must be opt-in, default off, and must
+  keep resolution and classification.** Reachability sometimes requires giving up
+  one SSRF control, as forward-proxy support does: a `CONNECT` tunnel takes its
+  TLS `server_hostname` from the request URL and ignores the SNI override that
+  pinning sets, so a pinned request through a tunnel verifies the certificate
+  against an IP and fails. Four rules make such a trade safe. Gate it behind an
+  explicit flag that defaults off, so exporting an unrelated environment variable
+  (`HTTP_PROXY`) can never change the posture. Keep resolving and classifying
+  every DNS answer before the connection, so the metadata/credential, link-local,
+  reserved and multicast hard-denies still run and one blocked answer denies the
+  request. Derive the scope of the relaxation from the classification rather than
+  from an operator-maintained exclusion list, so a forgotten entry cannot silently
+  drop the control for an internal target. Refuse cleartext on any path that
+  carries a secret, because a plain forward request hands the full URL and the
+  `Authorization` header to the intermediary. Record what was given up in the
+  module docstring, the setting description, and the feature's docs page.
+  (`EGRESS_FORWARD_PROXY_ENABLED`, `registry/utils/url_guard.py`, issue #1832.)
+- **Setting `HTTP_PROXY` re-points every proxy-aware SDK in the process, not just
+  your own client.** The AWS SDK honors it independently, so once it is set
+  botocore's instance-metadata credential provider sends IAM credential requests
+  to the proxy. Verified on a test deployment: the proxy established connections
+  to `169.254.169.254`, the SDK read the role name from
+  `/latest/meta-data/iam/security-credentials/`, and used the resulting
+  credentials. A proxy operator must never see a credential request, and a proxy
+  that can itself reach a metadata endpoint answers from its own network position
+  rather than the caller's. Two controls, and ship both: set
+  `AWS_EC2_METADATA_DISABLED=true` wherever the deployment does not need an
+  instance role (Helm and Terraform already do; Compose does not, because an
+  EC2-hosted Compose deployment may use the instance role for Amazon Bedrock),
+  and put every metadata address in the recommended `NO_PROXY`
+  (`169.254.169.254`, `169.254.170.2`, `169.254.170.23`). A `NO_PROXY` listing
+  only hostnames does not cover them, which is how this was missed. When adding a
+  proxy feature, enumerate the OTHER libraries in the process that read the same
+  variables before documenting a recommended value.
+- **Implement a proxy inside the guarded transport, never on the client.** Passing
+  `proxy=` to `httpx.AsyncClient` makes `_get_proxy_map` return `{"all://": proxy}`
+  and mount a plain transport that `_transport_for_url` prefers over the custom
+  one. Every request then skips the guard: no validation, no classification, no
+  metadata deny, no per-redirect re-check, while the factory is still called
+  `guarded_async_client`. The one-line fix is the dangerous one.
+- **A CA bundle setting must ADD to the trust store, not replace it.** httpx reads
+  `SSL_CERT_FILE`, so pointing it at a corporate CA looks like it works, but
+  `ssl.create_default_context(cafile=...)` replaces the certifi store rather than
+  extending it, breaking TLS to every other target. Take an explicit path, seed the
+  context from `certifi.where()` (httpx does not read the OS trust store), then
+  `load_verify_locations` the operator's bundle on top. Fail closed at startup on a
+  missing or malformed file: a silent fallback surfaces later as a certificate
+  error on every request and reads like a bug in the feature.
 - **A feature merged in parallel with a hardening PR is the classic gap.** When a
   hardening PR routes "every outbound URL" through the guard, its diff only covers
   files that existed on its branch. A feature developed concurrently (its own new
@@ -271,6 +399,7 @@ sanitizer that isn't called) is equivalent to no check.
   return the handler's error shape, do not raise. Query parameters are lower risk
   (they don't traverse the path), but still reject absolute (`/`-leading) and
   `..`-containing values as defense-in-depth.
+- **Neutralize spreadsheet formulas in every CSV export, including CSV the browser builds.** Audit records and registry data hold caller-authored strings (request paths, usernames, upstream error text). A cell that starts with `=`, `+`, `-`, `@`, tab or CR, also after leading whitespace, runs as a formula when an admin opens the file in Excel, Calc or Sheets (`=HYPERLINK` exfiltration, DDE prompts). The server export applies `_csv_safe` in `registry/audit/routes.py`; a client-side export (AG Grid `exportDataAsCsv`) bypasses it and must apply `frontend/src/utils/csvSafe.ts` through `processCellCallback`. AG Grid's default CSV output does not neutralize anything. Keep the two implementations' prefix rules identical.
 
 ## Authorization & ownership
 
@@ -291,8 +420,25 @@ sanitizer that isn't called) is equivalent to no check.
 - **`getattr(a_dict, "key", None)` always returns None** (dicts don't expose keys
   as attributes) — the guard becomes dead code that never denies. Use
   `dict.get("key")`; watch for dict-vs-Pydantic-model confusion.
+- **Normalize JSON `null` after Lua-cjson decoding before trusting a mapping field's type.** `cjson.null` is a truthy
+  userdata value, not Lua `nil`; `value or ""` does not clear it. A nullable backend version flowing into a version
+  selector or session key can crash on `#value` or be forwarded as an invalid header. Check `type(value) == "string"`
+  and require a non-empty value for a pinned version; otherwise use the unpinned path. Test the real JSON file
+  round-trip (`cjson.decode`), not a handwritten Lua table with `nil`.
 - **No substring matching for privilege decisions** (`"unrestricted" in scope`
   accepted access scopes as admin). Match exact, centralized constants.
+- **A wildcard in one grant dimension must not grant another.** A scope entry
+  has `methods` and `tools`. `validate_server_tool_access` had a
+  backward-compatibility branch that allowed any non-`tools/call` method found
+  in `tools`, and it also accepted `tools: ["*"]` there, so every wildcard-tool
+  scope allowed every MCP method and its `methods` list restricted nothing. The
+  same branch did `method in allowed_tools` on a string-valued `tools`, a
+  substring test. Rule: a wildcard grants only within its own dimension (`*` in
+  `tools` means every tool for `tools/call`); cross-dimension compatibility is
+  limited to exact, explicitly named entries in a list. When closing such a
+  fallback, first find what it was quietly allowing (here, the URL-derived
+  `sse`/`mcp`/`messages` names body-less HTTP+SSE requests are authorized as)
+  and keep exactly those cases explicitly, or the fix breaks a transport.
 - **Reserve the wildcard/sentinel names at every write that turns user input
   into an authorization key.** If a resolver treats a magic value (`all`, `*`)
   as a cross-cutting wildcard, then any name derived from user input — a server
@@ -320,6 +466,17 @@ sanitizer that isn't called) is equivalent to no check.
   byte-exact deny-list. Decode exactly once (a doubly-encoded `%252e` stays
   literal and fails closed), clamp traversal at root, and put the normalization
   inside the single shared entrypoint so every consumer benefits.
+- **A virtual MCP server must inherit each mapped backend tool's block state at
+  the execution boundary AND on discovery, including cached lists.** A mapping
+  file and a 60-second enriched-tools cache contain tool metadata, not the
+  backend's current `tool_overrides`. Checking only the direct MCP proxy allows
+  the virtual router to execute a tool an admin or scanner has blocked; hiding
+  it only from discovery still leaves `tools/call` exploitable. Bind the lookup
+  to the exact backend server path and original tool name, read the persisted
+  override for each request through an internal authenticated route, and deny
+  when the lookup or mapping identity is unavailable. Scope cached metadata by
+  backend location as well as original tool name: two backends can advertise
+  the same name without authorizing duplicate or cross-backend results.
 - **Attach a shared/global credential only on explicit opt-in.** Make the
   privileged code path default to not attaching it and gate its use behind an
   admin check.
@@ -333,14 +490,36 @@ sanitizer that isn't called) is equivalent to no check.
   couples a read scope with a management scope on the same static token.
 - **Never forward the caller's inbound credential to a proxied/untrusted
   destination.** When the gateway proxies to a registrant-controlled upstream (or
-  an agent calls a discovered remote agent), strip `Authorization`/`Cookie` from
-  the forwarded request — the upstream is authenticated by the gateway's own
-  mechanism, not by relaying the caller's registry token. nginx subrequests
-  inherit the parent request's headers, so `Cookie`/`Authorization` must be
-  explicitly cleared (`proxy_set_header ... "";`) on any location that proxies
-  directly to a registrant-controlled backend. For outbound service-to-service
-  calls, mint an audience-restricted, short-lived delegation token rather than
+  an agent calls a discovered remote agent), strip every caller and gateway
+  credential from the forwarded request. The upstream is authenticated by the
+  gateway's own mechanism, not by relaying the caller's registry token. Clearing
+  only `Authorization`/`Cookie` is not enough: this gateway's clients carry the
+  bearer in `X-Authorization`, and `Proxy-Authorization` and the signed
+  `X-Internal-Token*` headers are credentials too. nginx subrequests inherit the
+  parent request's headers, so each one must be cleared explicitly
+  (`proxy_set_header ... "";`) on any location that proxies directly to a
+  registrant-controlled backend. Derive that list from
+  `RESERVED_CUSTOM_HEADER_NAMES` rather than writing it by hand, so a newly
+  reserved header is stripped automatically (see `_VS_BACKEND_STRIPPED_HEADERS`
+  in `registry/core/nginx_service.py`). For outbound service-to-service calls,
+  mint an audience-restricted, short-lived delegation token rather than
   re-sending the inbound one.
+- **An IdP-minted delegation token must not also be a gateway credential.** When
+  the gateway asks its own IdP to mint a token for an upstream (OBO token
+  exchange), the IdP decides what lands in `aud`, and default client scopes can
+  add an audience this gateway accepts (Keycloak's legacy exchange copies the
+  realm's `mcp-gateway` audience mapper). The upstream could then replay the token
+  against the gateway as the user. Verify the minted token (signature, issuer,
+  expiry, target audience, and a `sub` equal to the `sub` of the user's ingress token it was exchanged from), intersect
+  its `aud` with the exact list the gateway's own validation accepts, and refuse
+  to forward it on any overlap. Read that list from the same method validation
+  uses (`accepted_audiences()`), so a new way to accept a token also widens the
+  refusal; a test pins any audience source the check does not cover.
+- **A virtual server must not route around a backend's enable state.** The
+  direct route only exists for an enabled, healthy server, and a failed security
+  scan disables the server. Any other path to the same backend (virtual-server
+  locations and tool mappings) must apply the same gate, or disabling a server
+  leaves it reachable through every virtual server that maps it.
 - **Never accept a credential as a URL query parameter.** Query strings land in
   access logs, the audit trail, and browser history. Take secrets via a request
   header or POST body; a credential that arrives in the query string should be
@@ -364,6 +543,7 @@ sanitizer that isn't called) is equivalent to no check.
   resource in the tenant, is then accepted (confused deputy). Enforce audience
   against a config-driven allowlist with `verify_aud=True`; fail closed (reject)
   when the allowlist is unconfigured rather than accepting any audience.
+- **A request header never selects how the request is authenticated.** `/validate` had a fallback, for a provider without `validate_token`, that checked the bearer against the Cognito user pool and app client named by the request's own `X-User-Pool-Id` and `X-Client-Id` headers (and `X-Region`), and nginx forwarded the client's values for all three. A caller could then name a pool it controls, sign a token there, and have it verified against that pool. The branch never ran only because every provider implements `validate_token`. Everything that decides how a credential is verified (provider, issuer, pool, client, JWKS, algorithm, audience) comes from server configuration; a request may carry the credential, never the parameters that verify it. Remove such a branch rather than guard it, fail closed when the configured provider cannot validate, and blank those headers at every nginx location that proxies to `/validate` so an older auth server cannot read them either. Sweep for request headers, query parameters or body fields that reach a validator's constructor or `get_auth_provider`.
 - **Never auto-grant groups/roles/admin from a code-shipped mapping.** A
   hardcoded `client_id → [groups]` (or default-admin) table in an M2M/SSO sync
   path silently confers privilege. Drive the mapping from config, fail closed to
@@ -390,6 +570,62 @@ sanitizer that isn't called) is equivalent to no check.
   missing, honor the record's disabled flag in the query AND on the returned doc,
   and emit a WARNING-level audit line whenever enrichment adds a privileged
   group so a write to the collection is attributable.
+- **Keep delegated-user group recovery ahead of machine-client enrichment.**
+  Entra access tokens can omit `groups` with or without an overage marker.
+  Recover user membership only after signature, issuer and audience checks,
+  using a delegated Graph token for `/me/transitiveMemberOf`. On a confirmed
+  empty Graph result, keep verified app roles but never restore stale inline
+  groups, and never consult `idp_m2m_clients` for a user token with signed
+  `scp` or legacy `scope`, even if the token also has a `client_id`. Use the
+  same validated scope classifier for token projection and user detection.
+  When the user has groups, derive registry scopes only from group mappings:
+  never add signed delegated `scp` values on top, because an app registration
+  names those and users grant them by consent, outside administrator control.
+  On any lookup or consent failure, stop authorization instead of using partial
+  groups. Filter recovered groups before writing the login session or minting
+  the registry token, and deny an oversized group set rather than truncating grants.
+- **Group recovery controls must not resurrect stale grants.** When Entra
+  Graph recovery is disabled, discard overage-marked inline groups and keep
+  only verified roles. Bound the positive group cache TTL because it delays
+  revocation. A retry-suppression cache may store only a short denial for
+  proven consent, configuration, or Graph 403 failures, keyed by the exact
+  incoming token's digest plus tenant, object and Graph resource. New tokens
+  must bypass stale denials; transient failures must retry. Never turn a
+  cached failure into an empty membership result or retain token bytes.
+- **An authoritative group result cannot be enriched from stale local data.**
+  A successful Entra Graph lookup, including an empty list, outranks local
+  `idp_user_groups` fallback at callback, bearer validation and later cookie
+  validation. When a session mints a user token, derive its Graph provenance
+  from the resolved server-side session, sign it into the token and honor it
+  at later validation. Ignore client-supplied provenance without a resolved
+  session; do not infer authority from an empty list alone.
+- **Do not share an OBO exchange across different assertions.** A process-local
+  single-flight key must include the exact incoming token's digest, even when
+  the successful membership cache is keyed by tenant and object ID. A new
+  token must never inherit another token's failed consent or successful Graph
+  result before its own exchange. Check token-specific denials and require a
+  successful exchange for the exact token before using warm memberships. A
+  browser lookup or a different bearer token can populate group IDs, but
+  neither proves this token has Graph consent. Bound proof entries by the
+  membership cache expiry and capacity. Entra browser login requires a
+  verified ID token; reject a missing one instead of falling back to userinfo.
+  Any other Entra Graph userinfo bearer fetch must use the guarded Graph client
+  with connect-time DNS pinning, not a plain HTTP client.
+- **Guard every Entra token POST that carries a client secret or assertion.**
+  Browser code exchange, provider M2M, refresh, and device token requests
+  use the HTTPS-only credentialed OAuth profile with connect-time DNS pinning.
+  Reject invalid endpoints before attaching credentials; do not log tokens or
+  raw provider error bodies.
+- **A Graph fetch proxy is not a Graph OAuth audience.** Entra OBO must request
+  `User.Read` for a validated native Graph resource, separate from the HTTPS
+  fetch proxy. An unknown login host needs an explicit Graph fetch URL, and
+  enabled group recovery or a browser `User.Read` request also needs an explicit
+  native resource. With both controls off, no Graph audience is requested.
+  Never infer public Graph or request a token for the proxy. Bind cache entries
+  and pagination rewrites to that resource. Reject cross-cloud endpoints and
+  keep native Graph hostnames public-only under the outbound URL guard. nginx
+  may identify a group-lookup outage only from the auth-server's `/validate`
+  response status and marker, never from an inbound client header.
 - **Protect the admin population from lockout and self-harm.** Admin user-mgmt
   must refuse self-deletion, refuse removing/demoting the LAST admin (count
   remaining admins first, fail closed if the population can't be enumerated), and
@@ -462,6 +698,27 @@ sanitizer that isn't called) is equivalent to no check.
   NOT a valid "hardening" here — CSRF is defended separately by the CSRF token,
   not by `SameSite=Strict`. Leave a comment at the `set_cookie` site so a future
   reader does not "tighten" it and break login.
+- **A session cookie without the `__Host-` prefix can be tossed from a sibling
+  subdomain.** Any other host under the parent domain can set a cookie with the
+  session cookie's name. Beside the real one, the browser sends both, in an
+  order the tossing host controls, and two readers that pick differently act as
+  two sessions on one request. Refuse a duplicated session cookie in every
+  reader of both services through one parser that matches the exact name, and
+  make a read that bypasses it fail closed. A tossed cookie with the real
+  cookie's Domain and Path replaces it instead, putting the browser in the
+  attacker's session: only the `__Host-` prefix stops that, so turn it on
+  wherever the deployment needs no shared cookie domain. Never record the
+  `Cookie` header, including through OpenTelemetry header capture ([Cookie
+  Security Design](design/cookie-security-design.md#duplicate-session-cookies)).
+- **Renaming or rescoping a credential cookie leaves the old copy live.** Turning
+  on the `__Host-` prefix renamed the session cookie, but the old one, still on
+  the parent `Domain`, kept reaching every sibling host until it expired, and its
+  value was a signed id for a session that stayed live. The value alone was
+  enough: replayed under the new name, it passed the signature check. When a
+  change renames or narrows a credential cookie, bind the signature to the
+  cookie's name (`session_cookie_signing_salt`), so a value signed for one name
+  fails under another, and tell operators to end the old sessions on the server
+  ([Cookie Security Design](design/cookie-security-design.md#session-cookie-host-prefix)).
 - **Bind the OAuth2/OIDC authorization-code flow to the specific login.** A valid
   signature is necessary but not sufficient — a correctly-signed id_token minted
   for a different login can be replayed/injected. Send a per-login `nonce` on the
@@ -475,6 +732,35 @@ sanitizer that isn't called) is equivalent to no check.
   handler exchanges the code inline, a `state` comparison that runs later in the
   calling flow is dead code; gate the exchange itself and fail closed when
   `state` is missing/absent/mismatched or no authorization request is in flight.
+- **Bind an OAuth consent to the browser that started it, and burn its state on
+  every exit.** A check that the finishing browser is signed in as the state's
+  principal does not stop account injection: whoever holds a state bound to user
+  V (an agent with V's bearer, V's browser history) finishes the provider step
+  with their own account and sends V's browser to the callback, and V's vault
+  then holds that account. PKCE does not help, because the verifier rides in the
+  state. Set a per-consent HttpOnly, `SameSite=Lax` cookie where the consent
+  starts, put its hash in the state, and refuse the callback before the code
+  exchange unless the browser presents the matching cookie. Name the cookie per
+  consent so parallel tabs all complete, and start a consent only for the
+  browser's own session cookie: a bearer skips CSRF and would get the state
+  together with its secret. A refusal that leaves the nonce live leaves a usable
+  `?code=...&state=...` in the refusing browser's history, which the minting
+  user's own browser can later complete, so consume the nonce once, right after
+  the state decodes and before the `code` check (RFC 9700 section 4.7, RFC 6749
+  section 10.12; `EgressAuthService.begin_callback`,
+  `registry/egress_auth/browser_binding.py`, `browser_session_context` in
+  `registry/auth/dependencies.py`).
+- **A reserved key prefix is a namespace only if no input can carry it.**
+  Prefixing username-fallback vault keys with `name:` keeps them apart from
+  account ids only while no account id starts with `name:`. A provider whose
+  `subject_claim` names a user-chosen value can return one, and that user then
+  reads the fallback user's bucket. Refuse the prefix wherever an outside value
+  becomes a key: the login (`_require_login_subject`), an IdP bearer's account
+  id (`_canonical_egress_user`) and a mint request that names no session
+  (`_reconcile_context_against_session`), all through one predicate
+  (`is_fallback_shaped` in `registry/egress_auth/fallback_key.py`). Exempt only
+  values the gateway wrote: a session's stored key, and the `egress_user` the
+  session-backed mint stamps on a `self_signed` token.
 - **Cross-resource permission confusion: one entity type's access grant must
   never gate a different entity type.** A skill-listing fast-path keyed on
   `accessible_agents` (an agent grant) let a broad agent grant expose private
@@ -574,6 +860,137 @@ sanitizer that isn't called) is equivalent to no check.
   internal host is absent from the derived field, not only from the raw one.
   (This is exactly the leak that survived the first pass on semantic search's
   `endpoint_url` while the raw fields were already nulled.)
+- **Snapshot what the user approves when the approval BEGINS, not when it
+  completes.** An OAuth consent round trip spans minutes at a third party. If the
+  callback re-reads the server record to decide which destinations (or which
+  token endpoint) the returned credential is bound to, anything an operator added
+  or repointed meanwhile inherits an approval the user never saw, and a repointed
+  token endpoint receives the code and client secret. Put the approved
+  destination set and token endpoint in the AEAD consent `state`; bind the stored
+  credential to the snapshot; refuse the callback if the live token endpoint
+  differs; refuse a state that carries no snapshot.
+- **A check made on one read says nothing about the next read.** When a code
+  path reads a credential, validates its bindings, then re-reads it (a refresh
+  single-flight's post-lease double-check, a lease-busy fallback), a concurrent
+  writer can replace the entry between reads. Put the full validation in one
+  gate applied to EVERY read whose result is used, returned, or refreshed --
+  never to the first read only.
+- **An authorization binding must mirror the routing decision, not re-derive
+  it.** When nginx has already chosen a location, the auth layer must bind to
+  what that location asserted (location-`set` variables, which the
+  `auth_request` subrequest shares), checked with the SAME match semantics as the
+  location (prefix `location /a/` -> prefix check), never a narrower or broader
+  re-parse of the URL. Per-registration selection (e.g. versions) belongs inside
+  the registration's own location; a global `map` keyed on `$uri` re-derives
+  routing with regex prefixes (matches nested registrations), aliases when keys
+  come from a lossy encoding, and evaluates against `$uri=/validate` when first
+  read inside the auth subrequest. Internal names derived from registry values
+  must be injective encodings; nginx `map` string keys are case-insensitive and
+  duplicate keys are a fatal config error, so they are not a safe identity index.
+- **A header a new nginx template clears is still forgeable behind an old one.**
+  auth-server and nginx roll independently, so a new auth-server must assume an
+  older template may forward the client's own copy of any header only the new
+  template sets or clears. Honor such headers only alongside proof that a current
+  template sent them -- the marker secret under a header name older templates
+  never set (`X-Validate-Binding-Secret`) -- and treat them as absent otherwise.
+  The existing marker proves "came through nginx", not "came through this
+  version of the template".
+- **Every internal token `/validate` mints needs the nginx marker, not just its
+  routing header.** `X-Resolved-Upstream`, `X-Resolved-Generic-Upstream` and
+  `X-Registry-Api-Auth` choose which token `/validate` mints, and each is a plain
+  header a direct auth-server caller can send. Gate every mint on the matching
+  `X-Validate-Source-Secret`, including a token that only asserts the caller's
+  own identity: a later consumer may come to trust it for more.
+- **Validate the type of any claim that drives authorization, and reject rather
+  than coerce.** A `groups` claim arrives as a JSON array of strings. Six
+  readings of it had each guessed differently at what to do with other shapes:
+  one wrapped a bare string into a single-element list, so a token asserting
+  `"groups": "mcp-registry-admin"` became membership in that group; others
+  passed a dict or a list of booleans through to the mapping query. The rule is
+  one shared validator (`normalize_groups_claim` in
+  `auth_server/providers/base.py`), accepting only a list of strings, treating
+  absent and null as the empty list, and raising on anything else. Coercion
+  guesses at intent on a value the caller controls, and the guess runs in the
+  authorization path. Apply it in every provider, including the self-signed and
+  userinfo paths, because a validator that one reading skips is the reading an
+  attacker uses.
+- **A relaxed check for a name the gateway invents is safe only if the gateway answers that name on every path and never forwards it.** Issue #1860 added a synthetic `connect_mcpgw_<server>` tool that `tools/list` returns before egress consent. It is authorized like `tools/list`, so a user with access to the server can call it without a grant for that tool. If the gateway answered it only while consent was pending and forwarded it afterwards, a backend tool with the same name would run with the user's vaulted credential under the weaker check. The rule has three parts. Answer the invented name at the gateway in every state: `_connect_tool_local_result` in `auth_server/server.py` covers the connected, OBO and non-egress cases. Match on the one exact name derived for the server. Grant the relaxed check only on routes where every request reaches the answering hop: direct routes, which nginx always sends to `/mcp-proxy` (pinned by `test_direct_route_location_only_proxies_to_mcp_proxy`). Virtual routes get no exemption, because nginx proxies their non-egress backends straight to the backend. A hop token that lacks the route claim gets none either.
+- **A cache in front of a token exchange must re-establish what the exchange checked.** Without the cache, the IdP
+  verifies the subject token on every exchange, so the gateway never needed to: on a cookie-authenticated
+  request `/validate` verifies the cookie and never the bearer header, and the OBO hop compared only the
+  bearer's unverified `sub`. When a cache or shortcut replaces a call to another party, list everything
+  that party checked (signature, expiry, revocation, conditional access) and either re-check it locally
+  or prove the caller already did. Here `/validate` signs a digest of the exact bearer it verified with
+  an OBO-capable IdP into the hop token, and the hop serves from the cache only when its subject token
+  matches; every other request still exchanges. Bound what the skipped checks can miss with a short
+  reuse window (`EGRESS_OBO_CACHE_MAX_TTL_SECONDS`). A data-plane service that starts caching credentials also gets the
+  narrowest store access that works: an in-process handle clamped to its own namespace, plus a backend policy scoped to
+  that namespace's path, created only when the feature is on.
+- **Key per-user secrets on the IdP's immutable account id, derived the same way
+  on every path.** The egress vault keyed Cognito browser sessions on the Cognito
+  username, which Cognito frees for reuse when the user is deleted, so a new user
+  created under the old name inherited the old user's vaulted provider tokens. A
+  raw Okta access token keyed on its `sub`, the user's editable login, while the
+  browser session keyed on the immutable user id; moving a login to another user
+  moved the connections with it. Key a stored secret on the value the IdP never
+  reassigns (`sub` for most OIDC providers, `uid` on an Okta access token), and
+  give each path one named function: the login computes and stores a session's
+  key (`_login_vault_user_id`), every session reader takes it from there
+  (`session_vault_user_id`), a bearer's comes from `_canonical_egress_user`, and
+  the registry routes and the vend address the vault through `vault_principal`.
+  Refuse an OIDC login that yields no such id, since a fallback to a name
+  reopens the hole. Test the
+  derivation as properties over generated accounts: two accounts with distinct
+  ids never share a key even when every other claim matches, one account keeps
+  its key when its profile changes, and every path agrees.
+
+## Identity-provider self-registration (DCR)
+
+RFC 7591 Dynamic Client Registration lets an MCP client create its own IdP
+client with no operator involvement, and anonymous DCR needs no credential at
+all. It does not let anyone authenticate as someone else: a user still logs in
+at the IdP with their own credentials. What it does decide is what the token
+that login produces asserts, so the registration surface is an authorization
+surface.
+
+- **Restrict both ends: which scopes a self-registered client may request, and
+  whether it may define protocol mappers.** The scope restriction alone is not
+  enough. A mapper chooses what a claim contains, so a client permitted to
+  attach a hardcoded-claim mapper can stamp a `groups` value regardless of the
+  user's real membership, and the gateway derives access from that claim. In
+  Keycloak terms, both the "Allowed Client Scopes" and "Allowed Protocol Mapper
+  Types" registration policies are load-bearing, for the `anonymous` and
+  `authenticated` subtypes alike, since Keycloak picks the subtype by whether
+  the request carried a registration token.
+- **Derive the withheld set from the list that creates the scopes, never from a
+  naming convention.** The first version of this filter excluded any scope whose
+  name contained a `/`, which covered the four `<group>/<action>` scopes it was
+  written against. The Helm surface also created `mcp-registry-admin` and
+  `registry-admins`, whose names carry no slash and which are the `_id` of scope
+  documents granting `server: "*"` with every action, so both stayed requestable
+  there. A convention nothing enforces is not a boundary. Name the privileged
+  set explicitly, build the DCR exclusion from that same list so a scope added
+  in one place cannot stay requestable in the other, and keep a shape-based rule
+  only as a second filter.
+- **Report what the allowlist resolved to.** Setup scripts that compute a policy
+  from live realm state should print the resulting allowlist and flag anything
+  excluded only by the weaker rule. The failure mode of a computed allowlist is
+  silent widening, which no amount of reading the script reveals.
+- **A provider that passes the IdP's discovery document through inherits that
+  IdP's DCR policy.** Of six providers here, `keycloak` and `pingfederate`
+  return the upstream `openid-configuration`, so whatever `registration_endpoint`
+  the IdP publishes is advertised to clients; `entra`, `okta`, `auth0` and
+  `cognito` build a static document with no such field. Okta and Auth0 support
+  DCR natively, so those two are unexposed only because of what the static
+  document omits. Switching any provider to passthrough therefore adds a
+  registration surface, and the restrictions above have to exist on that IdP
+  before the switch.
+- **A privileged scope name and an authorization identifier are the same string.**
+  `resolve_scope_access` looks up each scope in the token by name as a scope
+  document, so any scope name that matches a document resolves to that
+  document's grants. Creating an IdP client scope named after an admin scope
+  document is therefore equivalent to creating a requestable admin credential,
+  which is how the two slash-free names above came to matter.
 
 ## Frontend (React) URL / href handling
 
@@ -586,6 +1003,11 @@ sanitizer that isn't called) is equivalent to no check.
   mixed case); render unsafe schemes as inert text. Enforce with the
   `react/jsx-no-script-url` lint rule so regressions are caught. (Server-side
   template `innerHTML`/inline-`onclick` is a separate sink — guard it too.)
+
+## Files served from, or unpacked into, a configurable folder
+
+- **Check and read a served file through one descriptor.** Resolving a path, checking it, and then handing the path to `FileResponse` leaves a window in which a writer can swap the file or a parent directory for a symlink to anything the process can read, such as `/proc/self/environ`. Open the final component with `O_NOFOLLOW | O_NONBLOCK`, `fstat` the descriptor, read from it, then resolve the name again and require the same `(st_dev, st_ino)` inside the folder. `read_branding_file` in `registry/utils/branding_files.py` is the worked example; it still follows Kubernetes ConfigMap `..data` symlinks because they resolve inside the folder.
+- **Bound everything an archive makes you do, not just the files you keep.** Count every tar header, including entries you skip (archive root, macOS `._*` metadata), and cap the decoded input and the decompressed stream before `tarfile` parses a header: a gzip bomb or a huge pax or long-name record is otherwise read in full. Log skipped entries as one count, not one line each. Never use `extractall`; write accepted regular files yourself with `O_EXCL | O_NOFOLLOW`. `registry/utils/branding_writer.py` is the worked example.
 
 ## Deployment surface & insecure-by-default config
 
@@ -697,6 +1119,27 @@ sanitizer that isn't called) is equivalent to no check.
   the real client IP still arrives via `X-Real-IP`, and scheme/HTTPS detection
   reads the `X-Forwarded-Proto` header directly (not uvicorn's scheme rewrite), so
   OAuth redirect construction is unaffected.
+- **Generated internal auth locations must render their marker secret at the final interpolation site.** A template
+  placeholder replacement performed before dynamic location blocks are appended does not expand placeholders inside
+  those later blocks. If an internal `/validate` hop sends the literal marker instead of the configured
+  `AUTH_SERVER_NGINX_MARKER_SECRET`, auth-server correctly refuses to mint a backend-bound token and every virtual
+  backend call fails after ingress authentication. Render the validated config value when constructing the dynamic
+  block, and verify the fully rendered nginx config contains no marker placeholder in any `/validate` caller. Do not
+  disable the marker check to make routing work.
+- **Virtual backend authorization must preserve the ingress resource binding while checking a separate backing grant.**
+  An internal Lua subrequest to `/validate` rewrites the requested URL and JSON-RPC body to the selected backing server;
+  a token bound to the virtual resource cannot be reclassified as a backing-server token. Carry the original virtual URI
+  only in an nginx-generated header from the internal backend-auth location, clear any client-supplied copy in every
+  normal `/validate` location, and require the configured nginx marker and resolved upstream before honoring it. Check
+  the real rewritten backing method/tool against the user's backing scopes independently. A direct backing request with
+  a virtual-bound token must still fail.
+- **A registered MCP path is not a transport suffix, and an origin is not a credential destination.** A valid server may
+  be named `/peer/mcp`; stripping `mcp` after `/validate` has resolved that registered path makes the token and vend
+  point at `/peer` instead. Sign the exact registered path and route mode from nginx-controlled values, and force-set
+  them separately on both `/validate` and `/mcp-proxy` hops. For pinned versions, sign the selected stored version ID
+  and exact outbound endpoint; resolve the same active/version document when vending, and compare against exact
+  write-time credential bindings. An origin-only comparison can silently put the active version's token on another path.
+  Version selection lives in each registration's own nginx location, never in a shared map (see "An authorization binding must mirror the routing decision").
 - **An nginx `auth_request` subrequest does NOT inherit the parent location's
   `proxy_set_header` directives.** Headers the outer location sets for its own
   `proxy_pass` (e.g. `X-Real-IP $remote_addr`, a sanitized `X-Forwarded-For`) are
@@ -752,11 +1195,16 @@ the drift between copies is the hole.
   `@router.(post|put|patch|delete)` handler that depends on the session-cookie
   auth dependency — `enhanced_auth` AND `nginx_proxied_auth`, which falls back to
   the cookie — and mutates state) and close every gap. `verify_csrf_token_flexible`
-  correctly NO-OPS for non-cookie (Bearer/CLI) callers, so it is safe to add to a
-  route even if some callers are non-browser. It reads the token from the
-  `X-CSRF-Token` header OR a `csrf_token` form field, so a JSON-body route works
-  fine via the header. Skip only routes authed purely by `validate_internal_auth`
-  / internal-token (not browser/cookie surfaces).
+  correctly NO-OPS for a caller with no session cookie at all (Bearer/CLI), so it
+  is safe to add to a route even if some callers are non-browser. A request that
+  carries the session cookie, even a duplicated one or one that does not
+  resolve, gets a 403 unless it presents the token of the session it resolves
+  to: skipping CSRF because the registry could not read a session rests on
+  `/validate` agreeing, and a transient store error breaks that. It reads the
+  token from the `X-CSRF-Token` header OR a `csrf_token` form field, so a
+  JSON-body route works fine via the header. Skip only routes authed purely by
+  `validate_internal_auth` / internal-token (not browser/cookie surfaces).
+- **Cookie-authenticated proxy requests → `registry/common/request_origin.py`.** A browser attaches the session cookie to a request any site makes, and an MCP client cannot send a CSRF token. So every MCP, virtual, agent and proxy request authenticated by the cookie goes through `origin_refusal()` at `/validate` (`_refuse_cross_origin_cookie_request` in `auth_server/server.py`), before any scope check or token mint. Trusted origins come only from configuration (`AUTH_SERVER_EXTERNAL_URL`, `REGISTRY_URL`), never from `Host` or `X-Forwarded-*`. A missing `Origin` passes only on GET/HEAD/OPTIONS; `null`, malformed and foreign values always fail. Parse an origin with `normalize_origin()`, the same parser the CORS allowlist uses (#1996).
 - **Internal service-to-service auth → `registry/auth/internal.py`.**
   `generate_internal_token()` to mint, `validate_internal_auth` /
   `validate_internal_session_secret` as the route dependency. Internal tokens are
@@ -802,6 +1250,8 @@ the drift between copies is the hole.
   `MCP_SCANNER_LLM_API_KEY`) or stdin. When an unavoidable third-party tool only
   accepts the secret on argv, keep it off every hop you control and record the
   external constraint as a scoped residual (see FOLLOWUPS F-19/F-20).
+- **CSV export → neutralize formulas with the shared helper.** Server: `_csv_safe` in `registry/audit/routes.py`. Browser: `csvSafe` / `processCsvCell` in `frontend/src/utils/csvSafe.ts`, passed as AG Grid's `processCellCallback`.
+- **Serving a file from an operator-supplied folder → `read_branding_file` pattern** in `registry/utils/branding_files.py` (single descriptor, `O_NOFOLLOW`, post-open inode check). Do not return a path for `FileResponse` to open later.
 
 When you add a NEW canonical helper, list it here so the next agent reaches for
 it instead of rebuilding it.

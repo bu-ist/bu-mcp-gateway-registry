@@ -523,15 +523,20 @@ changes if the file path and size are similar.
 ```bash
 cd terraform/telemetry-collector
 
-# Step 1: Rebuild the zip package (see Step 2 in Deployment above)
-cd lambda/collector && pip install -r requirements.txt -t . && cd ../..
-zip -r lambda_function.zip lambda/collector/
+# Step 1: Rebuild the zip package. Dependencies are vendored into lambda/collector/,
+# and the handler is index.lambda_handler, so index.py and schemas.py must land at the
+# ZIP ROOT. Zip from inside the directory; zipping the directory itself nests the
+# handler and the function fails to import.
+cd lambda/collector \
+  && pip install -r requirements.txt -t . \
+  && zip -qr ../../lambda_function.zip . -x '__pycache__/*' '*/__pycache__/*' \
+  && cd ../..
 
 # Step 2: Apply terraform (updates infrastructure and zip hash)
 terraform apply -auto-approve
 
 # Step 3: Force Lambda to use the new code
-# Terraform may cache the old zip hash — this ensures the update takes effect
+# Terraform may cache the old zip hash; this ensures the update takes effect
 aws lambda update-function-code \
   --function-name telemetry-collector \
   --zip-file fileb://lambda_function.zip \
@@ -634,6 +639,30 @@ cd terraform/telemetry-collector
 ```
 
 **Warning:** This deletes ALL telemetry data. Cannot be undone. Production deployments retain a final DocumentDB snapshot.
+
+### Final snapshot names
+
+Production uses `telemetry-collector-final-snapshot-<suffix>`, where `random_id.documentdb_final_snapshot` generates an 8-byte random suffix and stores it in Terraform state as 16 hexadecimal characters. The name stays unchanged across plans. A full destroy removes the random resource, so the next deployment generates a new name even when AWS retains the previous snapshot.
+
+Testing skips the final snapshot and keeps its identifier unset. Switching to production fills in the identifier using the existing random suffix. Apply this configuration once to existing deployments before destroying them so Terraform stores the new identifier. Terraform chooses the name during apply and stores it for deletion.
+
+To replace the cluster and rotate its snapshot suffix in one apply:
+
+```bash
+terraform apply \
+  -replace=aws_docdb_cluster.telemetry \
+  -replace=random_id.documentdb_final_snapshot
+```
+
+The old cluster's final snapshot uses the identifier already stored in state. The replacement cluster gets a new suffix for its next final snapshot.
+
+Replacing only `aws_docdb_cluster.telemetry` leaves the random resource in state. The replacement cluster inherits the name used for the previous cluster's snapshot. Reusing that name for another deletion can fail with `DBClusterSnapshotAlreadyExistsFault`. After that replacement, rotate the suffix in a separate apply before the next cluster replacement or destroy:
+
+```bash
+terraform apply -replace=random_id.documentdb_final_snapshot
+```
+
+Use the same variable files and other inputs as the deployment. If a retained snapshot already uses the current name, run this rotation before deleting the current cluster. Check the stored name with `terraform output -raw documentdb_final_snapshot_identifier`.
 
 ## Security Considerations
 

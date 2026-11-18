@@ -104,7 +104,8 @@ class DocumentDBServerRepository(ServerRepositoryBase):
     ) -> dict[str, Any] | None:
         """Get server by path.
 
-        Normalizes paths to match both with and without trailing slashes.
+        Matches either trailing-slash form of the stored ``_id``, the caller's
+        spelling first.
         """
         logger.debug(
             f"DocumentDB READ: Getting server with path='{path}' from collection '{self._collection_name}'"
@@ -112,17 +113,13 @@ class DocumentDBServerRepository(ServerRepositoryBase):
         collection = await self._get_collection()
 
         try:
-            server_info = await collection.find_one({"_id": path})
-
-            # If not found, try alternate path (with/without trailing slash)
-            if not server_info:
-                if path.endswith("/"):
-                    alternate_path = path.rstrip("/")
-                else:
-                    alternate_path = path + "/"
-
-                logger.debug(f"DocumentDB READ: Trying alternate path '{alternate_path}'")
-                server_info = await collection.find_one({"_id": alternate_path})
+            server_info = None
+            for index, candidate in enumerate(self._path_variants(path)):
+                if index:
+                    logger.debug(f"DocumentDB READ: Trying alternate path '{candidate}'")
+                server_info = await collection.find_one({"_id": candidate})
+                if server_info:
+                    break
 
             if server_info:
                 server_info["path"] = server_info.pop("_id")
@@ -420,8 +417,33 @@ class DocumentDBServerRepository(ServerRepositoryBase):
         self,
         path: str,
         server_info: dict[str, Any],
+        *,
+        updated_fields: list[str] | None = None,
+        expected_updated_at: str | None = None,
     ) -> bool:
-        """Update an existing server."""
+        """Update an existing server.
+
+        Args:
+            path: Server path as used by callers (with or without a
+                trailing slash).
+            server_info: Full merged server dict (callers build this by
+                layering their change over a fetched card). Only the
+                fields named in ``updated_fields`` (plus ``updated_at``)
+                are written, so concurrent writers touching other fields
+                are not overwritten (#1716). When omitted, every field is
+                written (legacy full-card behaviour).
+            expected_updated_at: Optional ``updated_at`` value the caller
+                read. When given, it participates in the same
+                ``update_one`` filter as the ``_id`` match, so the
+                compare-and-set is atomic: if another writer persisted a
+                change since this caller read the card, the filter
+                matches nothing and the update fails.
+
+        Like :meth:`get`, a card stored under the slash variant of
+        ``path`` is written through the variant that exists, so a read
+        that found the card is never followed by a write that silently
+        misses it. A revision miss on the exact card never falls back.
+        """
         logger.debug(
             f"DocumentDB WRITE: Updating server at '{path}' in collection '{self._collection_name}'"
         )
@@ -432,6 +454,9 @@ class DocumentDBServerRepository(ServerRepositoryBase):
         try:
             doc = {**server_info}
             doc.pop("path", None)
+            if updated_fields is not None:
+                field_set = set(updated_fields) | {"updated_at"}
+                doc = {k: v for k, v in doc.items() if k in field_set}
             populate_normalized_identity_url(doc, ENTITY_TYPE_SERVER)
             unset_ops: dict[str, str] = {}
             # update() may carry no proxy_pass_url at all (a partial
@@ -449,10 +474,33 @@ class DocumentDBServerRepository(ServerRepositoryBase):
             update_spec: dict[str, dict[str, Any]] = {"$set": doc}
             if unset_ops:
                 update_spec["$unset"] = unset_ops
-            result = await collection.update_one({"_id": path}, update_spec)
+
+            # Exact _id first, then its slash variant, each with the same
+            # revision predicate; a miss on both fails the write.
+            def _filter_for(id_value: str) -> dict[str, Any]:
+                if expected_updated_at is None:
+                    return {"_id": id_value}
+                return {"_id": id_value, "updated_at": expected_updated_at}
+
+            primary, *alternates = self._path_variants(path)
+            result = await collection.update_one(_filter_for(primary), update_spec)
+            if result.matched_count == 0 and alternates:
+                if expected_updated_at is not None and await collection.find_one(
+                    {"_id": primary}, {"_id": 1}
+                ):
+                    # The card exists with a moved revision: a lost race, never a
+                    # variant miss. Writing another _id would retarget the write.
+                    logger.info(f"Server at '{path}' revision mismatch; concurrent update won")
+                    return False
+                result = await collection.update_one(_filter_for(alternates[0]), update_spec)
 
             if result.matched_count == 0:
-                logger.error(f"Server at '{path}' not found in DocumentDB")
+                if expected_updated_at is not None:
+                    logger.info(
+                        f"Server at '{path}' revision mismatch or missing; concurrent update won"
+                    )
+                else:
+                    logger.error(f"Server at '{path}' not found in DocumentDB")
                 return False
 
             logger.info(
@@ -474,14 +522,15 @@ class DocumentDBServerRepository(ServerRepositoryBase):
         collection = await self._get_collection()
 
         try:
-            server_doc = await collection.find_one({"_id": path})
+            # Match either slash variant, like get()/update().
+            server_doc = await collection.find_one({"_id": {"$in": self._path_variants(path)}})
             if not server_doc:
                 logger.error(f"Server at '{path}' not found in DocumentDB")
                 return False
 
             server_name = server_doc.get("server_name", "Unknown")
 
-            result = await collection.delete_one({"_id": path})
+            result = await collection.delete_one({"_id": {"$in": self._path_variants(path)}})
 
             if result.deleted_count == 0:
                 logger.error(f"Failed to delete server at '{path}'")
@@ -580,7 +629,8 @@ class DocumentDBServerRepository(ServerRepositoryBase):
         collection = await self._get_collection()
 
         try:
-            server_doc = await collection.find_one({"_id": path})
+            # Match either slash variant, like get()/update().
+            server_doc = await collection.find_one({"_id": {"$in": self._path_variants(path)}})
             if not server_doc:
                 logger.error(f"Server at '{path}' not found in DocumentDB")
                 return False
@@ -588,7 +638,7 @@ class DocumentDBServerRepository(ServerRepositoryBase):
             server_name = server_doc.get("server_name", path)
 
             result = await collection.update_one(
-                {"_id": path},
+                {"_id": {"$in": self._path_variants(path)}},
                 {"$set": {"is_enabled": enabled, "updated_at": datetime.utcnow().isoformat()}},
             )
 
@@ -672,19 +722,106 @@ class DocumentDBServerRepository(ServerRepositoryBase):
     ) -> bool:
         """Update a single field on a document."""
         collection = await self._get_collection()
+        # Match either slash variant, like get()/update().
+        path_filter = {"_id": {"$in": self._path_variants(path)}}
 
         if value is None:
             result = await collection.update_one(
-                {"_id": path},
+                path_filter,
                 {"$unset": {field: ""}},
             )
         else:
             result = await collection.update_one(
-                {"_id": path},
+                path_filter,
                 {"$set": {field: value}},
             )
 
         return result.modified_count > 0
+
+    @staticmethod
+    def _path_variants(path: str) -> list[str]:
+        """Both trailing-slash forms of a server path, the caller's form first.
+
+        Server ``_id``s are stored inconsistently (e.g. ``/airegistry-tools/``),
+        and callers may pass a bare name. Matching both forms in one query is
+        equivalent to the alternate-path fallback in ``get``, without the
+        second round trip.
+
+        The caller's own spelling sorts first so a sequential resolver (``get``,
+        ``update``) probes the most likely ``_id`` before its variant and wins
+        deterministically when both documents exist; an ``$in`` filter ignores
+        the order.
+        """
+        stem = "/" + path.strip("/")
+        variants = [stem, stem + "/"]
+        if path in variants:
+            variants.remove(path)
+            variants.insert(0, path)
+        return variants
+
+    async def get_tool_overrides(self, path: str) -> dict[str, Any]:
+        """Get the raw tool_overrides map for a server ({} when unset)."""
+        collection = await self._get_collection()
+        doc = await collection.find_one(
+            {"_id": {"$in": self._path_variants(path)}},
+            {"tool_overrides": 1},
+        )
+        if not doc:
+            return {}
+        overrides = doc.get("tool_overrides") or {}
+        return overrides if isinstance(overrides, dict) else {}
+
+    async def get_blocked_tools(self, path: str) -> set[str]:
+        """Get the set of currently blocked tool names for a server."""
+        overrides = await self.get_tool_overrides(path)
+        return {
+            name
+            for name, entry in overrides.items()
+            if isinstance(entry, dict) and entry.get("blocked") is True
+        }
+
+    async def set_tool_override(
+        self,
+        path: str,
+        tool_name: str,
+        override: dict[str, Any],
+    ) -> bool:
+        """Set one tool's override entry. Returns False if the server is unknown."""
+        collection = await self._get_collection()
+        result = await collection.update_one(
+            {"_id": {"$in": self._path_variants(path)}},
+            {
+                "$set": {
+                    f"tool_overrides.{tool_name}": override,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
+        if result.matched_count == 0:
+            logger.error(f"Server at '{path}' not found in DocumentDB")
+            return False
+        return True
+
+    async def replace_tool_overrides(
+        self,
+        path: str,
+        overrides: dict[str, Any],
+    ) -> bool:
+        """Replace the whole tool_overrides map in one write (rescan reconciliation)."""
+        collection = await self._get_collection()
+        result = await collection.update_one(
+            {"_id": {"$in": self._path_variants(path)}},
+            {
+                "$set": {
+                    "tool_overrides": overrides,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
+        if result.matched_count == 0:
+            logger.error(f"Server at '{path}' not found in DocumentDB")
+            return False
+        return True
 
     async def find_with_filter(
         self,

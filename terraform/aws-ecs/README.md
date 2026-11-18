@@ -206,8 +206,11 @@ session-manager-plugin --version
 **Install uv (Python Package Manager):**
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env
+# Ubuntu/Debian (on macOS: brew install uv)
+sudo apt-get install -y pipx
+pipx install uv==0.13.5
+pipx ensurepath
+export PATH="$HOME/.local/bin:$PATH"
 uv --version
 ```
 
@@ -263,6 +266,7 @@ cp terraform.tfvars.example terraform.tfvars
 | `registry_organization_name` | Organization that operates this registry. **Required** — same as above |
 | `documentdb_admin_username` / `documentdb_admin_password` | DocumentDB admin credentials. **Required when `storage_backend = "documentdb"` (the default).** Password min 8 chars |
 | `session_cookie_secure` | Set to `true` for HTTPS (all modes except development) |
+| `session_max_age_seconds` | Browser session lifetime in seconds (default `28800`, 8 hours). Sets the session store TTL, the cookie Max-Age and the registry's signature check; rendered into both the registry and auth-server task definitions so they always match. Must be a positive whole number |
 | `cors_allowed_origins` | Comma-separated exact browser origins allowed to make credentialed cross-origin API requests. Registry's own origin is always trusted; empty means same-origin only (no wildcard fallback) |
 | `grafana_admin_password` | Grafana admin password (required when `enable_observability = true`) |
 
@@ -935,6 +939,32 @@ See [OPERATIONS.md](OPERATIONS.md) for detailed operations and maintenance docum
 - Updating running services
 - Rolling back deployments
 
+### Infrastructure upgrades and repeat plans
+
+The `CreatedAt` tag uses one timestamp stored in Terraform state for this deployment.
+Existing deployments set it when they first apply `time_static.created`.
+This value records when Terraform initialized the shared tag, not when each AWS resource was created.
+
+The first upgrade creates `time_static.created`, updates the affected tags, and replaces `time_sleep.wait_for_bucket_policy` to add its bucket trigger.
+If `null_resource.dual_ingress_warning` already exists, its trigger change also causes a one-time replacement.
+After the upgrade, `null_resource.dual_ingress_warning` prints the Mode 3 access notice only when Terraform creates it or the domain changes.
+
+Before applying, confirm that the plan contains no service security group or task definition replacements and no changes that would redeploy ECS services.
+In-place updates that change only `tags` and `tags_all` are expected, including on `aws_ecs_service.keycloak` and `aws_ecs_task_definition.keycloak`.
+
+After applying the upgrade, run `terraform plan -detailed-exitcode` with the same inputs and provider and module versions.
+Exit code `0` means no changes, `2` means changes remain, and `1` means an error occurred.
+
+The existing 30-second delay runs when Terraform creates or recreates the wait resource.
+Updating only the bucket policy while keeping the same bucket ID does not rerun the delay.
+
+For a fresh deployment, verify access logging for both the Gateway and Keycloak ALBs.
+Check for `ELBAccessLogTestFile` and actual request logs.
+The Gateway ALB uses no extra prefix; the Keycloak ALB uses `keycloak-alb`.
+ALBs [publish access logs for each node every 5 minutes](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html).
+Wait at least 5 minutes after sending requests and allow extra time for delivery.
+See the [AWS access logging guide](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/enable-access-logging.html) for the permission test and log paths.
+
 ## Troubleshooting
 
 ### Common Issues
@@ -1404,7 +1434,6 @@ terraform/aws-ecs/
     ├── ecs-ssh.sh                     # SSH into ECS tasks
     ├── view-cloudwatch-logs.sh        # View/follow CloudWatch logs
     ├── user_mgmt.sh                   # Keycloak user management
-    ├── service_mgmt.sh                # Service management utilities
     ├── rotate-keycloak-web-client-secret.sh  # Rotate OAuth2 secrets
     ├── save-terraform-outputs.sh      # Export terraform outputs as JSON
     └── pre-destroy-cleanup.sh         # Run before terraform destroy

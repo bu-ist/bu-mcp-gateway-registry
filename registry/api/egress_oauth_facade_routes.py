@@ -18,30 +18,56 @@ SECURITY MODEL
   consent is the SESSION principal, never anything the client asserts. This is
   the elicitation anti-phishing requirement: a stolen connect URL opened by a
   different user cannot bind a token to the elicited user (the provider-leg AEAD
-  state binds the token write to the authenticated principal). When no session
+  state binds the token write to the authenticated principal, and to the
+  browser that opened the URL through a per-consent cookie). When no session
   exists (first IDE use), it redirects the browser through the gateway's
-  Keycloak login and returns to ``/connect``.
+  login for the configured ``AUTH_PROVIDER`` and returns to ``/connect``.
 - ``/connect`` takes NO client-side OAuth parameters (no redirect_uri / PKCE /
   Dynamic Client Registration), so it works with providers (e.g. Entra) that do
   not support RFC 7591 DCR.
 """
 
 import logging
+import re
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from registry.auth.dependencies import nginx_proxied_auth
+from registry.auth.dependencies import browser_session_context
 from registry.core.config import settings
 from registry.egress_auth import as_facade
+from registry.egress_auth.browser_binding import (
+    new_browser_binding,
+    set_consent_cookie,
+)
 from registry.egress_auth.factory import get_egress_auth_service
-from registry.egress_auth.service import is_per_user_auth_method
+from registry.egress_auth.service import EgressAuthError, vault_principal
 from registry.services.server_service import server_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Provider used for the no-session login bounce when AUTH_PROVIDER is empty or not
+# a plain provider name (the auth server's /oauth2/login/{provider} route).
+_DEFAULT_LOGIN_PROVIDER = "keycloak"
+_PROVIDER_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def _login_provider() -> str:
+    """Return the auth-server login provider for the no-session bounce.
+
+    The gateway signs users in with ``AUTH_PROVIDER`` (``settings.auth_provider``:
+    cognito, keycloak, entra, okta, ...), so the bounce must go to
+    ``/oauth2/login/{that provider}``. A hard-coded ``keycloak`` breaks the
+    consent link on every deployment that does not run Keycloak: the browser
+    lands on a blank page instead of the IdP login.
+    """
+    provider = (settings.auth_provider or "").strip().lower()
+    if not _PROVIDER_NAME_RE.fullmatch(provider):
+        return _DEFAULT_LOGIN_PROVIDER
+    return provider
 
 
 def _gateway_origin(request: Request) -> str:
@@ -50,7 +76,7 @@ def _gateway_origin(request: Request) -> str:
     The browser-facing auth routes (``/oauth2/login/*``, ``/oauth2/callback/*``)
     are served by nginx at the ORIGIN ROOT in BOTH routing modes -- they are
     NOT mounted under the registry's ROOT_PATH. So a login bounce must target
-    ``{origin}/oauth2/login/keycloak``, NOT ``{registry_url}/oauth2/login/...``
+    ``{origin}/oauth2/login/{provider}``, NOT ``{registry_url}/oauth2/login/...``
     (in path mode registry_url carries ``/registry`` and the prefixed login path
     falls through nginx to the SPA -> HTML -> the login never happens, which is
     the path-mode-only egress consent failure; subdomain mode worked because
@@ -71,24 +97,23 @@ def _feature_on() -> bool:
 
 
 async def _optional_session(request: Request) -> dict | None:
-    """Read the gateway session, returning None instead of raising when there is
-    no valid session (so /connect can bounce to login).
+    """Read the browser's gateway session, or None so /connect can bounce to login.
 
-    ``nginx_proxied_auth`` declares ``session`` as a FastAPI ``Cookie(...)``
-    parameter that is only populated by dependency injection. Since we call it
-    directly (not as a route dependency), we must extract the session cookie off
-    the request and pass it explicitly -- otherwise it always sees ``session=None``
-    and reports "no session" even when the cookie is present (the login-loop bug)."""
-    session = request.cookies.get(settings.session_cookie_name)
+    Resolved by ``browser_session_context`` from the session cookie alone (a
+    bearer or internal token names no browser). A session cookie sent more than
+    once reads as None, so it bounces to login too, and so does a session store
+    or scope lookup that fails: the login round trip retries it."""
     try:
-        return await nginx_proxied_auth(request, session=session)
-    except Exception:
+        return await browser_session_context(request)
+    except Exception as exc:
+        logger.warning("egress connect: session lookup failed (%s) -> login", type(exc).__name__)
         return None
 
 
 def _login_bootstrap_redirect(request: Request) -> RedirectResponse:
-    """302 the browser through the gateway's Keycloak login, returning to this
-    exact /connect URL (with its query) once a session is established.
+    """302 the browser through the gateway's login (configured provider),
+    returning to this exact /connect URL (with its query) once a session is
+    established.
 
     Uses the auth-server's validated same-origin redirect_uri round-trip. The
     return URL is the request's own path+query on the gateway origin."""
@@ -97,7 +122,7 @@ def _login_bootstrap_redirect(request: Request) -> RedirectResponse:
         return_to = f"{return_to}?{request.url.query}"
     # /oauth2/login/* is served at the ORIGIN root in both routing modes, so the
     # login URL must NOT carry the registry ROOT_PATH (see _gateway_origin).
-    login = f"{_gateway_origin(request)}/oauth2/login/keycloak?" + urlencode(
+    login = f"{_gateway_origin(request)}/oauth2/login/{_login_provider()}?" + urlencode(
         {"redirect_uri": return_to}
     )
     logger.info("egress connect: no session -> bounce to gateway login")
@@ -108,6 +133,7 @@ def _login_bootstrap_redirect(request: Request) -> RedirectResponse:
 async def egress_connect(
     request: Request,
     server: str = "",
+    purpose: str = "egress",
 ) -> object:
     """Session-verified front door for MCP URL-mode elicitation.
 
@@ -119,18 +145,28 @@ async def egress_connect(
     providers like Entra that do not support RFC 7591 DCR.
 
     Flow:
-      1. If the browser has no gateway session, bounce through Keycloak login and
-         return here (so the opener is always an authenticated principal).
+      1. If the browser has no gateway session, bounce through the gateway login
+         (configured provider) and return here (so the opener is always an authenticated principal).
       2. Verify the session principal is a per-user identity. This is the
          elicitation anti-phishing requirement: the user who OPENS the URL must
          be a real authenticated user, and the provider-leg AEAD state binds the
          token write to THIS principal -- a stolen connect URL opened by a
          different user cannot bind a token to the elicited user.
-      3. 302 the browser to the provider consent (``build_consent_url``). The
-         existing ``/oauth2/egress/callback`` stores the token and shows the
-         close-tab page; the client then retries the original tool call (same
-         bearer) and the vend now HITs.
+      3. 302 the browser to the provider consent (``build_consent_url``) and set
+         this consent's cookie on that redirect, so only this browser can
+         complete it. The existing ``/oauth2/egress/callback`` stores the token
+         and shows the close-tab page; the client then retries the original tool
+         call (same bearer) and the vend now HITs.
     """
+    if purpose not in ("egress", "discovery"):
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "invalid purpose"},
+            status_code=400,
+        )
+    # BOTH purposes are gated on EGRESS_AUTH_ENABLED. Discovery uses its own
+    # provider config, but it vaults and borrows through the egress machinery, and
+    # this router is only mounted under that flag anyway -- so exempting discovery
+    # here only ever produced a claim the deployment could not honour.
     if not _feature_on():
         return JSONResponse({"error": "not_found"}, status_code=404)
 
@@ -144,19 +180,42 @@ async def egress_connect(
     server_path = as_facade._normalize_server_path(server_path)
 
     server_info = await server_service.get_server_info(server_path, include_credentials=True)
-    if not as_facade.is_server_egress_configured(server_info):
-        return JSONResponse(
-            {"error": "invalid_request", "error_description": "server has no per-user egress auth"},
-            status_code=400,
-        )
+    if purpose == "discovery":
+        # Backend-auth discovery carries its own provider config; no egress needed.
+        disc = (server_info or {}).get("oauth_discovery") or {}
+        oauth_cfg = disc.get("oauth")
+        if not oauth_cfg:
+            return JSONResponse(
+                {
+                    "error": "invalid_request",
+                    "error_description": "server has no oauth discovery config",
+                },
+                status_code=400,
+            )
+    else:
+        if not as_facade.is_server_egress_configured(server_info):
+            return JSONResponse(
+                {
+                    "error": "invalid_request",
+                    "error_description": "server has no per-user egress auth",
+                },
+                status_code=400,
+            )
+        oauth_cfg = server_info["egress_oauth"]
 
-    # Session bootstrap: no gateway session -> log in via Keycloak, return here.
+    # Session bootstrap: no gateway session -> log in via the configured provider, return here.
     user_context = await _optional_session(request)
     if user_context is None:
         return _login_bootstrap_redirect(request)
 
-    auth_method = user_context.get("auth_method") or ""
-    if not is_per_user_auth_method(auth_method):
+    # Bind the consent state to the vault principal (canonical auth_method; the
+    # auth-server's ``egress_user``, with no username fallback here): the SAME
+    # principal the vend, the vault, and the callback account-swap guard use.
+    # Using bare ``username`` here would bind the state to a different id than the
+    # callback resolves, so the guard would reject every callback with "state user
+    # mismatch" whenever egress_user is set.
+    principal = vault_principal(user_context)
+    if principal is None:
         return JSONResponse(
             {
                 "error": "access_denied",
@@ -165,30 +224,112 @@ async def egress_connect(
             status_code=403,
         )
 
-    # Bind the consent state to the canonical egress principal (OIDC-sub-based
-    # ``egress_user``, else ``username``) -- the SAME id the vend, the vault, and
-    # the callback account-swap guard use. Using bare ``username`` here would bind
-    # the state to a different id than the callback resolves, so the guard would
-    # reject every callback with "state user mismatch" whenever egress_user is set.
-    egress_user_id = user_context.get("egress_user") or user_context.get("username") or ""
+    # Discovery connect is a backend-admin operation: only the server owner or an
+    # admin may vault a token the registry will borrow for its own discovery.
+    if purpose == "discovery" and not (
+        user_context.get("is_admin")
+        or (server_info or {}).get("registered_by") == user_context.get("username")
+    ):
+        return JSONResponse(
+            {"error": "access_denied", "error_description": "owner or admin only"},
+            status_code=403,
+        )
+
+    auth_method, egress_user_id = principal
+
+    # The consent must come from the DESIGNATED principal, not merely from someone
+    # authorized to designate. handle_callback vaults at the consenting principal's
+    # address, while resolve_discovery_bearer reads at the designated one -- so a
+    # second owner-or-admin completing this flow writes a token at their own address
+    # that discovery never looks at. Discovery then degrades to unauthenticated with
+    # only a log line, and the stray entry (recorded purpose='discovery') later
+    # refuses that person's own egress connection for the same provider and server.
+    if purpose == "discovery":
+        # The stored designation is already canonical: PUT .../oauth-discovery
+        # records it through the same vault_principal, so it compares directly.
+        designated = (server_info or {}).get("oauth_discovery") or {}
+        want_method = designated.get("auth_method") or ""
+        want_user = designated.get("user_id") or ""
+        # A designation must EXIST first. Consenting before anyone is designated vaults
+        # an entry nothing reads, which then 409s this person's own egress consent for
+        # the same provider and server -- a self-inflicted lockout with no visible
+        # cause. PUT .../oauth-discovery is what creates the designation.
+        if not (want_method and want_user):
+            return JSONResponse(
+                {
+                    "error": "invalid_request",
+                    "error_description": (
+                        "no discovery identity is designated for this server; "
+                        "configure it (PUT .../oauth-discovery) before connecting"
+                    ),
+                },
+                status_code=400,
+            )
+        if want_method != auth_method or want_user != egress_user_id:
+            return JSONResponse(
+                {
+                    "error": "access_denied",
+                    "error_description": (
+                        f"this server's discovery identity is designated to "
+                        f"'{designated.get('designated_by') or want_user}'; only that "
+                        f"principal can complete the connection. Re-designate it "
+                        f"(PUT .../oauth-discovery) to connect as someone else."
+                    ),
+                },
+                status_code=403,
+            )
 
     # Provider consent leg, via the existing web Connected-Accounts path: the
     # callback stores the token + shows the close-tab page. No client-side code
     # exchange -- the client just retries the original tool call.
-    provider_authorize_url = get_egress_auth_service().build_consent_url(
-        auth_method=auth_method,
-        user_id=egress_user_id,
-        client_id_audit=user_context.get("client_id") or "",
-        session_id=user_context.get("session_id") or "",
-        server_path=server_path,
-        egress_oauth=server_info["egress_oauth"],
-    )
+    binding = new_browser_binding()
+    try:
+        provider_authorize_url = await get_egress_auth_service().build_consent_url(
+            auth_method=auth_method,
+            user_id=egress_user_id,
+            client_id_audit=user_context.get("client_id") or "",
+            session_id=user_context.get("session_id") or "",
+            server_path=server_path,
+            egress_oauth=oauth_cfg,
+            purpose=purpose,
+            server=server_info,
+            browser_binding=binding.digest,
+        )
+    except ValueError:
+        # 503 with "temporarily_unavailable": the registration is incomplete on
+        # our side, so "invalid_request" would wrongly blame the caller's request.
+        return JSONResponse(
+            {
+                "error": "temporarily_unavailable",
+                "error_description": "server versions are not available",
+            },
+            status_code=503,
+        )
+    except EgressAuthError as exc:
+        # build_consent_url validates the client secret before redirecting, so a
+        # server missing it fails here rather than sending the user to the provider
+        # and back to a generic callback failure. The exception text can embed
+        # SECRET_KEY hints, so log the type and return a fixed description.
+        logger.warning("egress connect refused: server=%s type=%s", server_path, type(exc).__name__)
+        return JSONResponse(
+            {
+                "error": "invalid_request",
+                "error_description": (
+                    "this server's egress OAuth configuration is incomplete: the "
+                    "client secret is missing or unreadable. Set it on the server's "
+                    "egress auth config before connecting."
+                ),
+            },
+            status_code=400,
+        )
     logger.info(
         "egress connect: user=%s server=%s -> provider consent",
         egress_user_id,
         server_path,
     )
-    return RedirectResponse(provider_authorize_url, status_code=302)
+    redirect = RedirectResponse(provider_authorize_url, status_code=302)
+    set_consent_cookie(redirect, request, binding)
+    return redirect
 
 
 # --------------------------------------------------------------------------- #

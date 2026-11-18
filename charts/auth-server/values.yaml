@@ -1,10 +1,28 @@
 # Global configuration
 global:
+  # Secret generation switch shared with the umbrella chart. true (default)
+  # generates unresolved secret values randomly and preserves them across
+  # `helm upgrade` via `lookup`. Set false for ArgoCD and other
+  # `helm template` based tools, which render without cluster access: there the
+  # lookup is always empty, so a generated value would differ on every sync.
+  # With generation off, an unresolved value is a render-time error naming the
+  # value to set.
+  generateSecrets: true
   image:
     # Container registry (host + optional namespace). Shared default across subcharts.
     registry: public.ecr.aws/p3v1o3c6
-    tag: 1.29.0
+    tag: 1.37.0
     pullPolicy: IfNotPresent
+  # Defaults below cover both standalone (`helm template charts/auth-server`)
+  # and umbrella deploys; the umbrella overrides what it needs from
+  # charts/mcp-gateway-registry-stack/values.yaml. Most operators should
+  # deploy via the umbrella. Without these, templates/secret.yaml nil-derefs
+  # on global.ingress and the chart cannot be linted or rendered on its own.
+  ingress:
+    tls: false
+    routingMode: subdomain
+    paths:
+      registry: /registry
 # Per-service image configuration
 # Any field left empty falls back to the corresponding global.image.* value.
 image:
@@ -29,13 +47,40 @@ app:
   # When deployed via mcp-gateway-registry-stack, the key is shared with registry.
   # Uncomment to use a specific key:
   # secretKey: "your-secure-key-here"
-  sessionCookieSecure: true
+  # Mark the session cookie Secure on HTTPS requests (SESSION_COOKIE_SECURE).
+  # It is never Secure on plain HTTP. Must match the registry.
+  # global.sessionCookieSecure, which the stack chart sets, takes precedence;
+  # this key applies only to a standalone install. It has no default here so
+  # the stack chart can tell an override from the default.
+  # Default: true
+  # sessionCookieSecure: true
+  # Session lifetime in seconds (SESSION_MAX_AGE_SECONDS): how long the
+  # auth-server stores a session and the session cookie Max-Age. Must be a
+  # positive integer and must match the registry, which accepts the cookie
+  # signature for the same time. global.sessionMaxAgeSeconds, which the stack
+  # chart sets, takes precedence; this key applies only to a standalone
+  # install. It has no default here so the stack chart can tell an override
+  # from the default. Unset, the chart renders no SESSION_MAX_AGE_SECONDS and
+  # the auth-server uses its built-in 8 hours, as the registry does.
+  # sessionMaxAgeSeconds:
   # Session cookie Domain attribute. Leave empty to default to
   # ".<global.domain>" (valid for all subdomains of the deployment
   # domain). Set to a specific hostname (e.g. "mcpregistry.example.com")
   # to scope the cookie tighter, or to a different parent
-  # (".team.example.com") if this stack lives under a subdomain.
+  # (".team.example.com") if this stack lives under a subdomain. Must match
+  # the registry. global.sessionCookieDomain, which the stack chart sets,
+  # takes precedence; this key applies only to a standalone install.
   sessionCookieDomain: ""
+  # Name the session cookie __Host-mcp_gateway_session (Secure, Path=/, no
+  # Domain) so no sibling subdomain can set or overwrite it. Requires
+  # sessionCookieSecure=true and an empty sessionCookieDomain; the chart then
+  # renders SESSION_COOKIE_DOMAIN empty. Set the same value on the registry.
+  # Turning it on signs every user out once. See docs/design/cookie-security-design.md.
+  # global.sessionCookieHostPrefix, which the stack chart sets, takes
+  # precedence; this key applies only to a standalone install. It has no
+  # default here so the stack chart can tell an override from the default.
+  # Default: false
+  # sessionCookieHostPrefix: false
   # Exact-match allowlist of OAuth login/logout redirect URIs (open-redirect
   # hardening). Comma-separated list of the FULL absolute callback/success/logout
   # URLs the deployment legitimately redirects to. When set, an absolute
@@ -136,6 +181,45 @@ app:
   gatewayGenericAcquireTimeoutSeconds: 5 # Max wait (s) for either concurrency pool before 503
   gatewayGenericStreamMaxDurationSeconds: 3600 # Absolute lifetime (s) for one stream
   gatewayGenericStreamMaxBytes: "104857600" # Raw response-byte ceiling per stream (100 MiB)
+  # Forward-proxy egress for the SSRF-guarded clients (issue #1832). OFF by
+  # default. Only needed where the pod has NO direct internet egress and all
+  # outbound traffic must traverse a corporate forward proxy.
+  #
+  # The auth-server needs this as much as the registry: the
+  # egress-credential-injected runtime tool call and the OBO token exchange both
+  # run here, so a proxy configured only on the registry fixes half the paths.
+  #
+  # When true, a target is sent through the proxy named in HTTPS_PROXY /
+  # HTTP_PROXY ONLY when every address it resolves to is on the public internet.
+  # An internal target stays direct and IP-pinned with no extra configuration.
+  # Resolution and classification still run before any CONNECT, and metadata /
+  # credential endpoints stay hard-denied, but a proxied request is dialed by
+  # hostname rather than a pinned IP, so DNS-rebinding protection is relaxed for
+  # public destinations only. Hence opt-in rather than inferred from HTTP_PROXY.
+  #
+  # Credential-bearing egress (OBO token exchange, the injected egress credential,
+  # federation) accepts only https through a proxy, so the secret stays inside the
+  # CONNECT tunnel. Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY through `extraEnv`
+  #
+  #   extraEnv:
+  #     - name: HTTPS_PROXY
+  #       value: "http://corp-proxy.internal:3128"
+  #     - name: HTTP_PROXY
+  #       value: "http://corp-proxy.internal:3128"
+  #     - name: NO_PROXY
+  #       value: "localhost,127.0.0.1,169.254.169.254,169.254.170.2,169.254.170.23,.svc.cluster.local,mcpgw-server,registry,keycloak"
+  #
+  # NO_PROXY MUST exclude those three cloud credential endpoints. The pod refuses
+  # to start without them, because setting HTTP_PROXY re-points every proxy-aware
+  # SDK in the process and the AWS SDK would then send IAM credential requests to
+  # the proxy, over plain HTTP and from the proxy's own network position.;
+  # they are deliberately not chart-managed. See docs/forward-proxy-egress.md.
+  egressForwardProxyEnabled: false
+  # Comma-separated CIDR ranges that let the generic proxy's SSRF guard
+  # (PROXY_PROFILE) reach a reserved IPv4 address, such as an Istio ServiceEntry
+  # VIP in 240.240.0.0/16. For a standalone install; under the stack chart set
+  # global.ssrfAllowedCidrs instead, which wins over this value. #2018
+  ssrfAllowedCidrs: ""
 # Authentication Provider Configuration
 # Choose ONE provider: keycloak, entra, okta, auth0, cognito, or pingfederate
 authProvider:
@@ -154,8 +238,12 @@ entra:
   clientSecretExistingSecret: "" # If set, read ENTRA_CLIENT_SECRET from this K8s secret instead of clientSecret
   clientSecretExistingSecretKey: "ENTRA_CLIENT_SECRET" # Key within the existing secret
   tenantId: ""
-  loginBaseUrl: "" # Custom Entra login base URL for sovereign/national clouds (default: https://login.microsoftonline.com)
-  graphBaseUrl: "" # Optional override for Microsoft Graph base URL. Leave unset on standard deployments — auto-inferred from loginBaseUrl. Set only for proxied or air-gapped deployments.
+  loginBaseUrl: "" # Custom Entra login base URL for sovereign/national clouds (default: https://login.microsoftonline.com). A custom proxy also needs graphBaseUrl.
+  graphBaseUrl: "" # Optional on known Entra clouds; required for a custom login proxy. Network fetch URL, not the native OAuth resource.
+  graphResourceUrl: "" # Native Microsoft Graph OAuth resource. A custom login proxy needs it if groupRecoveryEnabled or browserUserReadEnabled is true; login.microsoftonline.us infers US Gov; set DoD explicitly.
+  browserUserReadEnabled: false # Request User.Read on browser login. Default false keeps OIDC-only login; Graph lookup also requires groupRecoveryEnabled.
+  groupRecoveryEnabled: true # Recover overage groups via Graph for eligible bearer tokens and browser sessions consented to User.Read. False disables Graph recovery.
+  groupCacheTtlSeconds: 300 # Positive Graph group-result cache lifetime (30..3600 seconds); removals can remain cached until expiration.
   scopeFormat: "" # Entra PRM scope form: "v1" (api://<app-id>/<scope>) or "v2" (bare, default). Set "v1" only if your app exposes v1-style api:// scopes (issue #990).
   applicationIdUri: "" # Application ID URI (e.g. api://<app-id>). Used as the v1 scope prefix and accepted as a token audience. Defaults to api://<clientId>.
 # Okta integration (used when authProvider.type = "okta")
@@ -232,11 +320,62 @@ egressAuth:
   # CIDRs. MUST match registry.egressAuth.oauthTrustedIdpHosts. Entries receive
   # client secrets / user assertions, so keep the list tight.
   oauthTrustedIdpHosts: ""
+  # Egress httpx client connection pooling (shared by url_guard). Keep
+  # httpPoolKeepaliveExpirySeconds below the shortest upstream/LB idle timeout.
+  # MUST match registry.egressAuth.httpPool* values.
+  httpPoolMaxConnections: "100"
+  httpPoolMaxKeepalive: "20"
+  httpPoolKeepaliveExpirySeconds: "30"
+  httpPoolConnectRetries: "1"
+  # Opt-in exchanged-OBO-token cache. Enabling this makes the
+  # AUTH-SERVER a SecretStore client for the first time (the cache lives in the
+  # per-user SecretStore), so the secret-store backend config below MUST be set
+  # to match the registry chart. Default off preserves the stateless per-request
+  # exchange. MUST match registry.egressAuth.oboCache*.
+  oboCacheEnabled: "false"
+  # Hard cap (seconds) on the OBO cache reuse window, applied below the token's
+  # real expiry. Bounds revocation / conditional-access re-evaluation latency on
+  # cache hits.
+  oboCacheMaxTtlSeconds: "300"
+  # Never reuse a cached OBO token within this many seconds of its expiry. Must be
+  # < oboCacheMaxTtlSeconds.
+  oboCacheExpirySkewSeconds: "30"
+  # Application-layer AES-256-GCM key for cached OBO tokens. Used only when
+  # oboCacheEnabled is "true" (rendered into the chart env secret as
+  # EGRESS_CREDENTIAL_ENCRYPTION_KEY). Should match
+  # registry.egressAuth.credentialEncryptionKey. Empty disables application-layer
+  # encryption of cached OBO tokens (they are stored as plaintext in the
+  # secret store).
+  credentialEncryptionKey: ""
   # nginx marker secret. REQUIRED for standalone deployment (chart render fails
-  # if empty) -- it guards all mcp-proxy token minting and the app requires it
-  # at startup. Set a strong random value, identical to the registry's. In the
-  # stack it is auto-generated + shared, so leave empty there.
+  # if empty). It guards all internal-token minting (registry API, mcp-proxy,
+  # generic proxy), so a mismatch with the registry 401s every registry API
+  # request, and the app requires it at startup. Set a strong random value of
+  # printable ASCII other than '$' (no spaces), identical to the registry's. In
+  # the stack it is auto-generated + shared, so leave empty there.
   markerSecret: ""
+  # Secret-store backend config. Only consumed when
+  # oboCacheEnabled=true, which turns the auth-server into a SecretStore client;
+  # otherwise the auth-server never touches the secret store. These MUST match the
+  # registry chart's egressAuth secret-store settings so both pods read/write the
+  # same per-user store.
+  # Secret store for per-user tokens: openbao | secrets-manager.
+  secretStoreBackend: "openbao" # pragma: allowlist secret
+  secretsManager:
+    kmsKeyId: "" # Optional CMK; empty uses the AWS-managed key.
+    pathPrefix: "mcp/egress"
+  openbao:
+    addr: "" # e.g. http://openbao.default.svc:8200
+    namespace: "" # Enterprise namespaces only.
+    kvMount: "secret"
+    authMethod: "kubernetes" # token | kubernetes — kubernetes is required for the scoped OBO role
+    # OpenBao kubernetes-auth role for the OBO cache. A SEPARATE, SCOPED role:
+    # the stack's openbao-init binds it to the auth-server
+    # ServiceAccount with a policy limited to the reserved "obo-cache" namespace,
+    # NOT the registry's broad mcp-egress policy -- so the auth-server can
+    # read/write its own cache entries but never any user's PAT/3LO secrets.
+    # Requires authMethod: kubernetes.
+    role: "auth-server-obo-cache"
 # PingFederate integration (used when authProvider.type = "pingfederate")
 pingfederate:
   enabled: false
@@ -303,6 +442,23 @@ resources:
 #       secretKeyRef:
 #         name: my-secret
 #         key: my-key
+# PEM CA bundle mounted into the pod and trusted by the SSRF-guarded egress
+# clients IN ADDITION to the default roots (issue #1832). Needed only when the
+# forward proxy terminates TLS and re-signs it with an internal CA, which makes
+# every proxied upstream certificate fail verification against public roots.
+#
+# Deliberately a narrow, dedicated block rather than generic extraVolumes: it is
+# self-documenting and does not hand operators a way to mount anything anywhere.
+# The deployment derives EGRESS_FORWARD_PROXY_CA_BUNDLE from mountPath and key, so
+# the path is never written twice. A missing or malformed PEM fails the pod at
+# startup rather than surfacing as a certificate error on every proxied request.
+caBundle:
+  enabled: false
+  # Exactly one of these is required when enabled (a `fail` guard enforces it).
+  existingConfigMap: "" # ConfigMap holding the PEM
+  existingSecret: "" # or a Secret, for operators who treat the chain as sensitive
+  key: ca-bundle.pem # key within the ConfigMap or Secret
+  mountPath: /etc/ssl/mcp-gateway # directory the volume is mounted at
 extraEnv: []
 # Extra `envFrom:` sources appended to the container. Use this to inject
 # all keys from an external ConfigMap or Secret you manage (e.g. via
@@ -353,7 +509,6 @@ metricsScrape:
       kubernetes.io/metadata.name: monitoring
     fromPodSelector:
       app.kubernetes.io/name: prometheus
-
 # Egress NetworkPolicy for the generic-proxy SSRF defense (LLD Step 7a layer 1).
 # This is the PRIMARY DNS-rebind control and a REQUIRED prerequisite before
 # enabling the generic proxy (registry chart's gatewayGenericProxyEnabled). It is

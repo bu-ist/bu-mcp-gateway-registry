@@ -128,8 +128,23 @@ class ServerRepositoryBase(ABC):
         self,
         path: str,
         server_info: dict[str, Any],
+        *,
+        updated_fields: list[str] | None = None,
+        expected_updated_at: str | None = None,
     ) -> bool:
-        """Update an existing server."""
+        """Update an existing server.
+
+        Args:
+            path: Server path as used by callers; both trailing-slash
+                forms of the stored ``_id`` are matched, like :meth:`get`.
+            server_info: Full merged server dict. When ``updated_fields``
+                is given, only those fields (plus ``updated_at``) are
+                written so concurrent writes to other fields survive;
+                ``None`` writes every field.
+            expected_updated_at: When given, the write only lands if the
+                stored ``updated_at`` still equals this value (atomic
+                compare-and-set); a revision miss returns ``False``.
+        """
         pass
 
     @abstractmethod
@@ -231,6 +246,77 @@ class ServerRepositoryBase(ABC):
 
         Returns:
             True if document was found and updated
+        """
+        ...
+
+    @abstractmethod
+    async def get_tool_overrides(
+        self,
+        path: str,
+    ) -> dict[str, Any]:
+        """Get the raw per-tool override map for a server.
+
+        Args:
+            path: Server path/ID
+
+        Returns:
+            The tool_overrides map, or {} when the server has none.
+            Raises on backend failure so callers can fail closed.
+        """
+        ...
+
+    @abstractmethod
+    async def get_blocked_tools(
+        self,
+        path: str,
+    ) -> set[str]:
+        """Get the names of tools currently blocked on a server.
+
+        Args:
+            path: Server path/ID
+
+        Returns:
+            Set of blocked tool names (empty when none are blocked).
+        """
+        ...
+
+    @abstractmethod
+    async def set_tool_override(
+        self,
+        path: str,
+        tool_name: str,
+        override: dict[str, Any],
+    ) -> bool:
+        """Set the override entry for a single tool.
+
+        Args:
+            path: Server path/ID
+            tool_name: Name of the tool, validated by the caller against
+                the server's tool_list and rejected if unusable as a
+                Mongo field key
+            override: The override entry (blocked, source, reason, timestamps)
+
+        Returns:
+            True if the server was found and updated
+        """
+        ...
+
+    @abstractmethod
+    async def replace_tool_overrides(
+        self,
+        path: str,
+        overrides: dict[str, Any],
+    ) -> bool:
+        """Replace a server's entire tool override map in one write.
+
+        Used by rescan reconciliation, which recomputes the full map.
+
+        Args:
+            path: Server path/ID
+            overrides: The complete replacement map
+
+        Returns:
+            True if the server was found and updated
         """
         ...
 
@@ -1330,8 +1416,12 @@ class SearchRepositoryBase(ABC):
         path: str,
         server_info: dict[str, Any],
         is_enabled: bool = False,
-    ) -> None:
-        """Index a server for search."""
+    ) -> bool:
+        """Index a server for search.
+
+        Returns:
+            True if the entry is stored with an embedding, False otherwise.
+        """
         pass
 
     @abstractmethod
@@ -1340,8 +1430,12 @@ class SearchRepositoryBase(ABC):
         path: str,
         agent_card: AgentCard,
         is_enabled: bool = False,
-    ) -> None:
-        """Index an agent for search."""
+    ) -> bool:
+        """Index an agent for search.
+
+        Returns:
+            True if the entry is stored with an embedding, False otherwise.
+        """
         pass
 
     @abstractmethod
@@ -1375,18 +1469,21 @@ class SearchRepositoryBase(ABC):
         path: str,
         skill: Any,
         is_enabled: bool = False,
-    ) -> None:
+    ) -> bool:
         """Index a skill for search.
 
-        Default implementation is a no-op. Override in implementations
-        that support skill indexing.
+        Default implementation is a no-op and returns False (nothing stored).
+        Override in implementations that support skill indexing.
 
         Args:
             path: Skill path (e.g., /skills/pdf-processing)
             skill: SkillCard object
             is_enabled: Whether skill is enabled
+
+        Returns:
+            True if the entry is stored with an embedding, False otherwise.
         """
-        return None
+        return False
 
     async def index_virtual_server(
         self,
@@ -1675,15 +1772,17 @@ class SkillRepositoryBase(ABC):
     async def list_by_paths(
         self,
         paths: list[str],
+        fields: list[str] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """List skills whose _id is in the given set of paths.
 
         Returns raw documents (not ``SkillCard`` objects) for metadata
-        projection use cases where the full Pydantic parse is not needed
-        (Issue #1277).
+        projection and search-result enrichment, where the full Pydantic
+        parse is not needed (Issues #1277, #1952).
 
         Args:
             paths: Exact skill paths to fetch.
+            fields: Top-level fields to return. None returns the whole document.
 
         Returns:
             Dictionary mapping skill path to raw skill document for found paths.
@@ -1856,8 +1955,8 @@ class BackendSessionRepositoryBase(ABC):
         client_session_id: str,
         backend_key: str,
         user_id: str | None = None,
-    ) -> str | None:
-        """Get backend session ID and bump last_used_at atomically.
+    ) -> tuple[str | None, bool] | None:
+        """Get initialized backend state and bump last_used_at atomically.
 
         Args:
             client_session_id: Client-facing session ID
@@ -1866,8 +1965,8 @@ class BackendSessionRepositoryBase(ABC):
                 When None, ownership is not enforced (legacy behavior).
 
         Returns:
-            Backend session ID if found (and owned by ``user_id`` when given),
-            None otherwise
+            (session ID, false) for stateful, (None, true) for stateless,
+            or None when not found or owned by another user.
         """
         pass
 
@@ -1876,18 +1975,20 @@ class BackendSessionRepositoryBase(ABC):
         self,
         client_session_id: str,
         backend_key: str,
-        backend_session_id: str,
+        backend_session_id: str | None,
         user_id: str,
         virtual_server_path: str,
+        stateless: bool = False,
     ) -> None:
         """Store or update a backend session (upsert).
 
         Args:
             client_session_id: Client-facing session ID
             backend_key: Backend location key
-            backend_session_id: Session ID from the backend MCP server
+            backend_session_id: Session ID, or None after stateless initialize
             user_id: User identity for audit
             virtual_server_path: Virtual server path
+            stateless: Whether initialize succeeded without a session ID
         """
         pass
 

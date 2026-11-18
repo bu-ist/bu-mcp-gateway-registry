@@ -94,3 +94,90 @@ subcharts render.
 {{- fail "generic proxy is enabled but no egress policy is declared: enable auth-server.egress.networkPolicy or explicitly acknowledge an equivalent external policy with auth-server.egress.externalEgressPolicyAcknowledged=true" -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+A value as a string for comparison. A whole number read from a values file
+arrives as a float, so 28800 from a file, 28800 from --set and "28800" all
+compare equal, and a large one is not written with an exponent.
+*/}}
+{{- define "mcp-gateway-registry-stack.valueString" -}}
+{{- if and (kindIs "float64" .) (eq . (float64 (int64 .))) -}}
+{{- int64 . -}}
+{{- else -}}
+{{- toString . -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Refuse a subchart-level session setting that differs from its global. The
+registry and the auth-server must agree on every one: the auth-server stores
+the session and sets the cookie's name, Domain, Max-Age and Secure attribute,
+and the registry reads, checks and expires the same cookie. A split prefix lets
+/validate find the session while CSRF, consent and logout do not; a split
+domain leaves the browser two cookies, which both services refuse, so the user
+is signed out on every request. Both subcharts render each setting from
+global.<setting>, so the stack requires the globals, and a differing override
+is ignored by the subcharts and would read as if it took effect, so name it
+instead. An override is compared with the value the subcharts render: for the
+cookie domain that is global.sessionCookieDomain, ".<global.domain>" when that
+global is empty, and no Domain at all with global.sessionCookieHostPrefix, so
+an override equal to the rendered domain is accepted. An empty override is a
+subchart default (app.sessionCookieDomain ships empty) and is ignored. The
+registry has no app key for the Secure flag.
+*/}}
+{{- define "mcp-gateway-registry-stack.validateSessionSettings" -}}
+{{- $checks := list (list "registry" "sessionMaxAgeSeconds" "SESSION_MAX_AGE_SECONDS") (list "auth-server" "sessionMaxAgeSeconds" "SESSION_MAX_AGE_SECONDS") (list "auth-server" "sessionCookieSecure" "SESSION_COOKIE_SECURE") (list "registry" "sessionCookieHostPrefix" "SESSION_COOKIE_HOST_PREFIX") (list "auth-server" "sessionCookieHostPrefix" "SESSION_COOKIE_HOST_PREFIX") (list "registry" "sessionCookieDomain" "SESSION_COOKIE_DOMAIN") (list "auth-server" "sessionCookieDomain" "SESSION_COOKIE_DOMAIN") -}}
+{{- range $check := $checks -}}
+{{- $chart := index $check 0 -}}
+{{- $key := index $check 1 -}}
+{{- $envName := index $check 2 -}}
+{{- $global := index $.Values.global $key -}}
+{{- if kindIs "invalid" $global -}}
+{{- fail (printf "global.%s is not set. The stack sets %s for the registry and the auth-server from global.%s, so the two cannot disagree. Set global.%s." $key $envName $key $key) -}}
+{{- end -}}
+{{- $globalText := include "mcp-gateway-registry-stack.valueString" $global -}}
+{{- $renderedText := $globalText -}}
+{{- $rendered := printf "global.%s is %s" $key ($globalText | default "empty") -}}
+{{- if eq $key "sessionCookieDomain" -}}
+{{- if eq (toString $.Values.global.sessionCookieHostPrefix) "true" -}}
+{{- $renderedText = "" -}}
+{{- $rendered = "global.sessionCookieHostPrefix is true, so the stack renders no Domain" -}}
+{{- else if eq $globalText "" -}}
+{{- $renderedText = printf ".%s" ($.Values.global.domain | default "localhost") -}}
+{{- $rendered = printf "global.sessionCookieDomain is empty, so the stack renders %s from global.domain" $renderedText -}}
+{{- end -}}
+{{- end -}}
+{{- $override := dig "app" $key nil (index $.Values $chart | default dict) -}}
+{{- if not (kindIs "invalid" $override) -}}
+{{- $overrideText := include "mcp-gateway-registry-stack.valueString" $override -}}
+{{- if and (ne $overrideText "") (ne $overrideText $renderedText) -}}
+{{- fail (printf "%s.app.%s is %s but %s. The stack sets %s for the registry and the auth-server from the globals only, so the two cannot disagree. Remove %s.app.%s and set global.%s." $chart $key $overrideText $rendered $envName $chart $key $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Guard chart-generated random secret value.
+
+`global.generateSecrets: true` (the default) generates a random value,
+`lookup` preserves it across `helm upgrade`.
+
+`global.generateSecrets: false` is the GitOps mode. ArgoCD and every other
+`helm template`-based tool renders without cluster access, so `lookup` always
+returns empty and a generated value is a NEW value on every sync — which then
+silently disagrees with the value the running pods already hold (a changed
+`envFrom` Secret does not restart pods), rotates the MongoDB user password out
+from under the operator-provisioned SCRAM credential, and re-randomizes the
+Keycloak PostgreSQL password against a retained PVC. With generation off, a
+value the chart cannot resolve is a render-time error naming the value to set
+instead of a silent rotation.
+
+Usage:
+  {{- include "mcp-gateway-registry-stack.requireGeneratedSecret" (dict "ctx" . "key" "SECRET_KEY" "value" "global.secretKey" "byo" "global.existingSharedSecret") }}
+*/}}
+{{- define "mcp-gateway-registry-stack.requireGeneratedSecret" -}}
+{{- if not (dig "generateSecrets" true .ctx.Values.global) -}}
+{{- fail (printf "global.generateSecrets is false and %s has no value, so the chart will not generate one. Set %s explicitly, or set %s to a Secret that already holds it. Generation is unsafe under ArgoCD and other `helm template` based tools: they render without cluster access, so the chart cannot read the previous value back and every sync would produce a different secret." .key .value .byo) -}}
+{{- end -}}
+{{- end -}}

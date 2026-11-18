@@ -4,8 +4,9 @@ Ties together the provider table, the OAuth engine, the AEAD state codec, and
 the SecretStore. The SecretStore is the only persistence dependency for token
 material; a small ``ReplayGuard`` protocol covers single-use ``state`` nonces.
 
-Handles here: consent-URL build, callback handling (verify/decrypt state +
-account-swap guard + single-use nonce + code exchange + store), lazy-on-vend
+Handles here: consent-URL build, callback handling (single-use nonce + TTL in
+``begin_callback``; browser binding + account-swap guard + code exchange +
+store in ``handle_callback``; the route decodes the state once), lazy-on-vend
 refresh with an in-process single-flight lock, list, disconnect.
 
 Not handled here: the cross-replica Mongo lease lock, the egress injection in
@@ -17,10 +18,12 @@ wraps it.
 import asyncio
 import logging
 import secrets
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, NamedTuple, Protocol
 
 from registry.egress_auth import oauth_engine
+from registry.egress_auth.browser_binding import browser_secret_matches
 from registry.egress_auth.providers import resolve_provider
 from registry.egress_auth.schemas import (
     EgressConnection,
@@ -29,7 +32,9 @@ from registry.egress_auth.schemas import (
     StoredToken,
     TokenEndpointAuthStyle,
 )
-from registry.egress_auth.state_codec import InvalidState, decode_state, encode_state
+from registry.egress_auth.state_codec import encode_state
+from registry.egress_auth.upstream_binding import registered_destinations
+from registry.secrets import keys
 from registry.secrets.interfaces import SecretStoreBase
 
 logger = logging.getLogger(__name__)
@@ -69,11 +74,54 @@ class ConsentRequired(EgressAuthError):
         self.authorize_url = authorize_url
 
 
+def _check_response_issuer(
+    expected_issuer: str | None,
+    response_issuer: str | None,
+) -> None:
+    """Apply RFC 9207 section 2.4 to the provider's authorization reply.
+
+    The gateway sends every provider back to one shared callback URL, so a reply
+    names its issuer to prove which authorization server produced the code.
+    Compared as exact strings, as RFC 9207 requires.
+
+    Raises:
+        EgressAuthError: when an expected issuer is configured and the reply
+            names a different one.
+    """
+    if not expected_issuer or not response_issuer:
+        return
+    if response_issuer != expected_issuer:
+        logger.warning(
+            "egress callback: authorization reply iss does not match the expected issuer"
+        )
+        raise EgressAuthError("authorization response issuer mismatch")
+
+
+class ConsentStartedInAnotherBrowser(EgressAuthError):
+    """The callback ran in a browser that did not start this consent.
+
+    Raised when the completing browser holds no consent cookie whose digest the
+    state carries, or the state binds no browser at all (minted before the
+    binding existed). The provider code may belong to anyone's account, so it
+    is never exchanged.
+    """
+
+
+class ReplayGuardUnavailable(Exception):
+    """The replay guard could not record a ``state`` nonce.
+
+    Raised when the store behind the guard fails (the database is unreachable,
+    for example). The nonce may still be live, so a caller must not exchange
+    the code or store anything for that state.
+    """
+
+
 class ReplayGuard(Protocol):
     """Single-use guard for OAuth ``state`` nonces (a Mongo-TTL-backed implementation backs this).
 
     ``check_and_consume`` returns True if the nonce was unused (and records it),
-    False if it has already been consumed (replay).
+    False if it has already been consumed (replay). It raises
+    ``ReplayGuardUnavailable`` when it cannot tell, because its store failed.
     """
 
     async def check_and_consume(self, nonce: str, ttl_seconds: int) -> bool: ...
@@ -133,14 +181,16 @@ class _InProcessLeaseManager:
 
 # The single per-user egress bucket. Browser consent keys the vault on this
 # (the cookie session's auth_method is enforced == "oauth2"), so vend-read must
-# resolve here too for one human identity. Mirror of auth_server's
-# _EGRESS_CANONICAL_PER_USER_METHOD / _PER_USER_IDP_METHODS.
+# resolve here too for one human identity.
 _EGRESS_CANONICAL_PER_USER_METHOD: str = "oauth2"
+# Validator ``method`` values that all denote a human authenticated through the
+# per-user IdP: different token formats and provider names for one kind of
+# principal. ``self_signed`` is absent: a gateway-minted token folds by its own
+# ``auth_method`` claim instead (see canonical_auth_method).
 _PER_USER_IDP_METHODS: frozenset[str] = frozenset(
     {
         "oauth2",
         "session_cookie",
-        "self_signed",
         "jwt",
         "boto3",
         "keycloak",
@@ -151,22 +201,56 @@ _PER_USER_IDP_METHODS: frozenset[str] = frozenset(
         "pingfederate",
     }
 )
+# The validator ``method`` of a JWT this gateway minted and signed itself.
+_SELF_SIGNED_METHOD: str = "self_signed"
 
 
-def canonical_auth_method(validation_result: dict) -> str:
-    """The ONE canonical egress principal method.
+def canonical_auth_method(validation_result: Mapping[str, Any]) -> str:
+    """The ONE canonical egress principal method, for both services.
 
-    Different token FORMATS / IdP provider names denote the same kind of per-user
-    principal and must all canonicalize to a single vault bucket (``oauth2``) so
-    consent-write and vend-read agree. In particular a Dynamic-Client-Registration
-    bearer issued directly by the IdP reports ``method == "keycloak"`` (etc.),
-    which must fold into the same bucket the cookie-consent path wrote
-    (``oauth2``) -- otherwise the DCR vend misses and the user loops on consent.
-    NON-per-user methods (``federation-static``/``network-trusted``) and unknown
-    methods pass through raw so ``is_per_user_auth_method`` still rejects them.
-    Mirrors ``auth_server.server._canonical_auth_method``.
+    The auth server stamps this into both internal tokens ``/validate`` mints,
+    and the registry derives every vault principal through it
+    (``vault_principal``), so consent-write and vend-read agree on one bucket
+    for one human identity; otherwise the user loops on consent. Different
+    token formats and IdP provider names denote the same kind of per-user
+    principal and fold into the single per-user bucket (``oauth2``):
+
+    - ``session_cookie``: the browser cookie session, whose inner
+      ``auth_method`` is ``oauth2``. This is the consent-write side, so it
+      defines the bucket.
+    - ``keycloak``/``entra``/``cognito``/``okta``/``auth0``/``pingfederate``: a
+      bearer the per-user IdP issued directly, notably what a Dynamic Client
+      Registration client (Claude Code, Codex) presents. Without folding, its
+      vend keys on bucket ``keycloak`` while consent wrote ``oauth2``.
+    - ``jwt``/``boto3``: other per-user token formats.
+    - ``self_signed``: a JWT this gateway minted (UI "generate token", or the
+      egress OAuth-facade ``/token`` mint). It folds by its own verified
+      ``data.auth_method`` claim, not by the format: ``/internal/tokens`` mints
+      for ``network-trusted`` callers too (a REGISTRY_API_TOKEN or
+      REGISTRY_API_KEYS key) and stamps that method, so folding every
+      self-signed token into ``oauth2`` would hand a static key the per-user
+      bucket named like it. A missing, non-string or ``self_signed`` claim
+      yields ``""``, which no per-user check accepts.
+
+    Non-per-user methods (``federation-static``, ``network-trusted``) and
+    unknown methods pass through unchanged, so ``is_per_user_auth_method``
+    still rejects them.
+
+    Args:
+        validation_result: A validator result, or any mapping with ``method``
+            and, for a self-signed token, its verified claims under ``data``.
+
+    Returns:
+        The canonical method; ``""`` when there is none.
+
+    Example:
+        >>> canonical_auth_method({"method": "self_signed", "data": {"auth_method": "oauth2"}})
+        'oauth2'
     """
     method = validation_result.get("method") or ""
+    if method == _SELF_SIGNED_METHOD:
+        claim = (validation_result.get("data") or {}).get("auth_method")
+        method = claim if isinstance(claim, str) and claim != _SELF_SIGNED_METHOD else ""
     if method in _PER_USER_IDP_METHODS:
         return _EGRESS_CANONICAL_PER_USER_METHOD
     return method
@@ -177,6 +261,78 @@ def is_per_user_auth_method(auth_method: str) -> bool:
     if not auth_method or auth_method in NON_PER_USER_AUTH_METHODS:
         return False
     return auth_method in PER_USER_AUTH_METHODS
+
+
+class VaultPrincipal(NamedTuple):
+    """The ``(auth_method, user_id)`` pair a per-user vault bucket is keyed on."""
+
+    auth_method: str
+    user_id: str
+
+
+def vault_auth_method(user_context: Mapping[str, Any]) -> str | None:
+    """Return the canonical per-user method of a user context or verified claims.
+
+    The method half of ``vault_principal``. The vend checks it on its own,
+    before the user id, because an ``obo_exchange`` server needs a per-user
+    caller but never reads the vault.
+
+    Args:
+        user_context: A registry user context, or the verified claims of an
+            internal token (the same ``auth_method`` key).
+
+    Returns:
+        The canonical method, or None for a non-per-user, empty, unknown or
+        non-string method.
+    """
+    raw_method = user_context.get("auth_method")
+    auth_method = canonical_auth_method(
+        {"method": raw_method if isinstance(raw_method, str) else ""}
+    )
+    return auth_method if is_per_user_auth_method(auth_method) else None
+
+
+def vault_principal(user_context: Mapping[str, Any]) -> VaultPrincipal | None:
+    """Derive the per-user vault principal from a registry user context.
+
+    Every registry route that reads or writes the per-user vault keys on this:
+    consent-write, list, disconnect, PAT and discovery designation from a
+    request's user context, and the vend from the verified mcp-proxy token
+    claims, which carry the same two keys.
+
+    ``auth_method`` is canonicalized (``vault_auth_method``); a non-per-user,
+    empty, unknown or non-string method yields None. ``user_id`` is the
+    context's ``egress_user`` and nothing else: an absent, empty or
+    non-string value yields None, whatever ``username`` holds. The value was
+    resolved before the context was built: by the auth server's
+    ``_canonical_egress_user`` for everything that reaches the registry through
+    an internal token, and by ``session_vault_user_id`` for a raw session
+    cookie (``enhanced_auth``). Neither builds a username fallback key: only
+    the auth server's login (``_login_vault_user_id``) computes one, stores it
+    on the session, and every later reader takes it from there (see "When the
+    key falls back to the username" in ``docs/egress-credential-vault.md``).
+    The auth server leaves ``egress_user`` empty exactly for the callers it
+    refuses to key, so falling back here would key those callers on their
+    login name.
+
+    Args:
+        user_context: The verified ``nginx_proxied_auth`` user context, or the
+            verified claims of an mcp-proxy token.
+
+    Returns:
+        The vault principal, or None when the caller owns no per-user bucket.
+
+    Example:
+        >>> vault_principal({"auth_method": "keycloak", "egress_user": "sub-1"})
+        VaultPrincipal(auth_method='oauth2', user_id='sub-1')
+    """
+    auth_method = vault_auth_method(user_context)
+    if auth_method is None:
+        return None
+    user_id = user_context.get("egress_user")
+    if not isinstance(user_id, str) or not user_id:
+        return None
+    return VaultPrincipal(auth_method, user_id)
 
 
 class EgressAuthService:
@@ -254,7 +410,7 @@ class EgressAuthService:
 
     # -- consent -------------------------------------------------------------- #
 
-    def build_consent_url(
+    async def build_consent_url(
         self,
         auth_method: str,
         user_id: str,
@@ -262,9 +418,41 @@ class EgressAuthService:
         session_id: str,
         server_path: str,
         egress_oauth: dict,
+        purpose: str = "egress",
+        *,
+        server: dict,
+        browser_binding: str,
     ) -> str:
-        """Build the provider authorize URL with an AEAD-encrypted, single-use state."""
+        """Build the provider authorize URL with an AEAD-encrypted, single-use state.
+
+        The destinations the user is approving are snapshot HERE, into the signed
+        state, not re-read at the callback: a version added or retargeted while the
+        user is away at the provider must not inherit an approval the user never saw.
+
+        ``browser_binding`` is the digest of the consent cookie the caller sets in
+        the browser that starts this consent (see ``browser_binding.py``). The
+        callback completes the consent only in a browser holding that cookie, so
+        call this only where a browser receives the response.
+
+        Raises:
+            EgressAuthError: the client secret is missing or undecryptable.
+            ValueError: a linked server version is unavailable.
+        """
         cfg = resolve_provider(egress_oauth)
+
+        # Fail here rather than at the callback. The secret is only READ during the
+        # code exchange, so a server missing it used to send the user out to the
+        # provider, through consent, and back to a generic failure page with the
+        # cause recorded only in the registry log. Everything this needs is already
+        # known before the redirect, so check it now: the operator sees a
+        # configuration error instead of a round trip that cannot succeed.
+        #
+        # Same call the exchange makes, so the two cannot disagree about what
+        # counts as configured, and a public client (auth style NONE) still
+        # returns None here without raising.
+        self._client_secret(cfg, egress_oauth)
+        approved_upstreams = await registered_destinations(server, server_path)
+
         verifier = oauth_engine.generate_pkce_verifier() if cfg.use_pkce else None
         challenge = oauth_engine.pkce_challenge_s256(verifier) if verifier else None
         state = OAuthState(
@@ -277,6 +465,11 @@ class EgressAuthService:
             pkce_verifier=verifier,
             nonce=secrets.token_urlsafe(16),
             issued_at=datetime.now(UTC).isoformat(),
+            purpose=purpose,
+            approved_upstreams=approved_upstreams,
+            token_url=cfg.token_url,
+            expected_issuer=egress_oauth.get("expected_issuer") or None,
+            browser_binding=browser_binding,
         )
         return oauth_engine.build_authorize_url(
             cfg=cfg,
@@ -289,32 +482,37 @@ class EgressAuthService:
 
     # -- callback ------------------------------------------------------------- #
 
-    async def handle_callback(
+    async def begin_callback(
         self,
-        code: str,
-        state_blob: str,
-        egress_oauth: dict,
-        current_user_id: str | None = None,
-        current_auth_method: str | None = None,
-        *,
-        bound_upstreams: list[str],
-    ) -> EgressConnection:
-        """Verify state, exchange the code, and store the token.
+        state: OAuthState,
+    ) -> None:
+        """Consume a decoded consent state's single-use nonce, then check the state.
 
-        Security checks before any token write:
-        - state decrypts/authenticates (AEAD) -- else InvalidState.
-        - state is within TTL.
-        - state nonce is single-use (replay guard).
-        - account-swap guard: the live principal (if provided) matches the
-          principal bound in the signed state -- bind to (user_id, auth_method),
-          NOT session_id (a legit "same user, new session" must still work).
+        The callback route calls this once, right after it decodes the state and
+        before it looks at the provider ``code`` or anything else, so every exit
+        after it (a provider error, no session, the wrong browser, a gone server)
+        has already burned the state. The refusing browser's history keeps the
+        ``code`` and the ``state``; a live nonce would let that URL be replayed
+        within the TTL from a browser that is signed in as the consenting user.
+
+        After consuming the nonce it refuses a state that carries no approval
+        snapshot (minted before the snapshot existed, or the MRTR
+        ``request_state`` that reuses this codec), which would bind a credential
+        to nothing the user approved, and a state older than the state TTL.
+
+        Args:
+            state: The consent state the callback decoded.
+
+        Raises:
+            EgressAuthError: The nonce was already used (replay), or the state
+                is not a consent state, or it expired.
+            ReplayGuardUnavailable: The replay guard could not record the nonce;
+                the caller must not exchange the code or store anything.
         """
-        try:
-            state = decode_state(state_blob)
-        except InvalidState as exc:
-            raise EgressAuthError(f"invalid state: {exc}") from exc
-
-        # TTL
+        if not await self._replay.check_and_consume(state.nonce, self._state_ttl):
+            raise EgressAuthError("state already used (replay)")
+        if not state.approved_upstreams or not state.token_url:
+            raise EgressAuthError("state carries no approved destinations")
         try:
             issued = datetime.fromisoformat(state.issued_at)
         except ValueError as exc:
@@ -322,33 +520,98 @@ class EgressAuthService:
         if (datetime.now(UTC) - issued).total_seconds() > self._state_ttl:
             raise EgressAuthError("state expired")
 
-        # Single-use
-        if not await self._replay.check_and_consume(state.nonce, self._state_ttl):
-            raise EgressAuthError("state already used (replay)")
+    async def handle_callback(
+        self,
+        code: str,
+        state: OAuthState,
+        egress_oauth: dict,
+        principal: VaultPrincipal,
+        *,
+        browser_secret: str | None,
+        response_issuer: str | None = None,
+    ) -> EgressConnection:
+        """Check the completing browser, exchange the code, and store the token.
 
-        # Account-swap guard (bind to canonical principal, not session_id)
-        if current_user_id is not None and current_user_id != state.user_id:
+        Call it only with a state ``begin_callback`` accepted: this method does
+        not consume the nonce or check the TTL again.
+
+        Security checks before any token write:
+        - browser binding: ``browser_secret`` (the consent cookie the completing
+          browser presented) must hash to the state's ``browser_binding``, so the
+          consent completes only in the browser that started it. Without this,
+          whoever holds a state bound to user V finishes the provider step with
+          their own account and makes V's browser load the callback, and V's
+          vault holds their account. A state without a binding is refused.
+        - account-swap guard: ``principal``, the completing browser's live vault
+          principal, must match the principal bound in the signed state. Bind to
+          (user_id, auth_method), NOT session_id (a legit "same user, new
+          session" must still work). The route refuses a browser with no live
+          principal before calling this.
+        - RFC 9207: when the state names an expected issuer, a reply whose
+          ``iss`` (``response_issuer``) differs is refused. A reply without
+          ``iss`` is accepted, since the gateway does not know whether the
+          provider sends it.
+        - token endpoint: the provider's live token URL must be the one the user
+          consented under.
+
+        Raises:
+            ConsentStartedInAnotherBrowser: the browser binding does not match.
+            EgressAuthError: any other refusal, or a failed code exchange.
+        """
+        if not browser_secret_matches(state.browser_binding, browser_secret):
+            raise ConsentStartedInAnotherBrowser("consent completed outside its starting browser")
+
+        # Account-swap guard (bind to canonical principal, not session_id).
+        if principal.user_id != state.user_id:
             raise EgressAuthError("state user mismatch")
-        if current_auth_method is not None and current_auth_method != state.auth_method:
+        if principal.auth_method != state.auth_method:
             raise EgressAuthError("state auth_method mismatch")
 
+        _check_response_issuer(state.expected_issuer, response_issuer)
+
         cfg = resolve_provider(egress_oauth)
-        token = await oauth_engine.exchange_code(
-            cfg=cfg,
-            client_id=egress_oauth["client_id"],
-            client_secret=self._client_secret(cfg, egress_oauth),
-            code=code,
-            redirect_uri=self._callback_url,
-            pkce_verifier=state.pkce_verifier,
-        )
-        # Bind the credential to the destinations + token endpoint registered at
-        # consent time; the vend refuses any other upstream / token URL (see
-        # egress_auth.upstream_binding and get_valid_token).
+        # The code is exchanged at the token endpoint the user consented under. A
+        # repointed custom_token_url must not receive this code + client secret.
+        if cfg.token_url != state.token_url:
+            raise EgressAuthError("token endpoint changed during consent")
+        try:
+            token = await oauth_engine.exchange_code(
+                cfg=cfg,
+                client_id=egress_oauth["client_id"],
+                client_secret=self._client_secret(cfg, egress_oauth),
+                code=code,
+                redirect_uri=self._callback_url,
+                pkce_verifier=state.pkce_verifier,
+            )
+        except oauth_engine.OAuthEngineError as exc:
+            # Provider rejected the exchange (e.g. incorrect_client_credentials) or
+            # was unreachable. The engine message carries the provider's error code
+            # only, never the secret; log it here because callers show a generic page.
+            logger.warning(
+                "egress code exchange failed provider=%s server=%s: %s",
+                state.provider,
+                state.server_path,
+                exc,
+            )
+            raise EgressAuthError("code exchange failed") from exc
+        # Bind the credential to exactly what the user approved when consent began;
+        # the vend refuses any other upstream / token URL (see get_valid_token).
         token = token.model_copy(
-            update={"bound_upstreams": list(bound_upstreams), "bound_token_url": cfg.token_url}
+            update={
+                "bound_upstreams": list(state.approved_upstreams),
+                "bound_token_url": state.token_url,
+            }
         )
+        # `purpose` is part of the ADDRESS, not the payload: this write cannot land on
+        # an entry belonging to the other purpose, so there is nothing to collide with,
+        # evict, or re-scope, and no stored field a later refresh could reclassify.
         await self._store.put_token(
-            state.auth_method, state.user_id, state.provider, state.server_path, token
+            state.auth_method,
+            state.user_id,
+            state.provider,
+            state.server_path,
+            token,
+            purpose=state.purpose,
         )
         return EgressConnection(
             provider=state.provider,
@@ -361,29 +624,23 @@ class EgressAuthService:
 
     # -- vend ----------------------------------------------------------------- #
 
-    async def get_valid_token(
+    def _vendable(
         self,
-        auth_method: str,
-        user_id: str,
-        server_path: str,
+        token: StoredToken | None,
         egress_oauth: dict,
-        *,
         requested_upstream: str,
-    ) -> str | None:
-        """Vend a valid access token, refreshing if near expiry. None on miss.
+        server_path: str,
+    ) -> bool:
+        """The one gate every stored OAuth token passes before it is used or refreshed.
 
-        Primary refresh mechanism (lazy-on-vend). Returns None when there is no
-        connection, the connection is dead (refresh_failed), the caller is not a
-        per-user principal, or the stored client_id no longer matches (rotated
-        provider app -> force re-consent).
+        Applied to EVERY vault read on the vend path -- the first read and each
+        re-read inside the refresh single-flight -- because a concurrent re-consent
+        can replace the entry between reads with a credential bound elsewhere. A
+        check made on one read says nothing about the next.
         """
-        if not is_per_user_auth_method(auth_method):
-            return None
-
         provider = egress_oauth["provider"]
-        token = await self._store.get_token(auth_method, user_id, provider, server_path)
         if token is None or token.status == "refresh_failed":
-            return None
+            return False
 
         # client-id binding: rotated provider app -> re-consent.
         if token.client_id and token.client_id != egress_oauth.get("client_id"):
@@ -392,13 +649,11 @@ class EgressAuthService:
                 provider,
                 server_path,
             )
-            return None
+            return False
 
-        # destination binding: the credential may only travel to an upstream that
-        # was registered when it was stored. A repointed proxy_pass_url (or a
-        # newly added version) is a MISS -> re-consent, never a vend to the new
-        # host. Legacy entries carry an empty set and re-consent once.
-        if requested_upstream not in set(token.bound_upstreams):
+        # Exact destination binding: a credential is only sent to a URL the user
+        # approved when it was written.
+        if requested_upstream not in token.bound_upstreams:
             logger.warning(
                 "egress vend: upstream binding mismatch for %s/%s (requested %r not in "
                 "bound set); refusing to vend -- forcing re-consent",
@@ -406,7 +661,7 @@ class EgressAuthService:
                 server_path,
                 requested_upstream,
             )
-            return None
+            return False
 
         # token-endpoint binding: a repointed custom_token_url would send the
         # refresh_token + client_secret to a new endpoint on the next refresh.
@@ -423,11 +678,58 @@ class EgressAuthService:
                     provider,
                     server_path,
                 )
-                return None
+                return False
+        return True
 
-        if self._is_near_expiry(token):
+    async def _read_vendable(
+        self,
+        auth_method: str,
+        user_id: str,
+        server_path: str,
+        egress_oauth: dict,
+        requested_upstream: str,
+        purpose: str,
+    ) -> StoredToken | None:
+        """Read the vault entry; None unless it passes ``_vendable``."""
+        token = await self._store.get_token(
+            auth_method, user_id, egress_oauth["provider"], server_path, purpose=purpose
+        )
+        if not self._vendable(token, egress_oauth, requested_upstream, server_path):
+            return None
+        return token
+
+    async def get_valid_token(
+        self,
+        auth_method: str,
+        user_id: str,
+        server_path: str,
+        egress_oauth: dict,
+        *,
+        requested_upstream: str,
+        purpose: str,
+    ) -> str | None:
+        """Vend a valid access token, refreshing if near expiry. None on miss.
+
+        Primary refresh mechanism (lazy-on-vend). Returns None when there is no
+        connection, the connection is dead (refresh_failed), the caller is not a
+        per-user principal, or the entry fails a binding (``_vendable``).
+
+        ``purpose`` is required, not defaulted, because it selects which vault address
+        space to read: a user's own runtime credential (``egress``) and the identity the
+        registry borrows for its headless calls (``discovery``) live at different
+        addresses. A caller therefore cannot reach the other purpose's credential at
+        all -- not "is refused after reading it". Defaulting would let a caller cross
+        the boundary by omission, which is the whole failure mode.
+        """
+        if not is_per_user_auth_method(auth_method):
+            return None
+
+        token = await self._read_vendable(
+            auth_method, user_id, server_path, egress_oauth, requested_upstream, purpose
+        )
+        if token is not None and self._is_near_expiry(token):
             token = await self._refresh_single_flight(
-                auth_method, user_id, server_path, egress_oauth, token
+                auth_method, user_id, server_path, egress_oauth, requested_upstream, purpose
             )
         return token.access_token if token else None
 
@@ -437,31 +739,41 @@ class EgressAuthService:
         user_id: str,
         server_path: str,
         egress_oauth: dict,
-        token: StoredToken,
+        requested_upstream: str,
+        purpose: str,
     ) -> StoredToken | None:
         """Single-flight refresh: cross-replica lease + post-acquire double-check.
 
         The post-acquire re-read is the CORRECTNESS anchor (a second waiter that
         finds a fresh token after acquiring does nothing); the lease only prevents
         refresh storms / rotating-refresh churn across replicas. The lease key is
-        the canonical vault tuple so it matches the vault namespacing exactly.
+        the canonical vault tuple -- purpose included -- so it matches the vault
+        namespacing exactly and two purposes never contend for one lease.
+
+        Every re-read goes through ``_read_vendable``: the entry may have been
+        replaced since the caller's first read.
         """
         provider = egress_oauth["provider"]
-        key = f"{auth_method}|{user_id}|{provider}|{server_path}"
+        key = f"{purpose}|{auth_method}|{user_id}|{provider}|{server_path}"
 
         acquired = await self._lease.acquire(key, self._holder, self._lease_ttl)
         if not acquired:
             # Could not take the lease (another replica is refreshing). Re-read
             # once -- if it refreshed, use that; else fall back to the stale token
             # rather than racing a concurrent refresh against a rotating provider.
-            current = await self._store.get_token(auth_method, user_id, provider, server_path)
-            return current if current and current.status != "refresh_failed" else None
+            return await self._read_vendable(
+                auth_method, user_id, server_path, egress_oauth, requested_upstream, purpose
+            )
 
         try:
-            current = await self._store.get_token(auth_method, user_id, provider, server_path)
-            if current and not self._is_near_expiry(current):
+            current = await self._read_vendable(
+                auth_method, user_id, server_path, egress_oauth, requested_upstream, purpose
+            )
+            if current is None:
+                return None
+            if not self._is_near_expiry(current):
                 return current  # another waiter already refreshed
-            if current is None or not current.refresh_token:
+            if not current.refresh_token:
                 return None
             cfg = resolve_provider(egress_oauth)
             try:
@@ -475,20 +787,28 @@ class EgressAuthService:
                 # Dead refresh token: mark the entry failed so the next vend
                 # returns None -> consent URL, rather than retrying forever.
                 failed = current.model_copy(update={"status": "refresh_failed"})
-                await self._store.put_token(auth_method, user_id, provider, server_path, failed)
+                await self._store.put_token(
+                    auth_method, user_id, provider, server_path, failed, purpose=purpose
+                )
                 logger.warning(
                     "egress refresh failed (dead refresh token) for %s/%s; marked refresh_failed",
                     provider,
                     server_path,
                 )
                 return None
+            # Carry the consent-time bindings forward. The refreshed token is written
+            # back to the address it was read from, so a refresh cannot move an entry
+            # between purposes -- the failure mode that existed while purpose was a
+            # mutable payload field a rewrite could drop.
             new = new.model_copy(
                 update={
                     "bound_upstreams": current.bound_upstreams,
                     "bound_token_url": current.bound_token_url,
                 }
             )
-            await self._store.put_token(auth_method, user_id, provider, server_path, new)
+            await self._store.put_token(
+                auth_method, user_id, provider, server_path, new, purpose=purpose
+            )
             return new
         finally:
             await self._lease.release(key, self._holder)
@@ -523,9 +843,19 @@ class EgressAuthService:
         user_id: str,
         provider: str,
         server_path: str,
+        *,
+        purpose: str,
     ) -> None:
-        """Delete the vault entry (idempotent). Provider-side revoke is a future follow-on."""
-        await self._store.delete_token(auth_method, user_id, provider, server_path)
+        """Delete the vault entry (idempotent). Provider-side revoke is a future follow-on.
+
+        ``purpose`` is required with no default, for the same reason the vend requires it.
+        A default would silently pin every caller to one address space, which is how the
+        discovery space ended up reachable for writes and reads but not deletes. Revoking
+        a designation MUST reach the discovery entry: otherwise turning discovery off
+        leaves a live delegated credential for a real person that nothing removes and
+        nobody sees, since it is deliberately absent from that user's Connected Accounts.
+        """
+        await self._store.delete_token(auth_method, user_id, provider, server_path, purpose=purpose)
 
     # -- pat (static per-user PAT / API-key) ---------------------------------- #
 
@@ -557,13 +887,15 @@ class EgressAuthService:
         """
         if not is_per_user_auth_method(auth_method):
             return None
-        token = await self._store.get_token(auth_method, user_id, provider, server_path)
+        token = await self._store.get_token(
+            auth_method, user_id, provider, server_path, purpose=keys.EGRESS_PURPOSE
+        )
         if token is None:
             return None
         # Enforce the bounded lifetime at the sink: an expired PAT is a MISS.
         if not token.expires_at or self._is_expired(token.expires_at):
             return None
-        if requested_upstream not in set(token.bound_upstreams):
+        if requested_upstream not in token.bound_upstreams:
             logger.warning(
                 "egress vend: pat upstream binding mismatch for %s/%s; treating as a miss",
                 provider,
@@ -581,7 +913,9 @@ class EgressAuthService:
         token: StoredToken,
     ) -> None:
         """Store a per-user PAT (thin wrapper over the SecretStore)."""
-        await self._store.put_token(auth_method, user_id, provider, server_path, token)
+        await self._store.put_token(
+            auth_method, user_id, provider, server_path, token, purpose=keys.EGRESS_PURPOSE
+        )
 
     async def get_pat_status(
         self,
@@ -597,7 +931,9 @@ class EgressAuthService:
         """
         if not is_per_user_auth_method(auth_method):
             return None
-        return await self._store.get_token(auth_method, user_id, provider, server_path)
+        return await self._store.get_token(
+            auth_method, user_id, provider, server_path, purpose=keys.EGRESS_PURPOSE
+        )
 
     async def delete_pat(
         self,
@@ -607,4 +943,6 @@ class EgressAuthService:
         server_path: str,
     ) -> None:
         """Delete the caller's stored PAT (idempotent)."""
-        await self._store.delete_token(auth_method, user_id, provider, server_path)
+        await self._store.delete_token(
+            auth_method, user_id, provider, server_path, purpose=keys.EGRESS_PURPOSE
+        )

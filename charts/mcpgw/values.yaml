@@ -3,7 +3,7 @@ global:
   image:
     # Container registry (host + optional namespace). Shared default across subcharts.
     registry: public.ecr.aws/p3v1o3c6
-    tag: 1.29.0
+    tag: 1.37.0
     pullPolicy: IfNotPresent
 # Per-service image configuration
 # Any field left empty falls back to the corresponding global.image.* value.
@@ -38,6 +38,10 @@ app:
   # Uncomment to use a specific key:
   # secretKey: "your-secure-key-here"
 
+  # Debug only: log the raw user search query at INFO. A query is free text a user
+  # typed and can carry PII, so this stays false outside of debugging. The server
+  # logs a startup warning while it is on.
+  searchLogQueryText: false
   # GitHub private repo auth (SKILL.md fetching)
   githubPat: ""
   githubPatExistingSecret: "" # If set, read GITHUB_PAT from this K8s secret
@@ -58,6 +62,21 @@ app:
   appLogLevel: "INFO" # Application log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
   appLogMaxBytes: "52428800" # Max size per log file before rotation (default 50 MB)
   appLogBackupCount: "5" # Number of rotated backup log files to keep
+  # Egress httpx client connection pooling. mcpgw holds ONE process-lifetime
+  # pooled client for every outbound hop (registry API calls + the Keycloak M2M
+  # token POST); see servers/mcpgw/http_pool.py. Keep
+  # httpPoolKeepaliveExpirySeconds below the shortest upstream/LB idle timeout.
+  # Same leaf names as the registry/auth-server charts (there they live under
+  # egressAuth.*); keep the values in sync across all three services.
+  httpPoolMaxConnections: "100"
+  httpPoolMaxKeepalive: "20"
+  httpPoolKeepaliveExpirySeconds: "30"
+  httpPoolConnectRetries: "1"
+  # Comma-separated CIDR ranges that let mcpgw's egress guard reach a reserved
+  # address, such as an Istio ServiceEntry VIP in 240.240.0.0/16. Private and
+  # loopback targets are already allowed. For a standalone install; under the stack
+  # chart set global.ssrfAllowedCidrs instead, which wins over this value. #2018
+  ssrfAllowedCidrs: ""
 # Service configuration
 service:
   type: ClusterIP

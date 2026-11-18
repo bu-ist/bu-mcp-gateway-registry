@@ -975,7 +975,7 @@ class MatchingToolResult(BaseModel):
 
     tool_name: str = Field(..., description="Tool name")
     description: str | None = Field(None, description="Tool description")
-    relevance_score: float = Field(0.0, ge=0.0, le=1.0, description="Relevance score")
+    relevance_score: float = Field(..., ge=0.0, le=1.0, description="Relevance score")
     match_context: str | None = Field(None, description="Why this tool matched")
     inputSchema: dict[str, Any] | None = Field(
         None, description="JSON Schema for tool input parameters"
@@ -1000,6 +1000,16 @@ class SemanticDiscoveredServer(BaseModel):
     path: str = Field(..., description="Server path")
     server_name: str = Field(..., description="Server name")
     relevance_score: float = Field(..., description="Semantic similarity score")
+    similarity_score: float | None = Field(
+        None,
+        ge=-1.0,
+        le=1.0,
+        description=(
+            "Raw cosine similarity to the query, in [-1.0, 1.0]. Negative means less "
+            "alike than two random vectors, so this is not a 0-to-1 confidence. Null "
+            "when the query was not embedded or the entry has no document path."
+        ),
+    )
     description: str | None = Field(None, description="Server description")
     tags: list[str] = Field(default_factory=list, description="Server tags")
     num_tools: int = Field(0, description="Number of tools")
@@ -1035,6 +1045,16 @@ class ToolSearchResult(BaseModel):
     description: str | None = Field(None, description="Tool description")
     inputSchema: dict[str, Any] | None = Field(None, description="JSON Schema for tool input")
     relevance_score: float = Field(..., ge=0.0, le=1.0, description="Relevance score")
+    similarity_score: float | None = Field(
+        None,
+        ge=-1.0,
+        le=1.0,
+        description=(
+            "Raw cosine similarity to the query, in [-1.0, 1.0]. Negative means less "
+            "alike than two random vectors, so this is not a 0-to-1 confidence. Null "
+            "when the query was not embedded or the entry has no document path."
+        ),
+    )
     match_context: str | None = Field(None, description="Why this tool matched")
     # Endpoint URL for the parent MCP server
     endpoint_url: str | None = Field(
@@ -1051,6 +1071,16 @@ class AgentSearchResult(BaseModel):
 
     path: str = Field(..., description="Agent path for identification")
     relevance_score: float = Field(..., ge=0.0, le=1.0, description="Relevance score")
+    similarity_score: float | None = Field(
+        None,
+        ge=-1.0,
+        le=1.0,
+        description=(
+            "Raw cosine similarity to the query, in [-1.0, 1.0]. Negative means less "
+            "alike than two random vectors, so this is not a 0-to-1 confidence. Null "
+            "when the query was not embedded or the entry has no document path."
+        ),
+    )
     match_context: str | None = Field(None, description="Why this agent matched")
     agent_card: dict[str, Any] = Field(..., description="Full agent card with all details")
 
@@ -1072,6 +1102,16 @@ class SkillSearchResult(BaseModel):
     health_status: str = Field("unknown", description="Health status")
     last_checked_time: str | None = Field(None, description="Last health check time")
     relevance_score: float = Field(..., ge=0.0, le=1.0, description="Relevance score")
+    similarity_score: float | None = Field(
+        None,
+        ge=-1.0,
+        le=1.0,
+        description=(
+            "Raw cosine similarity to the query, in [-1.0, 1.0]. Negative means less "
+            "alike than two random vectors, so this is not a 0-to-1 confidence. Null "
+            "when the query was not embedded or the entry has no document path."
+        ),
+    )
     match_context: str | None = Field(None, description="Why this skill matched")
 
 
@@ -1087,6 +1127,16 @@ class VirtualServerSearchResult(BaseModel):
     backend_paths: list[str] = Field(default_factory=list, description="Backend server paths")
     is_enabled: bool = Field(False, description="Whether virtual server is enabled")
     relevance_score: float = Field(..., ge=0.0, le=1.0, description="Relevance score")
+    similarity_score: float | None = Field(
+        None,
+        ge=-1.0,
+        le=1.0,
+        description=(
+            "Raw cosine similarity to the query, in [-1.0, 1.0]. Negative means less "
+            "alike than two random vectors, so this is not a 0-to-1 confidence. Null "
+            "when the query was not embedded or the entry has no document path."
+        ),
+    )
     match_context: str | None = Field(None, description="Why this matched")
     matching_tools: list[MatchingToolResult] = Field(
         default_factory=list, description="Matching tools"
@@ -1668,6 +1718,15 @@ class SkillSearchResponse(BaseModel):
     total_count: int = Field(0, description="Total matches")
 
 
+class ToolToggleResponse(BaseModel):
+    """Response model for the per-tool block toggle."""
+
+    tool_name: str = Field(..., description="Name of the tool that was toggled")
+    enabled: bool = Field(
+        ..., description="New state. False means the tool is blocked and tools/call is rejected"
+    )
+
+
 class SkillToggleResponse(BaseModel):
     """Response model for skill toggle."""
 
@@ -1810,9 +1869,14 @@ class RegistryClient:
             or "/versions" in endpoint
             or "/egress-auth" in endpoint
             or "/egress-pat" in endpoint
+            or "/check-duplicates" in endpoint
             # The server rate endpoint (POST /api/servers/{path}/rate) takes a
             # JSON RatingRequest body, not form data.
             or endpoint.endswith("/rate")
+            # The per-tool block toggle takes a JSON ToolTogglePayload. Server
+            # registration on /api/servers is form-encoded, so this needs naming
+            # explicitly rather than relying on the /api/servers prefix.
+            or "/toggle-tool" in endpoint
             or (method in ("PUT", "PATCH") and endpoint.startswith("/api/servers/"))
         ):
             # Send as JSON for agent, management, search, federation, and import endpoints
@@ -1838,6 +1902,57 @@ class RegistryClient:
                     logger.warning(f"Could not parse 422 error response as JSON: {e}")
             raise
         return response
+
+    def check_duplicates(
+        self,
+        entity_type: str,
+        name: str,
+        description: str | None = None,
+        identity_url: str | None = None,
+        self_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Ask the registry whether a registration would duplicate an existing entity.
+
+        Advisory only: the registry never blocks a registration on the result,
+        and neither does this method. Two independent checks come back in one
+        envelope — ``collision_with`` for an exact identity-URL match (the
+        strong signal) and ``advisory_matches`` for semantic similarity above
+        the configured threshold.
+
+        Args:
+            entity_type: ``server``, ``agent``, or ``skill``.
+            name: Proposed entity name.
+            description: Proposed description; sharpens the similarity half.
+            identity_url: The URL that identifies the entity — ``proxy_pass_url``
+                for a server, ``url`` for an agent, ``skill_md_url`` for a skill.
+            self_path: Path to exclude, so editing an entity does not match itself.
+
+        Returns:
+            The ``DuplicateCheckResult`` envelope as a dict.
+
+        Raises:
+            ValueError: If ``entity_type`` is not one of the three.
+            requests.HTTPError: If the request fails.
+        """
+        url_field = {
+            "server": "proxy_pass_url",
+            "agent": "url",
+            "skill": "skill_md_url",
+        }.get(entity_type)
+        if url_field is None:
+            raise ValueError(f"entity_type must be server, agent, or skill (got {entity_type!r})")
+
+        payload: dict[str, Any] = {"name": name}
+        if description:
+            payload["description"] = description
+        if identity_url:
+            payload[url_field] = identity_url
+        if self_path:
+            payload["self_path"] = self_path
+
+        endpoint = f"/api/{entity_type}s/check-duplicates"
+        response = self._make_request(method="POST", endpoint=endpoint, data=payload)
+        return response.json()
 
     def register_service(self, registration: InternalServiceRegistration) -> ServiceResponse:
         """
@@ -2995,6 +3110,54 @@ class RegistryClient:
 
         logger.info(f"Agent deleted successfully: {path}")
 
+    def toggle_tool(
+        self,
+        service_path: str,
+        tool_name: str,
+        enabled: bool,
+    ) -> ToolToggleResponse:
+        """
+        Block or unblock a single tool on a server.
+
+        A blocked tool is rejected on ``tools/call`` and withheld from the
+        agent-facing projections (the proxy's ``tools/list``, semantic search,
+        ``server.json``). The server itself stays enabled, so its other tools keep
+        working.
+
+        Blocking by hand records ``source="admin"``, which a later security rescan
+        preserves. That is what makes an unblock durable: without it the next scan
+        would re-block a tool the scanner still flags.
+
+        Args:
+            service_path: Server path, for example "/context7"
+            tool_name: Tool to toggle. Must exist on that server
+            enabled: True to unblock, False to block
+
+        Returns:
+            ToolToggleResponse with the new state
+
+        Raises:
+            requests.HTTPError: 404 if the server is not registered, 400 if the
+                tool is not on that server or its name cannot be used as a storage
+                key, 403 without the toggle_service permission
+        """
+        if not service_path.startswith("/"):
+            service_path = "/" + service_path
+
+        logger.info(f"Toggling tool {tool_name!r} on {service_path} to enabled={enabled}")
+
+        response = self._make_request(
+            method="POST",
+            # The /api/servers/... sibling accepts a bearer token; /api/toggle-tool
+            # is session-authenticated for the UI and would 401 here.
+            endpoint=f"/api/servers/toggle-tool{service_path}",
+            data={"tool_name": tool_name, "enabled": enabled},
+        )
+
+        result = response.json()
+        logger.info(f"Tool toggled: {result.get('tool_name')} -> enabled={result.get('enabled')}")
+        return ToolToggleResponse(**result)
+
     def toggle_agent(self, path: str, enabled: bool) -> AgentToggleResponse:
         """
         Toggle agent enabled/disabled status.
@@ -3902,6 +4065,8 @@ class RegistryClient:
         custom_scope_separator: str | None = None,
         custom_token_auth_style: str | None = None,
         custom_resource: str | None = None,
+        expected_issuer: str | None = None,
+        list_tools_before_consent: bool = False,
     ) -> dict[str, Any]:
         """Configure per-user egress auth on a server (admin only).
 
@@ -3930,6 +4095,13 @@ class RegistryClient:
             custom_resource: RFC 8707 resource indicator, sent on both the
                 authorize and token requests to bind the token to one protected
                 resource (custom only).
+            expected_issuer: RFC 9207 issuer of the provider's authorization
+                server (any provider). When set, the callback rejects a reply
+                whose ``iss`` names a different issuer.
+            list_tools_before_consent: oauth_user and pat only. List the
+                server's stored tools on a direct-route tools/list before the
+                user connects (issue #1986). The request replaces the whole
+                config, so leaving this False turns it off.
 
         Returns:
             Non-secret egress config view dict.
@@ -3965,6 +4137,9 @@ class RegistryClient:
             body["custom_token_auth_style"] = custom_token_auth_style
         if custom_resource is not None:
             body["custom_resource"] = custom_resource
+        if expected_issuer is not None:
+            body["expected_issuer"] = expected_issuer
+        body["list_tools_before_consent"] = list_tools_before_consent
 
         response = self._make_request(
             method="POST",

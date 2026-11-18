@@ -21,8 +21,9 @@ const MAX_BUNDLE_BYTES = 10 * 1024 * 1024; // 10 MB
 const FETCH_CONCURRENCY = 4;
 
 // Resources whose contents render usefully inline (markdown / code).
-// Assets are treated as opaque in v1 (download-only) since the server
-// returns content as UTF-8 text and binary assets would be corrupted.
+// Assets are treated as opaque (download-only). The API returns text assets in
+// `content` and binary assets as base64 JSON, so an asset can never choose an
+// executable content type.
 const TEXT_PREVIEWABLE_TYPES: ReadonlySet<SkillResource['type']> = new Set<SkillResource['type']>(
   ['script', 'reference', 'agent'],
 );
@@ -96,11 +97,24 @@ function _isOverCap(resources: SkillResource[]): CapResult {
 }
 
 
+// Blob MIME types are fixed constants at the download site, never derived from
+// the resource path: a path-derived text/html on a blob: URL would run with
+// this page's origin.
+export type FetchedResource =
+  | { path: string; kind: 'text'; content: string }
+  | { path: string; kind: 'binary'; content: Uint8Array };
+
+
+function _decodeBase64(value: string): Uint8Array {
+  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+}
+
+
 async function _fetchResource(
   skillApiPath: string,
   resourcePath: string,
   authToken: string | null,
-): Promise<{ path: string; content: string }> {
+): Promise<FetchedResource> {
   const headers = authToken ? { Authorization: `Bearer ${authToken}` } : undefined;
   const resp = await axios.get(
     `/api/skills${skillApiPath}/content`,
@@ -109,7 +123,24 @@ async function _fetchResource(
       ...(headers ? { headers } : {}),
     },
   );
-  return { path: resourcePath, content: resp.data.content as string };
+  const data = (
+    resp.data !== null && typeof resp.data === 'object' ? resp.data : {}
+  ) as { content?: unknown; content_base64?: unknown; encoding?: unknown };
+
+  // Binary assets arrive as base64 JSON; text resources and text assets keep
+  // the content field.
+  if (data.encoding === 'base64' && typeof data.content_base64 === 'string') {
+    return {
+      path: resourcePath,
+      kind: 'binary',
+      content: _decodeBase64(data.content_base64),
+    };
+  }
+  return {
+    path: resourcePath,
+    kind: 'text',
+    content: String(data.content ?? ''),
+  };
 }
 
 
@@ -124,10 +155,10 @@ async function _fetchAllWithConcurrency(
   authToken: string | null,
   onProgress: (done: number, total: number) => void,
 ): Promise<{
-  successes: { path: string; content: string }[];
+  successes: FetchedResource[];
   failures: { path: string; error: string }[];
 }> {
-  const successes: { path: string; content: string }[] = [];
+  const successes: FetchedResource[] = [];
   const failures: { path: string; error: string }[] = [];
   const queue = [...resources];
   let done = 0;
@@ -164,7 +195,7 @@ async function _fetchAllWithConcurrency(
 async function _buildAndDownloadZip(
   skill: Skill,
   skillMdContent: string,
-  fetched: { path: string; content: string }[],
+  fetched: FetchedResource[],
 ): Promise<void> {
   const zip = new JSZip();
   zip.file('SKILL.md', skillMdContent);
@@ -203,7 +234,9 @@ function ResourceItem({
     setDownloadError(null);
     try {
       const result = await _fetchResource(skillApiPath, resource.path, authToken);
-      const blob = new Blob([result.content], { type: 'text/plain' });
+      const blob = result.kind === 'binary'
+        ? new Blob([result.content as BlobPart], { type: 'application/octet-stream' })
+        : new Blob([result.content], { type: 'text/plain' });
       triggerBlobDownload(blob, _basename(resource.path));
     } catch (e: any) {
       const status = e?.response?.status;
@@ -216,23 +249,23 @@ function ResourceItem({
   const isPreviewable = TEXT_PREVIEWABLE_TYPES.has(resource.type);
 
   return (
-    <div className="flex items-center justify-between py-2 px-3 border-b border-gray-200 dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800">
+    <div className="flex items-center justify-between py-2 px-3 border-b border-line last:border-b-0 hover:bg-surface-hover">
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="font-mono text-sm text-gray-900 dark:text-gray-100 truncate">
+          <span className="font-mono text-sm text-fg truncate">
             {resource.path}
           </span>
           {resource.language && (
-            <span className="px-2 py-0.5 text-xs font-semibold rounded bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300">
+            <span className="px-2 py-0.5 text-xs font-semibold rounded bg-surface-muted text-fg-muted">
               {resource.language}
             </span>
           )}
-          <span className="text-xs text-gray-500 dark:text-gray-400">
+          <span className="text-xs text-fg-muted">
             {_formatSize(resource.size_bytes)}
           </span>
         </div>
         {downloadError && (
-          <div className="text-xs text-red-600 dark:text-red-400 mt-1" role="alert">
+          <div className="text-xs text-danger-600 dark:text-danger-400 mt-1" role="alert">
             {downloadError}
           </div>
         )}
@@ -243,7 +276,7 @@ function ResourceItem({
             type="button"
             onClick={() => onPreview(resource)}
             aria-label={`View ${resource.path}`}
-            className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-900/30"
+            className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded text-skill-700 dark:text-skill-300 hover:bg-skill-50 dark:hover:bg-skill-500/10"
           >
             <EyeIcon className="h-4 w-4" />
             View
@@ -254,7 +287,7 @@ function ResourceItem({
           onClick={_onDownload}
           disabled={downloading}
           aria-label={`Download ${resource.path}`}
-          className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded text-fg-muted hover:bg-surface-muted hover:text-fg disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <ArrowDownTrayIcon className="h-4 w-4" />
           {downloading ? 'Downloading…' : 'Download'}
@@ -294,24 +327,24 @@ function ResourceGroup({
   const sorted = _sortByPath(resources);
 
   return (
-    <div className="rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+    <div className="rounded-lg border border-line overflow-hidden">
       <button
         type="button"
         onClick={() => setExpanded((e) => !e)}
         aria-expanded={expanded}
-        className="w-full flex items-center justify-between px-3 py-2 bg-gray-50 dark:bg-gray-900/50 hover:bg-gray-100 dark:hover:bg-gray-800 text-left"
+        className="w-full flex items-center justify-between px-3 py-2 bg-surface-muted hover:bg-surface-hover text-left"
       >
-        <span className="font-medium text-gray-800 dark:text-gray-200">
-          {label} <span className="text-gray-500 dark:text-gray-400">({resources.length})</span>
+        <span className="font-medium text-fg">
+          {label} <span className="text-fg-muted">({resources.length})</span>
         </span>
         {expanded ? (
-          <ChevronDownIcon className="h-4 w-4 text-gray-500 dark:text-gray-400" />
+          <ChevronDownIcon className="h-4 w-4 text-fg-muted" />
         ) : (
-          <ChevronRightIcon className="h-4 w-4 text-gray-500 dark:text-gray-400" />
+          <ChevronRightIcon className="h-4 w-4 text-fg-muted" />
         )}
       </button>
       {expanded && (
-        <div className="bg-white dark:bg-gray-900">
+        <div className="bg-surface">
           {sorted.map((r) => (
             <ResourceItem
               key={r.path}
@@ -356,7 +389,12 @@ function ResourcePreview({
     setError(null);
     _fetchResource(skillApiPath, resource.path, authToken)
       .then((result) => {
-        if (!cancelled) setContent(result.content);
+        if (cancelled) return;
+        if (result.kind === 'binary') {
+          setError('Binary resources cannot be previewed. Download the file instead.');
+          return;
+        }
+        setContent(result.content);
       })
       .catch((e: any) => {
         if (cancelled) return;
@@ -378,30 +416,30 @@ function ResourcePreview({
         <button
           type="button"
           onClick={onBack}
-          className="inline-flex items-center gap-1 px-2 py-1 rounded text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-900/30"
+          className="inline-flex items-center gap-1 px-2 py-1 rounded text-skill-700 dark:text-skill-300 hover:bg-skill-50 dark:hover:bg-skill-500/10"
         >
           <ArrowLeftIcon className="h-4 w-4" />
           Back to SKILL.md
         </button>
-        <span className="text-gray-400 dark:text-gray-500">›</span>
-        <span className="font-mono text-gray-700 dark:text-gray-300 truncate">
+        <span className="text-fg-subtle">›</span>
+        <span className="font-mono text-fg-muted truncate">
           {resource.path}
         </span>
       </div>
       {error ? (
-        <div className="text-center py-8 text-red-600 dark:text-red-400">
+        <div className="text-center py-8 text-danger-600 dark:text-danger-400">
           Could not load resource: {error}
         </div>
       ) : content === null ? (
         <div className="flex items-center justify-center py-8">
-          <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-amber-600"></div>
+          <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-skill-600"></div>
         </div>
       ) : isMarkdown ? (
-        <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:text-amber-800 dark:prose-headings:text-amber-200 prose-a:text-amber-600 dark:prose-a:text-amber-400">
+        <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:text-skill-800 dark:prose-headings:text-skill-200 prose-a:text-skill-600 dark:prose-a:text-skill-400">
           <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: safeMarkdownAnchor }}>{content}</ReactMarkdown>
         </div>
       ) : (
-        <pre className="bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-x-auto text-xs">
+        <pre className="bg-surface-muted text-fg rounded p-4 overflow-x-auto text-xs">
           <code>{content}</code>
         </pre>
       )}
@@ -568,9 +606,9 @@ function SkillResourcesInner({
   return (
     <div className="mb-6">
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200">
+        <h3 className="text-sm font-semibold text-fg">
           Resources{' '}
-          <span className="font-normal text-gray-500 dark:text-gray-400">
+          <span className="font-normal text-fg-muted">
             ({all.length} {all.length === 1 ? 'file' : 'files'}, {_formatSize(totalSize)})
           </span>
         </h3>
@@ -579,7 +617,7 @@ function SkillResourcesInner({
           onClick={_onDownloadAllClick}
           disabled={cap.over || bundleStatus === 'preparing'}
           aria-label="Download all classified resources as a zip"
-          className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+          className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded bg-skill-600 hover:bg-skill-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
           title={cap.over ? cap.reason : undefined}
         >
           <ArrowDownTrayIcon className="h-4 w-4" />
@@ -587,12 +625,12 @@ function SkillResourcesInner({
         </button>
       </div>
 
-      <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
+      <p className="text-xs text-fg-muted mb-3">
         Download all bundles classified resources only — files outside{' '}
-        <code className="px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-900">references/</code>,{' '}
-        <code className="px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-900">scripts/</code>,{' '}
-        <code className="px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-900">agents/</code>, and{' '}
-        <code className="px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-900">assets/</code> are not
+        <code className="px-1 py-0.5 rounded bg-surface-muted text-fg">references/</code>,{' '}
+        <code className="px-1 py-0.5 rounded bg-surface-muted text-fg">scripts/</code>,{' '}
+        <code className="px-1 py-0.5 rounded bg-surface-muted text-fg">agents/</code>, and{' '}
+        <code className="px-1 py-0.5 rounded bg-surface-muted text-fg">assets/</code> are not
         included.
       </p>
 
@@ -609,8 +647,8 @@ function SkillResourcesInner({
           role="alert"
           className={`mb-3 px-3 py-2 rounded text-sm ${
             bundleStatus === 'error' || bundleStatus === 'over-cap'
-              ? 'bg-red-50 dark:bg-red-900/30 text-red-800 dark:text-red-200'
-              : 'bg-amber-50 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200'
+              ? 'bg-danger-50 dark:bg-danger-900/30 text-danger-800 dark:text-danger-200'
+              : 'bg-warning-50 dark:bg-warning-900/30 text-warning-800 dark:text-warning-200'
           }`}
         >
           {bundleError}

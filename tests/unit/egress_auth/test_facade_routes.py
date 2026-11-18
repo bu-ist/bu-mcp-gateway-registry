@@ -2,19 +2,21 @@
 
 TestClient over the router with the session read, server_service, and the
 EgressAuthService stubbed. Verifies the param-free /oauth2/egress/connect front
-door (session-gated, including the no-session -> Keycloak login bounce), the
+door (session-gated, including the no-session -> provider login bounce), the
 session-cookie forwarding regression, and the resource-param parsing.
 """
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 import registry.api.egress_oauth_facade_routes as facade
 
 REGISTRY_URL = "https://gw.example.com"
 USER = {
     "username": "alice",
+    "egress_user": "sub-alice",
     "auth_method": "oauth2",
     "client_id": "web",
     "groups": ["mcp-registry-user"],
@@ -56,18 +58,17 @@ def client(monkeypatch):
 
         monkeypatch.setattr(facade.server_service, "get_server_info", _get_server_info)
 
-        # /connect reads the session via _optional_session -> nginx_proxied_auth
-        # (called with session=<cookie>). None user_context simulates no gateway
-        # session (login bounce).
-        async def _session(request, session=None):
+        # /connect reads the session via _optional_session -> browser_session_context.
+        # None user_context simulates no gateway session (login bounce).
+        async def _session(request):
             if user_context is None:
                 raise RuntimeError("no session")
             return user_context
 
-        monkeypatch.setattr(facade, "nginx_proxied_auth", _session)
+        monkeypatch.setattr(facade, "browser_session_context", _session)
 
         class _Svc:
-            def build_consent_url(self, **kwargs):
+            async def build_consent_url(self, **kwargs):
                 _Svc.last_session_id = kwargs.get("session_id")
                 return consent_url
 
@@ -84,13 +85,11 @@ def client(monkeypatch):
 
 @pytest.mark.unit
 class TestOptionalSession:
-    """Regression: _optional_session MUST read the session cookie off the request
-    and pass it explicitly to nginx_proxied_auth. nginx_proxied_auth's `session`
-    is a FastAPI Cookie(...) param only populated by dependency injection; calling
-    it directly without passing the cookie always sees session=None -> the login
-    loop (the live bug)."""
+    """Regression: _optional_session MUST resolve the session cookie the request
+    carries. Reading the session from a dependency parameter that only injection
+    populates always saw no session -> the login loop (the live bug)."""
 
-    async def test_passes_request_cookie_to_nginx_proxied_auth(self, monkeypatch):
+    async def test_resolves_the_request_cookie(self, monkeypatch):
         monkeypatch.setattr(facade.settings, "session_cookie_name", "mcp_gateway_session")
         seen = {}
 
@@ -98,25 +97,35 @@ class TestOptionalSession:
             seen["session"] = session
             return {"username": "alice", "auth_method": "oauth2"}
 
-        monkeypatch.setattr(facade, "nginx_proxied_auth", _fake)
+        monkeypatch.setattr("registry.auth.dependencies.enhanced_auth", _fake)
 
-        class _Req:
-            cookies = {"mcp_gateway_session": "the-cookie-value"}
+        request = Request(
+            {
+                "type": "http",
+                "headers": [(b"cookie", b"mcp_gateway_session=the-cookie-value")],
+            }
+        )
 
-        ctx = await facade._optional_session(_Req())
+        ctx = await facade._optional_session(request)
         assert ctx["username"] == "alice"
-        assert seen["session"] == "the-cookie-value"  # extracted + forwarded
+        assert seen["session"] == "the-cookie-value"  # extracted + resolved
 
     async def test_returns_none_when_auth_raises(self, monkeypatch):
+        monkeypatch.setattr(facade.settings, "session_cookie_name", "mcp_gateway_session")
+
         async def _raise(request, session=None):
-            raise RuntimeError("no session")
+            raise RuntimeError("session store down")
 
-        monkeypatch.setattr(facade, "nginx_proxied_auth", _raise)
+        monkeypatch.setattr("registry.auth.dependencies.enhanced_auth", _raise)
 
-        class _Req:
-            cookies = {}
+        request = Request(
+            {
+                "type": "http",
+                "headers": [(b"cookie", b"mcp_gateway_session=the-cookie-value")],
+            }
+        )
 
-        assert await facade._optional_session(_Req()) is None
+        assert await facade._optional_session(request) is None
 
 
 @pytest.mark.unit
@@ -162,7 +171,8 @@ class TestConnectRoute:
         # Uses the real session_id, never a facade-marked one (no leg-1 resume).
         assert not (c._svc.last_session_id or "").startswith("facade:")
 
-    def test_connect_no_session_bounces_to_keycloak_login(self, client):
+    def test_connect_no_session_bounces_to_keycloak_login(self, client, monkeypatch):
+        monkeypatch.setattr(facade.settings, "auth_provider", "keycloak")
         c = client(user_context=None, server=_server())
         r = c.get("/oauth2/egress/connect", params={"server": "/github"})
         assert r.status_code == 302
@@ -171,6 +181,52 @@ class TestConnectRoute:
         # returns to /connect with its query preserved (anti-phishing: the opener
         # must authenticate before consent starts)
         assert "oauth2%2Fegress%2Fconnect" in loc
+
+    @pytest.mark.parametrize("auth_provider", ["entra", "cognito", " Okta "])
+    def test_connect_no_session_bounces_to_configured_provider_login(
+        self, client, monkeypatch, auth_provider
+    ):
+        """The bounce follows AUTH_PROVIDER: a hard-coded /oauth2/login/keycloak
+        showed a blank page on deployments that sign users in with another IdP."""
+        monkeypatch.setattr(facade.settings, "auth_provider", auth_provider)
+        c = client(user_context=None, server=_server())
+        r = c.get("/oauth2/egress/connect", params={"server": "/github"})
+        assert r.status_code == 302
+        loc = r.headers["location"]
+        expected = auth_provider.strip().lower()
+        assert loc.startswith(f"{REGISTRY_URL}/oauth2/login/{expected}?redirect_uri=")
+        assert "oauth2%2Fegress%2Fconnect" in loc
+
+    @pytest.mark.parametrize("auth_provider", ["", None, "entra/../admin", "a b"])
+    def test_connect_no_session_unusable_provider_falls_back_to_keycloak(
+        self, client, monkeypatch, auth_provider
+    ):
+        """An empty or malformed AUTH_PROVIDER never reaches the login URL path."""
+        monkeypatch.setattr(facade.settings, "auth_provider", auth_provider)
+        c = client(user_context=None, server=_server())
+        r = c.get("/oauth2/egress/connect", params={"server": "/github"})
+        assert r.status_code == 302
+        assert r.headers["location"].startswith(f"{REGISTRY_URL}/oauth2/login/keycloak?")
+
+    def test_unavailable_versions_is_503_temporarily_unavailable(self, client, monkeypatch):
+        """An incomplete registration must not be reported as the caller's bad request.
+
+        ``build_consent_url`` raises ValueError when a linked version document is
+        missing or has no endpoint. That is a server-side configuration fault, so
+        the OAuth error must be ``temporarily_unavailable`` with 503, not
+        ``invalid_request`` with 409, which would tell the client its own request
+        was malformed and invite it to change the request.
+        """
+
+        class _Broken:
+            async def build_consent_url(self, **kwargs):
+                raise ValueError("linked version has no endpoint")
+
+        c = client(server=_server())
+        monkeypatch.setattr(facade, "get_egress_auth_service", lambda: _Broken())
+        r = c.get("/oauth2/egress/connect", params={"server": "/github"})
+        assert r.status_code == 503
+        assert r.json()["error"] == "temporarily_unavailable"
 
     def test_connect_non_per_user_denied(self, client):
         c = client(user_context=STATIC, server=_server())
@@ -201,3 +257,118 @@ class TestConnectRoute:
         )
         assert r.status_code == 302
         assert r.headers["location"].startswith("https://github.com/login/oauth/authorize")
+
+
+@pytest.mark.unit
+class TestConnectDiscovery:
+    """purpose=discovery: the backend-auth headless borrow. Requires the
+    egress feature flag; reads the server's OWN oauth_discovery.oauth; owner or
+    admin only."""
+
+    def _disc_server(self, **over) -> dict:
+        base = {
+            "path": "/tableau",
+            "registered_by": "alice",  # matches USER.username -> owner
+            "oauth_discovery": {
+                "enabled": True,
+                "oauth": {
+                    "provider": "custom",
+                    "client_id": "cid",
+                    "client_secret_encrypted": "enc",
+                    "scopes": ["tableau:content:read"],
+                    "custom_authorize_url": "https://sso.example.com/authorize",
+                    "custom_token_url": "https://sso.example.com/token",
+                },
+                # A designation must exist before consent: connecting first would vault
+                # an entry nothing reads, which then blocks this principal's own egress
+                # consent for the same provider+server. USER's canonical principal is
+                # (oauth2, egress_user).
+                "auth_method": "oauth2",
+                "user_id": "sub-alice",
+                "designated_by": "alice",
+            },
+        }
+        base.update(over)
+        return base
+
+    def test_discovery_connect_redirects_to_provider(self, client):
+        c = client(server=self._disc_server())
+        r = c.get(
+            "/oauth2/egress/connect",
+            params={"server": "/tableau", "purpose": "discovery"},
+        )
+        assert r.status_code == 302
+        assert r.headers["location"].startswith("https://github.com/login/oauth/authorize")
+
+    def test_discovery_connect_404s_when_feature_disabled(self, client):
+        """Discovery consent REQUIRES the egress feature, like every other purpose.
+
+        An earlier revision exempted purpose=discovery from this gate on the theory
+        that backend-auth discovery was independent of egress. It is not: the consent
+        writes into the per-user egress vault and the borrow reads from it, so the
+        exemption only ever let a deployment accept a designation its own vend path
+        was switched off for. The router also only mounts this route under the same
+        flag, so the exemption was unreachable in production and purely misleading.
+        """
+        c = client(server=self._disc_server(), enabled=False)
+        r = c.get(
+            "/oauth2/egress/connect",
+            params={"server": "/tableau", "purpose": "discovery"},
+        )
+        assert r.status_code == 404
+
+    def test_discovery_connect_no_config_400(self, client):
+        c = client(server={"path": "/tableau", "registered_by": "alice"})
+        r = c.get(
+            "/oauth2/egress/connect",
+            params={"server": "/tableau", "purpose": "discovery"},
+        )
+        assert r.status_code == 400
+
+    def test_discovery_connect_non_owner_denied(self, client):
+        c = client(server=self._disc_server(registered_by="someone-else"))
+        r = c.get(
+            "/oauth2/egress/connect",
+            params={"server": "/tableau", "purpose": "discovery"},
+        )
+        assert r.status_code == 403
+
+    def test_discovery_connect_requires_a_designation_first(self, client):
+        """Consenting before anyone is designated is a self-inflicted lockout.
+
+        handle_callback vaults at the CONSENTING principal while the borrow reads the
+        DESIGNATED one, so with no designation the entry is written where nothing looks
+        -- and because it is recorded purpose='discovery', it then blocks this same
+        person's own egress consent for that provider+server with a 409 about something
+        they never knowingly created.
+        """
+        disc = self._disc_server()
+        disc["oauth_discovery"] = {**disc["oauth_discovery"], "auth_method": "", "user_id": ""}
+        c = client(server=disc)
+        r = c.get(
+            "/oauth2/egress/connect",
+            params={"server": "/tableau", "purpose": "discovery"},
+        )
+        assert r.status_code == 400, r.text
+        assert "no discovery identity is designated" in r.text
+
+    def test_discovery_connect_refuses_a_principal_other_than_the_designee(self, client):
+        """Owner-or-admin authorizes you to DESIGNATE, not to consent as someone else.
+
+        A second admin completing this flow would vault a token at their own address
+        while discovery keeps reading the designee's -- silent degradation to
+        unauthenticated, with only a log line.
+        """
+        disc = self._disc_server()
+        disc["oauth_discovery"] = {
+            **disc["oauth_discovery"],
+            "user_id": "some-other-admin-sub",
+            "designated_by": "other-admin",
+        }
+        c = client(server=disc)
+        r = c.get(
+            "/oauth2/egress/connect",
+            params={"server": "/tableau", "purpose": "discovery"},
+        )
+        assert r.status_code == 403, r.text
+        assert "designated to" in r.text

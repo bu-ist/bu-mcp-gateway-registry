@@ -1,5 +1,6 @@
 """DocumentDB-based repository for hybrid search (text + vector)."""
 
+import asyncio
 import logging
 import math
 import re
@@ -9,6 +10,8 @@ from motor.motor_asyncio import AsyncIOMotorCollection
 
 from ...core.config import embedding_config, settings
 from ...schemas.agent_models import AgentCard
+from ...utils.embedding_text import EmbeddingText
+from ...utils.embeddings_provider import default_retry_max_input_chars
 from ...utils.metadata import flatten_metadata_to_text
 from ...utils.vector import cosine_similarity
 from ..interfaces import SearchRepositoryBase
@@ -66,6 +69,37 @@ _STOPWORDS: set[str] = {
     "set",
     "put",
 }
+
+
+# Reported for a path whose entry was stored without a vector. The entry is still
+# found by keyword search; the registry log has the provider's error for the path.
+REINDEX_NO_EMBEDDING_ERROR: str = (
+    "Stored without an embedding: the embeddings provider rejected or failed the "
+    "request. The entry is still found by keyword search; see the registry log for "
+    "the provider's error."
+)
+
+
+# Matches an embeddings-collection record that actually has a vector. A record whose
+# embedding call failed is stored with an empty list (still found by keyword search),
+# so the record existing is not enough. $nin with None also excludes a missing field.
+HAS_VECTOR_FILTER: dict[str, Any] = {"embedding": {"$nin": [None, []]}}
+
+
+def _reindex_detail(
+    path: str,
+    entity_type: str,
+    embedded: bool,
+) -> dict[str, Any]:
+    """Build one reindex result, failing a path that was stored without a vector."""
+    if embedded:
+        return {"path": path, "entity_type": entity_type, "status": "success"}
+    return {
+        "path": path,
+        "entity_type": entity_type,
+        "status": "failed",
+        "error": REINDEX_NO_EMBEDDING_ERROR,
+    }
 
 
 def _tokenize_query(query: str) -> list[str]:
@@ -158,6 +192,48 @@ def _format_custom_result(
         "is_enabled": doc.get("is_enabled", False),
         "relevance_score": relevance_score,
         "match_context": doc.get("description"),
+    }
+
+
+def _format_skill_result(
+    doc: dict[str, Any],
+    relevance_score: float,
+) -> dict[str, Any]:
+    """Format a skill search hit into its result entry.
+
+    Shared by every search path (vector, client-side, lexical) so the skill
+    fields cannot drift between them. Health is deliberately absent: the
+    search route reads it from the skills collection, the single store a
+    health check writes to (issue #1952).
+
+    Args:
+        doc: Search-index document for the skill.
+        relevance_score: Score assigned by the calling search path.
+
+    Returns:
+        Skill result entry consumed by the semantic search route and by ARD
+        search, which publishes ``updated_at`` as the catalog entry's
+        last-modified time without a per-hit database read.
+    """
+    metadata = doc.get("metadata") or {}
+    return {
+        "entity_type": "skill",
+        "path": doc.get("path"),
+        "skill_name": doc.get("name"),
+        "description": doc.get("description"),
+        "tags": doc.get("tags", []),
+        "skill_md_url": metadata.get("skill_md_url"),
+        "skill_md_raw_url": metadata.get("skill_md_raw_url"),
+        "version": metadata.get("version"),
+        "author": metadata.get("author"),
+        "visibility": doc.get("visibility", "public"),
+        "allowed_groups": doc.get("allowed_groups", []),
+        "owner": doc.get("owner"),
+        "is_enabled": doc.get("is_enabled", False),
+        "status": doc.get("status", "active"),
+        "relevance_score": relevance_score,
+        "match_context": doc.get("description"),
+        "updated_at": doc.get("indexed_at"),
     }
 
 
@@ -286,6 +362,65 @@ def _reciprocal_rank_fusion(
 
 SCORE_DISPLAY_FLOOR: float = 0.10
 
+# model.encode() is CPU-bound and runs in a worker thread (issue #1751). The
+# thread keeps the event loop free, but unbounded threads would let N concurrent
+# searches run N torch encodes over the same cores and make every one slower, so
+# admission is capped. Torch also parallelises inside a single encode, which is
+# why the cap is small rather than the executor default of min(32, cpu_count+4).
+_ENCODE_CONCURRENCY: int = max(1, settings.embeddings_encode_concurrency)
+_encode_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_encode_semaphore() -> asyncio.Semaphore:
+    """Lazily build the encode semaphore on the running loop.
+
+    Built on first use rather than at import so it binds to the loop that
+    actually serves requests.
+
+    Returns:
+        The process-wide semaphore gating concurrent model.encode() calls.
+    """
+    global _encode_semaphore
+    if _encode_semaphore is None:
+        _encode_semaphore = asyncio.Semaphore(_ENCODE_CONCURRENCY)
+    return _encode_semaphore
+
+
+def _attach_similarity_scores(
+    grouped_results: dict[str, list[dict[str, Any]]],
+    selected_results: list[tuple[dict, float]],
+    query_embedding: list[float] | None,
+) -> None:
+    """Stamp each hit with its raw cosine similarity to the query, in place.
+
+    ``relevance_score`` is a ranking signal: under RRF it is rank-relative,
+    and ``_normalize_scores`` maps the best hit to exactly 1.0 whatever its
+    real similarity. Callers that need an absolute "how alike are these"
+    number, rather than "what came first", read ``similarity_score``.
+
+    Hits are matched to their source document by ``path``, which the search
+    collection also uses as ``_id``, so it is unique across entity types.
+    Tool entries lifted out of a parent server carry ``server_path`` rather
+    than ``path`` and are left untouched, as are all entries when the query
+    could not be embedded.
+    """
+    if not query_embedding:
+        return
+
+    similarity_by_path: dict[str, float] = {}
+    for doc, _ in selected_results:
+        path = doc.get("path")
+        if path:
+            similarity_by_path[str(path)] = cosine_similarity(
+                query_embedding, doc.get("embedding") or []
+            )
+
+    for entries in grouped_results.values():
+        for entry in entries:
+            path = entry.get("path")
+            if path is not None and str(path) in similarity_by_path:
+                entry["similarity_score"] = similarity_by_path[str(path)]
+
 
 def _normalize_scores(
     scored_results: list[tuple[dict, float]],
@@ -327,8 +462,6 @@ def _normalize_scores(
 
     if len(above_floor) >= max_results:
         return above_floor
-
-    return normalized
 
     return normalized
 
@@ -374,6 +507,63 @@ def _score_tool_relevance(
     score = min(1.0, score) * 0.7 + token_coverage * 0.3
 
     return round(min(1.0, score), 4)
+
+
+def _grade_matching_tools(
+    matching_tools: list[dict[str, Any]],
+    query_tokens: list[str],
+    entity_name: str = "",
+) -> list[dict[str, Any]]:
+    """Attach a graded relevance_score to tools the aggregation pipeline selected.
+
+    The pipeline's $filter picks candidate tools by regex but does not score them,
+    so Python is the single scorer on every search path (issue #1752). Tools that
+    score 0.0 are dropped rather than returned with a meaningless score.
+
+    Args:
+        matching_tools: Tool entries from the pipeline, each with tool_name and description
+        query_tokens: Tokenized query, already lowercased by _tokenize_query()
+        entity_name: Server or virtual-server name, used only in the drop warning
+
+    Returns:
+        Graded tool entries sorted best first. Entries scoring 0.0 are omitted.
+    """
+    graded: list[dict[str, Any]] = []
+    for tool in matching_tools:
+        score = _score_tool_relevance(
+            tool.get("tool_name") or "",
+            tool.get("description") or "",
+            query_tokens,
+        )
+        if score <= 0.0:
+            continue
+        graded_tool = dict(tool)
+        graded_tool["relevance_score"] = score
+        graded.append(graded_tool)
+
+    graded.sort(key=lambda tool: tool["relevance_score"], reverse=True)
+
+    # The regex $filter and _score_tool_relevance() are expected to agree on which
+    # tools to keep. If they ever disagree, tools vanish from an agent's choices with
+    # no error anywhere, so say so at INFO. On a healthy deployment this never fires.
+    dropped = len(matching_tools) - len(graded)
+    if dropped > 0:
+        logger.info(
+            "Tool grading dropped %d of %d matching tools for %s",
+            dropped,
+            len(matching_tools),
+            entity_name or "<unnamed entity>",
+        )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Graded %d tools for %s: %s",
+            len(graded),
+            entity_name or "<unnamed entity>",
+            [(tool["tool_name"], tool["relevance_score"]) for tool in graded],
+        )
+
+    return graded
 
 
 def _build_status_filter(
@@ -625,10 +815,11 @@ def _build_text_boost_stage(
                         }
                     },
                     "as": "tool",
+                    # No relevance_score here. The aggregation selects candidates and
+                    # Python grades them with _score_tool_relevance() (issue #1752).
                     "in": {
                         "tool_name": "$$tool.name",
                         "description": {"$ifNull": ["$$tool.description", ""]},
-                        "relevance_score": 1.0,
                         "match_context": {
                             "$cond": [
                                 {"$ne": ["$$tool.description", None]},
@@ -653,6 +844,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         )
         self._embedding_model = None
         self._embedding_unavailable: bool = False
+        self._doc_count_cache: int | None = None
 
     async def _get_collection(self) -> AsyncIOMotorCollection:
         """Get DocumentDB collection."""
@@ -660,6 +852,25 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             db = await get_documentdb_client()
             self._collection = db[self._collection_name]
         return self._collection
+
+    async def _cached_doc_count(self) -> int:
+        """Total indexed documents, cached for the life of the process.
+
+        Used to report how much of the corpus a vector search covered. The count
+        moves slowly relative to search traffic, so a per-process cache is
+        enough and keeps this off the request path (issue #1751).
+
+        Returns:
+            Document count in the embeddings collection, or 0 if it cannot be read.
+        """
+        if self._doc_count_cache is None:
+            try:
+                collection = await self._get_collection()
+                self._doc_count_cache = await collection.count_documents({})
+            except Exception as exc:
+                logger.debug("Could not count documents for coverage logging: %s", exc)
+                return 0
+        return self._doc_count_cache
 
     async def _get_embedding_model(self):
         """Lazy load embedding model."""
@@ -701,6 +912,9 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                 embedding_dimension=settings.embeddings_model_dimensions,
                 token_provider=token_provider,
                 response_format=settings.embeddings_response_format,
+                extra_headers=settings.embeddings_extra_headers,
+                request_timeout_seconds=settings.embeddings_request_timeout_seconds,
+                max_retries=settings.embeddings_max_retries,
             )
         return self._embedding_model
 
@@ -738,7 +952,12 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             return None
         try:
             model = await self._get_embedding_model()
-            vectors = model.encode(texts)
+            # Offload to a worker thread. encode() is synchronous and CPU-bound,
+            # so calling it directly blocked the event loop for its whole
+            # duration and stalled every other request on this worker,
+            # including health checks and auth (issue #1751).
+            async with _get_encode_semaphore():
+                vectors = await asyncio.to_thread(model.encode, texts)
             return [v.tolist() for v in vectors]
         except Exception as exc:
             logger.warning(
@@ -749,6 +968,60 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             if latch_unavailable:
                 self._embedding_unavailable = True
             return None
+
+    def _retry_max_input_chars(self) -> int:
+        """Return the trim target for a retry: the setting, or the model's default."""
+        if settings.embeddings_retry_max_input_chars:
+            return settings.embeddings_retry_max_input_chars
+        return default_retry_max_input_chars(settings.embeddings_model_name)
+
+    async def _embed_with_trim_retry(
+        self,
+        embedding_text: EmbeddingText,
+        context: str,
+    ) -> list[float]:
+        """Embed the full text, and retry once trimmed if it fails and is over the target.
+
+        The first attempt always sends the full text, so every entry that embeds
+        today is unchanged. Only a failed attempt on text longer than the trim
+        target is retried, once, with the text trimmed (issue #1917). A failure on
+        shorter text is not retried: length cannot be the cause. This needs no
+        provider-specific error parsing.
+
+        Args:
+            embedding_text: The entry's text, as parts.
+            context: Label for log lines, for example "server 'github'".
+
+        Returns:
+            The vector, or an empty list if both attempts failed (the caller stores
+            the entry without a vector, so keyword search still finds it).
+        """
+        full_text = embedding_text.full()
+        # latch_unavailable=False: indexing failures should not poison
+        # the latch for later docs in the same batch.
+        vectors = await self._embed_texts([full_text], context=context, latch_unavailable=False)
+        if vectors:
+            return vectors[0]
+
+        max_chars = self._retry_max_input_chars()
+        if len(full_text) <= max_chars:
+            return []
+
+        trimmed_text = embedding_text.trimmed(max_chars)
+        logger.warning(
+            "Embedding failed for %s with %d characters; retrying once trimmed to %d "
+            "characters (EMBEDDINGS_RETRY_MAX_INPUT_CHARS target %d)",
+            context,
+            len(full_text),
+            len(trimmed_text),
+            max_chars,
+        )
+        vectors = await self._embed_texts(
+            [trimmed_text],
+            context=f"{context} (trimmed retry)",
+            latch_unavailable=False,
+        )
+        return vectors[0] if vectors else []
 
     async def initialize(self) -> None:
         """Initialize the search service and create vector index."""
@@ -807,41 +1080,45 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         server_info: dict[str, Any],
         is_enabled: bool = False,
         skip_if_unchanged: bool = False,
-    ) -> None:
+    ) -> bool:
         """Index a server for search.
 
         Args:
             skip_if_unchanged: When True (used during startup), skip embedding
                 generation if the existing document has the same content hash.
                 This avoids redundant embedding API calls on every boot.
+
+        Returns:
+            True if the entry is stored with an embedding. False if the embedding
+            call failed (the entry is stored without a vector, so it is still found
+            by keyword search) or the write failed. Callers that only index can
+            ignore this; reindex_paths uses it to report failures honestly.
         """
         import hashlib
 
         collection = await self._get_collection()
 
-        text_parts = [
-            server_info.get("server_name", ""),
-            server_info.get("description", ""),
-        ]
+        embedding_text = EmbeddingText(
+            head=[server_info.get("server_name", ""), server_info.get("description", "")]
+        )
 
         # Coerce null to empty: a server updated via PUT can carry an explicit
         # tags/tool_list of None, and dict.get(key, default) returns None (not
         # the default) when the key is present-but-None.
         tags = server_info.get("tags") or []
         if tags:
-            text_parts.append("Tags: " + ", ".join(tags))
+            embedding_text.head.append("Tags: " + ", ".join(tags))
 
         for tool in server_info.get("tool_list") or []:
-            text_parts.append(tool.get("name", ""))
-            text_parts.append(tool.get("description", ""))
+            embedding_text.items.append((tool.get("name") or "", tool.get("description") or ""))
 
         # Include custom metadata key-value pairs in embedding text
         metadata = server_info.get("metadata", {})
         if isinstance(metadata, dict) and metadata:
             for key, value in metadata.items():
-                text_parts.append(f"{key}: {value}")
+                embedding_text.tail.append(f"{key}: {value}")
 
-        text_for_embedding = " ".join(filter(None, text_parts))
+        text_for_embedding = embedding_text.full()
         content_hash = hashlib.sha256(text_for_embedding.encode()).hexdigest()[:16]
 
         # Skip re-embedding if content hasn't changed (startup optimization)
@@ -858,19 +1135,15 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                 # Content unchanged and embedding exists; just update is_enabled if needed
                 if existing.get("is_enabled") != is_enabled:
                     await collection.update_one({"_id": path}, {"$set": {"is_enabled": is_enabled}})
-                return
+                return True
 
         # Flatten metadata into a searchable text field for keyword matching
         metadata_text = flatten_metadata_to_text(metadata)
 
-        # latch_unavailable=False: indexing failures should not poison
-        # the latch for later docs in the same batch.
-        vectors = await self._embed_texts(
-            [text_for_embedding],
+        embedding = await self._embed_with_trim_retry(
+            embedding_text,
             context=f"server {server_info.get('server_name', path)!r}",
-            latch_unavailable=False,
         )
-        embedding = vectors[0] if vectors else []
 
         doc = {
             "_id": path,
@@ -902,8 +1175,10 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         try:
             await collection.replace_one({"_id": path}, doc, upsert=True)
             logger.info(f"Indexed server '{server_info.get('server_name')}' for search")
+            return bool(embedding)
         except Exception as e:
             logger.error(f"Failed to index server in search: {e}", exc_info=True)
+            return False
 
     async def index_agent(
         self,
@@ -911,33 +1186,35 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         agent_card: AgentCard,
         is_enabled: bool = False,
         skip_if_unchanged: bool = False,
-    ) -> None:
-        """Index an agent for search."""
+    ) -> bool:
+        """Index an agent for search.
+
+        Returns:
+            True if the entry is stored with an embedding. False if the embedding
+            call failed (the entry is stored without a vector, so it is still found
+            by keyword search) or the write failed. Callers that only index can
+            ignore this; reindex_paths uses it to report failures honestly.
+        """
         import hashlib
 
         collection = await self._get_collection()
 
-        text_parts = [
-            agent_card.name,
-            agent_card.description or "",
-        ]
+        embedding_text = EmbeddingText(head=[agent_card.name, agent_card.description or ""])
 
         tags = agent_card.tags or []
         if tags:
-            text_parts.append("Tags: " + ", ".join(tags))
+            embedding_text.head.append("Tags: " + ", ".join(tags))
 
         # Include capability keys (feature flags like "streaming")
         if agent_card.capabilities:
-            text_parts.append("Capabilities: " + ", ".join(agent_card.capabilities))
+            embedding_text.head.append("Capabilities: " + ", ".join(agent_card.capabilities))
 
         # Include skill names and descriptions for better semantic search
         if agent_card.skills:
             for skill in agent_card.skills:
-                text_parts.append(skill.name)
-                if skill.description:
-                    text_parts.append(skill.description)
+                embedding_text.items.append((skill.name or "", skill.description or ""))
 
-        text_for_embedding = " ".join(filter(None, text_parts))
+        text_for_embedding = embedding_text.full()
         content_hash = hashlib.sha256(text_for_embedding.encode()).hexdigest()[:16]
 
         if skip_if_unchanged:
@@ -952,14 +1229,12 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             ):
                 if existing.get("is_enabled") != is_enabled:
                     await collection.update_one({"_id": path}, {"$set": {"is_enabled": is_enabled}})
-                return
+                return True
 
-        vectors = await self._embed_texts(
-            [text_for_embedding],
+        embedding = await self._embed_with_trim_retry(
+            embedding_text,
             context=f"agent {agent_card.name!r}",
-            latch_unavailable=False,
         )
-        embedding = vectors[0] if vectors else []
 
         # Flatten agent metadata for keyword search
         agent_metadata = getattr(agent_card, "metadata", None) or {}
@@ -987,8 +1262,10 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         try:
             await collection.replace_one({"_id": path}, doc, upsert=True)
             logger.info(f"Indexed agent '{agent_card.name}' for search")
+            return bool(embedding)
         except Exception as e:
             logger.error(f"Failed to index agent in search: {e}", exc_info=True)
+            return False
 
     async def index_skill(
         self,
@@ -996,7 +1273,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         skill: Any,
         is_enabled: bool = False,
         skip_if_unchanged: bool = False,
-    ) -> None:
+    ) -> bool:
         """Index a skill for semantic search.
 
         Args:
@@ -1004,6 +1281,12 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             skill: SkillCard object
             is_enabled: Whether skill is enabled
             skip_if_unchanged: Skip embedding if content hash matches existing doc
+
+        Returns:
+            True if the entry is stored with an embedding. False if the embedding
+            call failed (the entry is stored without a vector, so it is still found
+            by keyword search) or the write failed. Callers that only index can
+            ignore this; reindex_paths uses it to report failures honestly.
         """
         import hashlib
 
@@ -1032,7 +1315,9 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             if extra_text:
                 text_parts.append(extra_text)
 
-        text_for_embedding = " ".join(filter(None, text_parts))
+        # No per-item descriptions: a retry trims by a hard cut at a word boundary.
+        embedding_text = EmbeddingText(head=text_parts)
+        text_for_embedding = embedding_text.full()
         content_hash = hashlib.sha256(text_for_embedding.encode()).hexdigest()[:16]
 
         if skip_if_unchanged:
@@ -1047,14 +1332,12 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             ):
                 if existing.get("is_enabled") != is_enabled:
                     await collection.update_one({"_id": path}, {"$set": {"is_enabled": is_enabled}})
-                return
+                return True
 
-        vectors = await self._embed_texts(
-            [text_for_embedding],
+        embedding = await self._embed_with_trim_retry(
+            embedding_text,
             context=f"skill {skill.name!r}",
-            latch_unavailable=False,
         )
-        embedding = vectors[0] if vectors else []
 
         # Handle visibility enum
         visibility_value = skill.visibility
@@ -1088,10 +1371,6 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             "visibility": visibility_value,
             "allowed_groups": skill.allowed_groups or [],
             "owner": skill.owner,
-            "health_status": skill.health_status,
-            "last_checked_time": skill.last_checked_time.isoformat()
-            if skill.last_checked_time
-            else None,
             "status": getattr(skill, "status", "active"),
             "text_for_embedding": text_for_embedding,
             "content_hash": content_hash,
@@ -1113,8 +1392,10 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         try:
             await collection.replace_one({"_id": path}, search_doc, upsert=True)
             logger.info(f"Indexed skill for search: {path}")
+            return bool(embedding)
         except Exception as e:
             logger.error(f"Failed to index skill in search: {e}", exc_info=True)
+            return False
 
     async def index_custom_entity(
         self,
@@ -1145,7 +1426,9 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                 text_parts.append(", ".join(val) if isinstance(val, list) else str(val))
         if record.tags:
             text_parts.append("Tags: " + ", ".join(record.tags))
-        text_for_embedding = " ".join(p for p in text_parts if p)
+        # No per-item descriptions: a retry trims by a hard cut at a word boundary.
+        embedding_text = EmbeddingText(head=text_parts)
+        text_for_embedding = embedding_text.full()
         content_hash = hashlib.sha256(text_for_embedding.encode()).hexdigest()[:16]
 
         # Non-semantic fields -> metadata_text (keyword-search boost).
@@ -1161,12 +1444,10 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                     metadata_parts.append(f"{f.name}: {val}")
         metadata_text = " | ".join(metadata_parts) if metadata_parts else ""
 
-        vectors = await self._embed_texts(
-            [text_for_embedding],
+        embedding = await self._embed_with_trim_retry(
+            embedding_text,
             context=f"custom {record.entity_type}",
-            latch_unavailable=False,
         )
-        embedding = vectors[0] if vectors else []
 
         search_doc = {
             "_id": record.path,
@@ -1264,14 +1545,13 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                 backend_tool_descriptions[backend_path] = {}
 
         # Compose text for embedding
-        text_parts = [
-            virtual_server.server_name,
-            virtual_server.description or "",
-        ]
+        embedding_text = EmbeddingText(
+            head=[virtual_server.server_name, virtual_server.description or ""]
+        )
 
         # Add tags
         if virtual_server.tags:
-            text_parts.append(f"Tags: {', '.join(virtual_server.tags)}")
+            embedding_text.head.append(f"Tags: {', '.join(virtual_server.tags)}")
 
         # Build tools array and collect text for embedding
         tools = []
@@ -1288,8 +1568,10 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                 description = backend_tools.get(mapping.tool_name, "")
 
             # Add description to embedding text
+            # Names go in the trailing "Tools:" list, so the item carries only
+            # the description.
             if description:
-                text_parts.append(description)
+                embedding_text.items.append(("", description))
 
             tools.append(
                 {
@@ -1300,16 +1582,14 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             )
 
         if tool_names:
-            text_parts.append(f"Tools: {', '.join(tool_names)}")
+            embedding_text.tail.append(f"Tools: {', '.join(tool_names)}")
 
-        text_for_embedding = " ".join(filter(None, text_parts))
+        text_for_embedding = embedding_text.full()
 
-        vectors = await self._embed_texts(
-            [text_for_embedding],
+        embedding = await self._embed_with_trim_retry(
+            embedding_text,
             context=f"virtual server {virtual_server.server_name!r}",
-            latch_unavailable=False,
         )
-        embedding = vectors[0] if vectors else []
 
         # Flatten virtual server metadata for keyword search
         vs_metadata_parts = []
@@ -1440,7 +1720,9 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         """Find documents in source collections that have no embedding indexed.
 
         Compares _id values across mcp_servers, mcp_agents, and agent_skills
-        collections against the embeddings collection.
+        collections against the embeddings collection. A record stored with an
+        empty vector (its embedding call failed) counts as missing, so a reindex
+        driven by this list retries it.
 
         Returns:
             Dictionary with missing list, counts, and summary.
@@ -1454,7 +1736,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         ]
 
         embeddings_collection = await self._get_collection()
-        indexed_cursor = embeddings_collection.find({}, {"_id": 1})
+        indexed_cursor = embeddings_collection.find(HAS_VECTOR_FILTER, {"_id": 1})
         indexed_docs = await indexed_cursor.to_list(length=None)
         indexed_ids = {doc["_id"] for doc in indexed_docs}
 
@@ -1632,7 +1914,8 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             paths: List of document paths to re-index (max 100).
 
         Returns:
-            Dictionary with success/failed counts and per-path details.
+            Dictionary with success/failed counts and per-path details. A path whose
+            entry was stored without an embedding counts as failed.
         """
         db = await get_documentdb_client()
 
@@ -1646,35 +1929,23 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             try:
                 server_doc = await servers_col.find_one({"_id": path})
                 if server_doc:
-                    await self.index_server(
+                    embedded = await self.index_server(
                         path,
                         server_doc,
                         is_enabled=server_doc.get("is_enabled", True),
                     )
-                    details.append(
-                        {
-                            "path": path,
-                            "entity_type": "mcp_server",
-                            "status": "success",
-                        }
-                    )
+                    details.append(_reindex_detail(path, "mcp_server", embedded))
                     continue
 
                 agent_doc = await agents_col.find_one({"_id": path})
                 if agent_doc:
                     agent_card = AgentCard(**agent_doc)
-                    await self.index_agent(
+                    embedded = await self.index_agent(
                         path,
                         agent_card,
                         is_enabled=agent_doc.get("is_enabled", True),
                     )
-                    details.append(
-                        {
-                            "path": path,
-                            "entity_type": "a2a_agent",
-                            "status": "success",
-                        }
-                    )
+                    details.append(_reindex_detail(path, "a2a_agent", embedded))
                     continue
 
                 skill_doc = await skills_col.find_one({"_id": path})
@@ -1682,18 +1953,12 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                     from ...schemas.skill_models import SkillCard
 
                     skill_card = SkillCard(**skill_doc)
-                    await self.index_skill(
+                    embedded = await self.index_skill(
                         path,
                         skill_card,
                         is_enabled=skill_doc.get("is_enabled", True),
                     )
-                    details.append(
-                        {
-                            "path": path,
-                            "entity_type": "skill",
-                            "status": "success",
-                        }
-                    )
+                    details.append(_reindex_detail(path, "skill", embedded))
                     continue
 
                 details.append(
@@ -1754,7 +2019,17 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             # Build query filter
             query_filter = {}
             if entity_types:
-                query_filter["entity_type"] = {"$in": entity_types}
+                # Drop "tool" the way the DocumentDB path does. Tools live inside
+                # their parent server document rather than as standalone entities,
+                # so matching entity_type="tool" can only return nothing. The two
+                # paths disagreed on this before issue #1751: harmless while no
+                # tool documents exist, a divergence the moment any do.
+                #
+                # An empty list here means the caller asked only for "tool", so
+                # match nothing. Omitting the filter would search every type,
+                # which is the opposite of what was requested.
+                searchable_types = [t for t in entity_types if t != "tool"]
+                query_filter["entity_type"] = {"$in": searchable_types}
 
             # Apply lifecycle status and enabled filter
             status_filter = _build_status_filter(
@@ -1783,8 +2058,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                     "visibility": 1,
                     "owner": 1,
                     "allowed_groups": 1,
-                    "health_status": 1,
-                    "last_checked_time": 1,
+                    "indexed_at": 1,
                     "embedding": 1,
                 },
             )
@@ -1799,7 +2073,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
 
             # Tokenize query for keyword matching
             query_tokens = _tokenize_query(query)
-            logger.debug(f"Client-side search tokens: {query_tokens}")
+            logger.debug("Client-side search tokenized query into %d tokens", len(query_tokens))
 
             # Score each document on BOTH axes independently for RRF
             vector_scored: list[tuple[dict, float]] = []
@@ -1962,7 +2236,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                                 "tool_name": tool_name,
                                 "description": tool.get("description", ""),
                                 "inputSchema": tool_schema_map.get(tool_name, {}),
-                                "relevance_score": tool.get("relevance_score", 0.0),
+                                "relevance_score": tool["relevance_score"],
                                 "match_context": tool.get("match_context", ""),
                             }
                         )
@@ -1999,24 +2273,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                     grouped_results["tools"].append(result_entry)
 
                 elif entity_type == "skill":
-                    metadata = doc.get("metadata", {})
-                    result_entry = {
-                        "entity_type": "skill",
-                        "path": doc.get("path"),
-                        "skill_name": doc.get("name"),
-                        "description": doc.get("description"),
-                        "tags": doc.get("tags", []),
-                        "skill_md_url": metadata.get("skill_md_url"),
-                        "version": metadata.get("version"),
-                        "author": metadata.get("author"),
-                        "visibility": doc.get("visibility", "public"),
-                        "owner": doc.get("owner"),
-                        "is_enabled": doc.get("is_enabled", False),
-                        "status": doc.get("status", "active"),
-                        "relevance_score": relevance_score,
-                        "match_context": doc.get("description"),
-                    }
-                    grouped_results["skills"].append(result_entry)
+                    grouped_results["skills"].append(_format_skill_result(doc, relevance_score))
 
                 elif entity_type == "virtual_server":
                     metadata = doc.get("metadata", {})
@@ -2039,6 +2296,8 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
 
                 else:
                     grouped_results["custom"].append(_format_custom_result(doc, relevance_score))
+
+            _attach_similarity_scores(grouped_results, selected, query_embedding)
 
             logger.info(
                 "Client-side search returned "
@@ -2096,7 +2355,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         query_tokens = _tokenize_query(query)
 
         if not query_tokens:
-            logger.info("Lexical search: no valid tokens from query '%s'", query)
+            logger.info("Lexical search: no valid tokens in query, returning no results")
             return {
                 "servers": [],
                 "tools": [],
@@ -2140,11 +2399,20 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         cursor = collection.aggregate(pipeline)
         results = await cursor.to_list(length=max(max_results * 3, 50))
 
+        # Grade the tools the aggregation $filter selected (issue #1752). Without this
+        # the lexical-only path would report every keyword-matched tool at 1.0.
+        for doc in results:
+            if doc.get("matching_tools"):
+                doc["matching_tools"] = _grade_matching_tools(
+                    doc["matching_tools"],
+                    query_tokens,
+                    doc.get("name") or "",
+                )
+
         grouped_results = self._format_lexical_results(results, max_results)
 
         logger.info(
-            "Lexical-only search for '%s' returned %d servers, %d tools, %d agents",
-            query,
+            "Lexical-only search returned %d servers, %d tools, %d agents",
             len(grouped_results["servers"]),
             len(grouped_results["tools"]),
             len(grouped_results["agents"]),
@@ -2234,7 +2502,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                             "tool_name": tool_name,
                             "description": tool.get("description", ""),
                             "inputSchema": tool_schema_map.get(tool_name, {}),
-                            "relevance_score": tool.get("relevance_score", 0.0),
+                            "relevance_score": tool["relevance_score"],
                             "match_context": tool.get("match_context", ""),
                         }
                     )
@@ -2271,24 +2539,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                 grouped_results["tools"].append(result_entry)
 
             elif entity_type == "skill":
-                metadata = doc.get("metadata", {})
-                result_entry = {
-                    "entity_type": "skill",
-                    "path": doc.get("path"),
-                    "skill_name": doc.get("name"),
-                    "description": doc.get("description"),
-                    "tags": doc.get("tags", []),
-                    "skill_md_url": metadata.get("skill_md_url"),
-                    "version": metadata.get("version"),
-                    "author": metadata.get("author"),
-                    "visibility": doc.get("visibility", "public"),
-                    "owner": doc.get("owner"),
-                    "is_enabled": doc.get("is_enabled", False),
-                    "status": doc.get("status", "active"),
-                    "relevance_score": relevance_score,
-                    "match_context": doc.get("description"),
-                }
-                grouped_results["skills"].append(result_entry)
+                grouped_results["skills"].append(_format_skill_result(doc, relevance_score))
 
             elif entity_type == "virtual_server":
                 metadata = doc.get("metadata", {})
@@ -2355,6 +2606,12 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         """
         collection = await self._get_collection()
 
+        # The single place a query string can reach the logs from this repository.
+        # search() is the entry point for all three paths (hybrid, client-side,
+        # lexical-only), so one guarded line covers them all (issue #1752).
+        if settings.search_log_query_text:
+            logger.info("Search query text: %s", query)
+
         try:
             # Try to get embedding; fall back to lexical-only search if
             # unavailable. _embed_texts() honors and updates the
@@ -2372,12 +2629,42 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                     include_disabled=include_disabled,
                 )
 
-            # DocumentDB vector search returns results sorted by similarity.
-            # Run separate vector search per entity type to ensure each type
-            # gets fair representation in the candidate pool (prevents servers
-            # from crowding out agents/skills in large registries).
+            # One global vector search, not one per entity type (issue #1751).
+            #
+            # The per-type loop was added to stop servers crowding out agents and
+            # skills (#1160), but it could not work: $search selects the nearest k
+            # documents before any $match runs, so every pipeline ran the same
+            # global search and only differed in which type it kept afterwards.
+            # Measured on DocumentDB, the union of all per-type pipelines was
+            # exactly k, never k-per-type, so five round trips bought no recall.
+            #
+            # Instead: one query, then filter and distribute in Python. This also
+            # restores the contract _reciprocal_rank_fusion() documents, since a
+            # single query returns one list ordered by similarity rather than
+            # blocks grouped by entity type.
+            # efSearch is the HNSW traversal queue: an independent quality dial,
+            # set to an absolute ceiling. k is what the caller asked for, scaled.
             ef_search = settings.vector_search_ef_search
-            k_per_type = max(max_results * 2, 30)
+
+            # Over-request, because the filters below run after the search and k is
+            # spent before they do.
+            #
+            # Clamped to half the queue rather than all of it. HNSW cannot return
+            # more candidates than the queue holds, and a queue exactly the size of
+            # the result set leaves the traversal no room to explore past what it
+            # has already committed to returning, which costs recall at the tail of
+            # k. Half keeps that headroom. The clamp only binds above
+            # max_results=25 at the default multiplier.
+            #
+            # Measured on DocumentDB with efSearch pinned at 1000, vector-stage
+            # latency tracks k rather than efSearch: k=20 took 52ms, k=200 took
+            # 61ms, k=1000 took 155ms. So the cost is materialising documents (each
+            # carries a 384-float embedding), not graph traversal. Sizing efSearch
+            # down for small k was tried and reverted; it targets the wrong term.
+            k_candidates = min(
+                max_results * settings.vector_search_overrequest,
+                max(1, ef_search // 2),
+            )
 
             status_filter = _build_status_filter(
                 include_draft=include_draft,
@@ -2396,11 +2683,13 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             escaped_tokens = [re.escape(token) for token in query_tokens]
             has_keyword_tokens = bool(escaped_tokens)
             token_regex = "|".join(escaped_tokens)
+            # Token count and stage flag only. The tokens are the query minus
+            # stopwords, and the regex is the tokens joined, so logging either would
+            # leak what the user typed (issue #1752).
             logger.info(
-                "Hybrid search tokens for '%s': %s (regex: %s)",
-                query,
-                query_tokens,
-                token_regex if has_keyword_tokens else "<none: keyword stage skipped>",
+                "Hybrid search tokenized query into %d tokens (keyword stage: %s)",
+                len(query_tokens),
+                "enabled" if has_keyword_tokens else "skipped",
             )
 
             text_boost_stage = _build_text_boost_stage(token_regex) if has_keyword_tokens else None
@@ -2408,67 +2697,98 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             default_scope = await self._default_search_scope()
             search_types = [t for t in (entity_types or default_scope) if t != "tool"]
 
-            results = []
-            result_ids: set[str] = set()
+            # Nothing searchable (for example entity_types=["tool"], which has no
+            # standalone documents). Skip the vector search rather than paying for
+            # an ANN traversal whose $match can only reject everything.
+            if not search_types:
+                logger.info("No searchable entity types after filtering; skipping vector search")
+                return await self._lexical_only_search(
+                    query,
+                    entity_types,
+                    max_results,
+                    include_draft=include_draft,
+                    include_deprecated=include_deprecated,
+                    include_disabled=include_disabled,
+                )
 
-            for search_type in search_types:
-                pipeline: list[dict[str, Any]] = [
-                    {
-                        "$search": {
-                            "vectorSearch": {
-                                "vector": query_embedding,
-                                "path": "embedding",
-                                "similarity": "cosine",
-                                "k": k_per_type,
-                                "efSearch": ef_search,
-                            }
+            pipeline: list[dict[str, Any]] = [
+                {
+                    "$search": {
+                        "vectorSearch": {
+                            "vector": query_embedding,
+                            "path": "embedding",
+                            "similarity": "cosine",
+                            "k": k_candidates,
+                            "efSearch": ef_search,
                         }
-                    },
-                    {"$match": {"entity_type": search_type}},
-                ]
-                if status_filter:
-                    pipeline.append({"$match": status_filter})
-                if text_boost_stage is not None:
-                    pipeline.append(text_boost_stage)
-                    pipeline.append({"$sort": {"text_boost": -1}})
-                pipeline.append({"$limit": k_per_type})
+                    }
+                },
+                # Post-filters. $search has no filter option on DocumentDB, so
+                # these cannot move inside the search; k above absorbs the loss.
+                {"$match": {"entity_type": {"$in": search_types}}},
+            ]
+            if status_filter:
+                pipeline.append({"$match": status_filter})
+            if text_boost_stage is not None:
+                pipeline.append(text_boost_stage)
 
-                cursor = collection.aggregate(pipeline)
-                type_results = await cursor.to_list(length=k_per_type)
-
-                for doc in type_results:
-                    doc_id = doc.get("_id")
-                    if doc_id not in result_ids:
-                        results.append(doc)
-                        result_ids.add(doc_id)
-
-            logger.info(
-                "Per-type vector search for '%s': %d total candidates "
-                "(k_per_type=%d, efSearch=%d, types=%s)",
-                query,
-                len(results),
-                k_per_type,
-                ef_search,
-                search_types,
-            )
-
-            # NOTE: DocumentDB does not support $unionWith, so we run a separate
-            # keyword query and merge results in Python code after the main pipeline.
-            # Skip the keyword pass entirely when there are no escaped tokens so that
-            # no attacker-controlled regex pattern is ever handed to Mongo.
-            keyword_results: list[dict[str, Any]] = []
-            if has_keyword_tokens:
+            # Run the vector and keyword queries concurrently (issue #1751). The
+            # keyword query does not depend on the vector results; only the merge
+            # further down does. Awaiting them in sequence wasted whichever of the
+            # two was smaller, and the reporter named this as the last serialized
+            # round trip.
+            #
+            # NOTE: DocumentDB does not support $unionWith, so the keyword pass is a
+            # separate query merged in Python rather than another pipeline stage.
+            async def _run_keyword_query() -> list[dict[str, Any]]:
+                # Skip the keyword pass entirely when there are no escaped tokens,
+                # so no attacker-controlled regex pattern is ever handed to Mongo.
+                if not has_keyword_tokens:
+                    return []
                 keyword_match_filter = _build_keyword_match_filter(
                     token_regex=token_regex,
                     entity_types=entity_types,
                 )
+                keyword_limit = max(max_results, 10)
+                keyword_cursor = collection.find(keyword_match_filter).limit(keyword_limit)
+                return await keyword_cursor.to_list(length=keyword_limit)
 
-                keyword_cursor = collection.find(keyword_match_filter).limit(max(max_results, 10))
-                keyword_results = await keyword_cursor.to_list(length=max(max_results, 10))
+            results, keyword_results = await asyncio.gather(
+                collection.aggregate(pipeline).to_list(length=k_candidates),
+                _run_keyword_query(),
+            )
+            result_ids: set[str] = {doc.get("_id") for doc in results}
+
+            # Survivors versus the requested candidates. A low ratio means the
+            # post-filters ate the search budget and recall is being lost before
+            # ranking even starts, which is invisible without this line.
+            doc_count = await self._cached_doc_count()
+            logger.info(
+                "Vector search: %d of %d requested candidates survived filtering "
+                "(efSearch=%d, corpus=%d, coverage=%.1f%%, types=%s)",
+                len(results),
+                k_candidates,
+                ef_search,
+                doc_count,
+                (100.0 * k_candidates / doc_count) if doc_count else 0.0,
+                search_types,
+            )
+            if doc_count and k_candidates < doc_count * 0.5 and len(results) < max_results:
+                logger.warning(
+                    "Vector search returned %d candidates for max_results=%d while "
+                    "k=%d covers only %.1f%% of %d documents. Post-filters are "
+                    "discarding most of the candidate pool. Raise "
+                    "VECTOR_SEARCH_OVERREQUEST or reduce the share of "
+                    "disabled/draft assets.",
+                    len(results),
+                    max_results,
+                    k_candidates,
+                    100.0 * k_candidates / doc_count,
+                    doc_count,
+                )
 
             logger.info(
-                "Keyword search for '%s' found %d candidates",
-                query,
+                "Keyword search found %d candidates",
                 len(keyword_results),
             )
             for i, kw_doc in enumerate(keyword_results):
@@ -2582,6 +2902,17 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             if settings.search_fusion_method == "rrf":
                 selected_results = _normalize_scores(selected_results, max_results)
 
+            # Grade the tools the aggregation $filter selected (issue #1752). Docs added
+            # by the keyword merge above are already graded by the same scorer with the
+            # same tokens, so regrading them changes nothing.
+            for doc, _score in selected_results:
+                if doc.get("matching_tools"):
+                    doc["matching_tools"] = _grade_matching_tools(
+                        doc["matching_tools"],
+                        query_tokens,
+                        doc.get("name") or "",
+                    )
+
             # Group selected results by entity type for the response
             grouped_results: dict[str, list[dict[str, Any]]] = {
                 "servers": [],
@@ -2641,7 +2972,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                                 "tool_name": tool_name,
                                 "description": tool.get("description", ""),
                                 "inputSchema": tool_schema_map.get(tool_name, {}),
-                                "relevance_score": tool.get("relevance_score", 0.0),
+                                "relevance_score": tool["relevance_score"],
                                 "match_context": tool.get("match_context", ""),
                             }
                         )
@@ -2679,24 +3010,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                     grouped_results["tools"].append(result_entry)
 
                 elif entity_type == "skill":
-                    metadata = doc.get("metadata", {})
-                    result_entry = {
-                        "entity_type": "skill",
-                        "path": doc.get("path"),
-                        "skill_name": doc.get("name"),
-                        "description": doc.get("description"),
-                        "tags": doc.get("tags", []),
-                        "skill_md_url": metadata.get("skill_md_url"),
-                        "version": metadata.get("version"),
-                        "author": metadata.get("author"),
-                        "visibility": doc.get("visibility", "public"),
-                        "owner": doc.get("owner"),
-                        "is_enabled": doc.get("is_enabled", False),
-                        "status": doc.get("status", "active"),
-                        "relevance_score": relevance_score,
-                        "match_context": doc.get("description"),
-                    }
-                    grouped_results["skills"].append(result_entry)
+                    grouped_results["skills"].append(_format_skill_result(doc, relevance_score))
 
                 elif entity_type == "virtual_server":
                     metadata = doc.get("metadata", {})
@@ -2722,6 +3036,8 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
                     # the schema-driven UI renders attributes from the descriptor.
                     grouped_results["custom"].append(_format_custom_result(doc, relevance_score))
 
+            _attach_similarity_scores(grouped_results, selected_results, query_embedding)
+
             # Sort each group by relevance_score (descending) to ensure highest matches
             # appear first. This is needed because the DB sorts by text_boost only,
             # but relevance_score combines both vector similarity and text boost.
@@ -2735,10 +3051,9 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
             grouped_results["custom"].sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
 
             logger.info(
-                "Hybrid search for '%s' returned "
+                "Hybrid search returned "
                 "%d servers, %d tools, %d agents, %d skills, "
                 "%d virtual_servers, %d custom (max_results=%d)",
-                query,
                 len(grouped_results["servers"]),
                 len(grouped_results["tools"]),
                 len(grouped_results["agents"]),

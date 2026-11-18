@@ -12,6 +12,7 @@ that applies to all tests.
 
 import errno
 import os
+import re
 import uuid
 
 _original_stat = os.stat
@@ -43,13 +44,37 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from hypothesis import settings as hypothesis_settings
 
 from tests.fixtures.mocks.mock_embeddings import (
-    create_mock_litellm_module,
     create_mock_st_module,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# HYPOTHESIS PROFILE
+# =============================================================================
+# Turn off Hypothesis's per-example deadline for the whole suite.
+#
+# The default is 200ms per example, measured as wall clock. Our property tests
+# exercise async route handlers behind AsyncMock, and the FIRST example pays
+# import and event-loop warm-up that the rest do not: one observed run took
+# 518ms on the opening example and 99ms on every later one. Hypothesis reports
+# that as FlakyFailure, so a passing test fails perhaps one run in four with no
+# code change behind it, which trains people to re-run rather than read it.
+#
+# Set here rather than on each test because not one of the 16 existing
+# @settings(...) calls specifies a deadline, so every one of them is exposed and
+# the next one written would be too. A test that names other settings inherits
+# this deadline, since @settings only overrides the attributes it lists.
+#
+# This gives up timing regression detection, which these tests were never a
+# sound place to measure anyway: they assert behaviour under mocks, on shared CI
+# runners, at a 200ms threshold that ordinary scheduling noise crosses.
+hypothesis_settings.register_profile("mcp-gateway", deadline=None)
+hypothesis_settings.load_profile("mcp-gateway")
 
 
 # =============================================================================
@@ -93,6 +118,13 @@ def pytest_configure(config):
     # Disable registration gate for all tests by default
     # (dedicated gate tests mock settings directly)
     os.environ["REGISTRATION_GATE_ENABLED"] = "false"
+
+    # Keep application logs out of MongoDB during tests. The centralized sink
+    # writes application_logs_default in a background flush, which outlived the
+    # teardown below: dropping the session database and then flushing recreated
+    # it, so one database still leaked per run. Tests have no use for shipped
+    # logs, and this also removes a write per log line from every run.
+    os.environ["APP_LOG_CENTRALIZED_ENABLED"] = "false"
 
     # NOTE: SECRET_KEY is set at module-import time near the top of this
     # conftest, because Settings() is constructed during import and refuses
@@ -139,6 +171,51 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "slow: Tests that take a long time to run")
 
 
+# Only a name this conftest generated above is ever dropped. Matching the exact
+# shape is the whole safety mechanism: were DOCUMENTDB_DATABASE ever to point at
+# a real database, an unguarded teardown would destroy it.
+_TEST_DB_PATTERN = re.compile(r"test_[0-9a-f]{8}\Z")
+
+
+def pytest_unconfigure(config):
+    """Drop this session's isolated database so test runs stop accumulating.
+
+    ``pytest_configure`` gives every session (and, under xdist, every worker)
+    its own ``test_<hex>`` database for isolation. Nothing dropped them, so they
+    accumulated: 599 were found on one developer machine, holding 6,215 of
+    mongod's 6,407 WiredTiger files open against a soft limit of 1024, at which
+    point mongod refused connections with "Too many open files".
+
+    Each worker drops only the database it created and used alone, so this
+    cannot interfere with another worker still running. Failure to drop is
+    logged and ignored: leaking one database is a cleanup problem, whereas
+    raising here would fail an otherwise green run.
+    """
+    name = os.environ.get("DOCUMENTDB_DATABASE", "")
+    if not _TEST_DB_PATTERN.fullmatch(name):
+        return
+
+    try:
+        from pymongo import MongoClient
+
+        from registry.core.config import settings
+
+        # Credentials reach the app through pydantic Settings (which reads .env),
+        # not os.environ, so an environment-only lookup authenticates as nobody
+        # and the drop fails with "requires authentication".
+        host = os.environ.get("DOCUMENTDB_HOST") or settings.documentdb_host
+        port = int(os.environ.get("DOCUMENTDB_PORT") or settings.documentdb_port)
+        user = os.environ.get("DOCUMENTDB_USERNAME") or settings.documentdb_username
+        password = os.environ.get("DOCUMENTDB_PASSWORD") or settings.documentdb_password
+        kwargs = {"directConnection": True, "serverSelectionTimeoutMS": 5000}
+        if user and password:
+            kwargs.update({"username": user, "password": password, "authSource": "admin"})
+        with MongoClient(host, port, **kwargs) as client:
+            client.drop_database(name)
+    except Exception as exc:  # cleanup must never fail a green run
+        print(f"conftest: could not drop test database {name}: {type(exc).__name__}: {exc}")
+
+
 # =============================================================================
 # AUTO-MOCKING SETUP (BEFORE IMPORTS)
 # =============================================================================
@@ -157,11 +234,6 @@ def _setup_auto_mocking() -> None:
     mock_st = create_mock_st_module()
     sys.modules["sentence_transformers"] = mock_st
     logger.info("Auto-mocked: sentence_transformers")
-
-    # Mock litellm
-    mock_litellm = create_mock_litellm_module()
-    sys.modules["litellm"] = mock_litellm
-    logger.info("Auto-mocked: litellm")
 
 
 # Execute auto-mocking setup
@@ -371,6 +443,14 @@ def mock_server_repository():
     mock.get_state.return_value = False
     mock.get_all_states.return_value = {}
     mock.set_state.return_value = True
+    # Per-tool blocking (tool_blocks.py) reads these on every read projection.
+    # They need real empty containers: an unconfigured AsyncMock attribute
+    # answers any call, so `await mock.get_tool_overrides(path)` yields another
+    # AsyncMock whose .items() is a coroutine, and the caller fails with
+    # "'coroutine' object is not iterable" deep inside a comprehension rather
+    # than at the boundary.
+    mock.get_tool_overrides.return_value = {}
+    mock.get_blocked_tools.return_value = set()
     return mock
 
 
@@ -554,6 +634,32 @@ def _reset_url_guard_allowlist_caches():
         url_guard._proxy_allowlist.cache_clear()
         url_guard._skill_allowlist.cache_clear()
         url_guard._builtin_airegistry_tools_allowlist.cache_clear()
+
+    _clear()
+    try:
+        yield
+    finally:
+        _clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_jwks_cache():
+    """Clear the class-level JWKS and discovery caches on AuthProvider around every test.
+
+    The cache is keyed by jwks_url and shared across provider instances, and
+    tests reuse the same fake IdP URLs, so a JWKS (or a kid-miss refresh
+    timestamp) cached by one test would leak into the next on the same xdist
+    worker. Tests import the providers as both ``auth_server.providers.base``
+    and ``providers.base``, which are two separate module objects, so clear
+    whichever copies are loaded rather than importing either.
+    """
+
+    def _clear() -> None:
+        for name in ("auth_server.providers.base", "providers.base"):
+            module = sys.modules.get(name)
+            if module is not None:
+                module.AuthProvider._clear_shared_jwks_cache()
+                module.AuthProvider._clear_shared_discovery_cache()
 
     _clear()
     try:

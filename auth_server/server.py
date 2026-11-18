@@ -43,6 +43,8 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response, Streamin
 
 # Import metrics middleware
 from internal_request_token import (
+    VALIDATE_RESPONSE_HEADER_BUDGET,
+    InternalTokenTooLargeError,
     mint_generic_proxy_token,
     mint_mcp_proxy_token,
     mint_registry_ui_token,
@@ -55,22 +57,28 @@ from metrics_middleware import add_auth_metrics_middleware
 from starlette.background import BackgroundTask
 
 try:
+    from auth_path_stats import flush_loop as auth_path_flush_loop
+    from auth_path_stats import flush_once as auth_path_flush_once
     from observability.meters import (
+        audit_integrity_degraded_total,
         record_generic_proxy_request,
         record_generic_proxy_slot_rejected,
         record_generic_proxy_stream_outcome,
         redirect_rejected_total,
         token_mint_total,
-        zero_init_generic_proxy_metrics,
+        zero_init_metrics,
     )
 except ImportError:
+    from auth_server.auth_path_stats import flush_loop as auth_path_flush_loop
+    from auth_server.auth_path_stats import flush_once as auth_path_flush_once
     from auth_server.observability.meters import (
+        audit_integrity_degraded_total,
         record_generic_proxy_request,
         record_generic_proxy_slot_rejected,
         record_generic_proxy_stream_outcome,
         redirect_rejected_total,
         token_mint_total,
-        zero_init_generic_proxy_metrics,
+        zero_init_metrics,
     )
 try:
     from egress_obo import (
@@ -92,11 +100,13 @@ except ImportError:
     )
 
 # Import provider factory
+from providers.base import normalize_groups_claim
 from providers.factory import get_auth_provider
 from pydantic import (
     BaseModel,
     Field,
     StrictStr,
+    ValidationInfo,
     field_validator,
 )
 
@@ -108,13 +118,37 @@ from registry.audit.request_id import new_audit_request_id, sanitize_correlation
 from registry.audit.service import AuditLogger, NonDurableAuditError, enforce_durable_audit_sink
 from registry.audit.sink import emit_audit_event
 from registry.common.log_redaction import redact_url
+from registry.common.mcp_protocol import (
+    DENIED_BY_SCOPES,
+    DENIED_NO_SCOPES,
+    DENIED_ORIGIN,
+    META_CLIENT_CAPABILITIES_KEY,
+    access_denied_error,
+    is_modern_request,
+    request_meta,
+    shape_result,
+)
+from registry.common.request_origin import (
+    origin_of_url,
+    origin_refusal,
+)
 from registry.common.scopes_loader import reload_scopes_config
 from registry.common.secret_key import validate_secret_key, validate_signing_secret
+from registry.common.session_cookie import (
+    SessionCookieAttributes,
+    join_cookie_fields,
+    session_cookie_attributes,
+    session_cookie_values,
+    single_session_cookie,
+)
 from registry.core.config import settings
+from registry.egress_auth.fallback_key import is_fallback_shaped, username_fallback_key
+from registry.egress_auth.service import canonical_auth_method
+from registry.egress_auth.session_vault_user import session_vault_user_id
 
 # Configure logging using shared module (RotatingFileHandler + optional MongoDB)
 from registry.exceptions import UrlValidationError
-from registry.repositories.factory import get_scope_repository
+from registry.repositories.factory import get_scope_repository, get_server_repository
 from registry.utils.logging_setup import setup_logging as _setup_logging
 from registry.utils.request_utils import get_client_ip
 from registry.utils.url_guard import PROXY_PROFILE, guarded_async_client
@@ -144,6 +178,11 @@ from registry.auth.internal import validate_internal_auth
 # registry.auth.internal._INTERNAL_JWT_AUDIENCE ("mcp-internal").
 _USER_JWT_AUDIENCE: str = "mcp-registry"
 
+# Spellings accepted for ENTRA_ENABLED, matching the registry's Pydantic bool
+# parsing so both services agree on whether Entra is active.
+_ENTRA_ENABLED_TRUE: frozenset[str] = frozenset({"true", "1", "yes", "on", "t", "y"})
+_ENTRA_ENABLED_FALSE: frozenset[str] = frozenset({"false", "0", "no", "off", "f", "n", ""})
+
 # MCP access-token lifetimes are operator-configurable via the registry Settings
 # (MCP_TOKEN_MAX_TTL_HOURS / MCP_TOKEN_DEFAULT_TTL_HOURS), defaulting to 24h max
 # and 8h default. `settings` already clamps the max to a hardcoded 7-day absolute
@@ -165,10 +204,8 @@ DEFAULT_TOKEN_LIFETIME_HOURS = settings.mcp_token_default_ttl_hours
 # account-selection prompt for multi-account users).
 MAX_LOGOUT_URL_LENGTH: int = 2000
 
-# Trailing path segments that are MCP transport endpoints, not part of the
-# registered server name. Used when deriving the scope key from a proxied path
-# so that /validate and the mcp-proxy hop authorize against the SAME server
-# name (see _registered_server_from_proxy_path).
+# Recognized transport route tails for legacy URL parsing and direct proxy
+# routing; a trusted registered path can itself end in one of these names.
 MCP_TRANSPORT_ENDPOINTS: frozenset[str] = frozenset({"mcp", "sse", "messages"})
 
 # Rate limiting for token generation (simple in-memory counter)
@@ -245,31 +282,26 @@ def _read_mcp_filter_enabled() -> bool:
     return raw in ("true", "1", "yes")
 
 
-# The ONE canonical per-user egress bucket. The browser consent path keys the
-# vault on this value (the registry's nginx_proxied_auth enforces the cookie
-# session's auth_method == "oauth2"), so vend-read MUST resolve to the SAME value
-# for one human identity or the user loops on consent forever.
-_EGRESS_CANONICAL_PER_USER_METHOD: str = "oauth2"
+# Validator ``method`` values for a bearer JWT that /validate verified with an
+# IdP that has an OBO exchange path. Only these sign ``obo_subject_sha256`` into
+# the hop token, so only these may be served from the OBO token cache.
+_OBO_SUBJECT_VERIFIED_METHODS: frozenset[str] = frozenset({"entra", "keycloak"})
 
-# Validator ``method`` values that all denote "a real human authenticated via the
-# per-user IdP" -- they are different TOKEN FORMATS / provider names for the same
-# kind of principal. A user may consent via a cookie session (reported as
-# ``session_cookie`` -> inner ``oauth2``) and later vend with a Keycloak-issued
-# bearer obtained via Dynamic Client Registration (reported as ``keycloak``), or
-# a gateway-minted JWT (``self_signed``). All must canonicalize to the SAME vault
-# bucket. NON-per-user methods (``federation-static``, ``network-trusted``) are
-# deliberately absent so they pass through raw and are rejected by the vend's
-# is_per_user_auth_method() check.
-_PER_USER_IDP_METHODS: frozenset[str] = frozenset(
+# Validator ``method`` an Okta bearer reports. An Okta user access token puts the
+# user's editable login in ``sub`` and the immutable user id in ``uid``, so the
+# egress vault key for this method comes from _okta_user_id only.
+_OKTA_BEARER_METHOD: str = "okta"
+
+# Login providers that speak OpenID Connect, so every login returns the
+# account's ``sub``. A login through one of them that maps no subject is refused
+# (see _require_login_subject), as is any login whose token response carried an
+# id_token: the session would otherwise key the egress vault on the username,
+# which the IdP may let another account hold later.
+_OIDC_LOGIN_PROVIDERS: frozenset[str] = frozenset(
     {
-        "oauth2",
-        "session_cookie",
-        "self_signed",
-        "jwt",
-        "boto3",
         "keycloak",
-        "entra",
         "cognito",
+        "entra",
         "okta",
         "auth0",
         "pingfederate",
@@ -277,37 +309,67 @@ _PER_USER_IDP_METHODS: frozenset[str] = frozenset(
 )
 
 
-def _canonical_auth_method(validation_result: dict) -> str:
-    """The ONE canonical egress principal method, stamped into both internal tokens.
+def _trusted_egress_user_claim(validation_result: dict) -> str | None:
+    """The ``egress_user`` claim, but ONLY from a token this gateway minted.
 
-    The per-user egress vault keys on this value, so consent-write and vend-read
-    MUST agree on the same bucket for one human identity -- otherwise the user
-    loops on consent forever. Different token *formats* / IdP provider names
-    represent the SAME kind of per-user principal and must therefore all
-    canonicalize to the single per-user bucket (``oauth2``), NOT the raw method
-    string:
+    ``egress_user`` is an identity-keying claim: it names the human whose egress
+    vault bucket a vend reads, and it is the only place the real OIDC ``sub``
+    appears on a self-signed USER token (whose own ``sub`` is the login username
+    -- see ``generate_user_token``). Trust it only when the token is
+    ``self_signed``, where provenance is guaranteed. A JWT / M2M / other-issuer
+    token could otherwise carry an attacker-chosen ``egress_user`` and point the
+    vend -- or an audit record's durable identity -- at a victim.
 
-    - ``session_cookie``: the browser cookie session; the registry enforces its
-      inner ``auth_method == "oauth2"``. This is the CONSENT-WRITE side, so it
-      defines the canonical bucket value.
-    - ``self_signed``: a JWT this gateway minted (UI "generate token", or the
-      egress OAuth-facade ``/token`` mint).
-    - ``keycloak``/``entra``/``cognito``/``okta``/``auth0``/``pingfederate``: a
-      bearer issued directly by the per-user IdP -- notably what a Dynamic Client
-      Registration (DCR) client (Claude Code, Codex) presents. Without folding
-      these into ``oauth2`` the DCR vend keys on bucket ``keycloak`` while consent
-      wrote to ``oauth2`` -> permanent miss -> the DCR consent loop. (This was the
-      live DCR failure.)
-    - ``jwt``/``boto3``: other per-user token formats.
+    Gateway-built paths (session cookie, federation, network-trusted) never set
+    the claim, so the gate is a no-op for them.
 
-    NON-per-user methods (``federation-static``, ``network-trusted``) and unknown
-    methods pass through unchanged so the vend's per-user check still rejects them.
-    Mirrors ``registry.egress_auth.service.canonical_auth_method``.
+    Shared by ``_canonical_egress_user`` (the vault key) and
+    ``_audit_identity_claims`` (the audit record's durable identity) so the two
+    resolve the same human from the same claim under ONE trust gate -- duplicating
+    the gate is how such gates drift apart.
     """
-    method = validation_result.get("method") or ""
-    if method in _PER_USER_IDP_METHODS:
-        return _EGRESS_CANONICAL_PER_USER_METHOD
-    return method
+    if validation_result.get("method") != AUTH_METHOD_SELF_SIGNED:
+        return None
+    return (validation_result.get("data") or {}).get("egress_user") or None
+
+
+def _okta_user_id(validation_result: dict) -> str | None:
+    """The immutable account id of a raw Okta bearer, or None for any other token.
+
+    An Okta user access token carries the user's login (editable, often an
+    email, and movable to another user) in ``sub``, the immutable user id in
+    ``uid``, and the client it was issued to in ``cid``; the Okta id_token, and
+    so the cookie session, carries that user id as ``sub``. A client-credentials
+    token has no ``uid`` and is issued to itself, so its ``sub`` equals its
+    ``cid`` (the client id the Okta provider reports as ``client_id``).
+
+    For an Okta bearer this returns ``uid`` when it is a non-empty string, else
+    ``sub`` when it is a non-empty string equal to ``cid`` (a machine token),
+    else ``""``: a user token without a usable ``uid`` has no key, and falling
+    back to its ``sub`` would key the vault on the login. Read only when the
+    Okta provider validated the token (``method == "okta"``), so no other
+    issuer can choose the identity this returns.
+
+    Shared by ``_canonical_egress_user`` (the vault key) and
+    ``_audit_identity_claims`` (the audit subject) so both apply one rule.
+
+    Args:
+        validation_result: A validator result with ``method`` and ``data``.
+
+    Returns:
+        None when the token is not an Okta bearer; otherwise its account id, or
+        ``""`` when it carries none.
+    """
+    if validation_result.get("method") != _OKTA_BEARER_METHOD:
+        return None
+    data = validation_result.get("data") or {}
+    okta_user_id = data.get("uid")
+    if isinstance(okta_user_id, str) and okta_user_id:
+        return okta_user_id
+    subject = data.get("sub")
+    if isinstance(subject, str) and subject and subject == data.get("cid"):
+        return subject
+    return ""
 
 
 def _canonical_egress_user(validation_result: dict) -> str:
@@ -317,13 +379,28 @@ def _canonical_egress_user(validation_result: dict) -> str:
     session) and the vend path (bearer token), or the user's vaulted token is
     written under one id and looked up under another -> permanent vend miss.
 
-    Uses the OIDC ``sub`` claim, which is present in BOTH id_tokens and access
-    tokens for every OIDC provider and is stable per (user, gateway app). This is
-    provider-agnostic: it avoids ``preferred_username``, which some IdPs (notably
-    Entra) omit from ACCESS tokens, so the browser id_token (has it) and a DCR
-    client's bearer access token (lacks it) would otherwise key differently.
+    Uses the IdP's immutable account id, which for every OIDC provider except
+    Okta is the ``sub`` claim, present in BOTH id_tokens and access tokens. This
+    avoids ``preferred_username``, which some IdPs (notably Entra) omit from
+    ACCESS tokens, so the browser id_token (has it) and a DCR client's bearer
+    access token (lacks it) would otherwise key differently. It also avoids every
+    name an IdP lets an account change or lets a later account reuse: a Cognito
+    username is freed when its user is deleted, and an Okta login is editable. A
+    key built on one of those hands the old account's vaulted tokens to whoever
+    holds the name next.
 
     Resolution (first hit wins):
+      0. A session cookie (``method == "session_cookie"``): the key the login
+         stored on the session, read through ``session_vault_user_id``
+         (``registry/egress_auth/session_vault_user.py``) and nothing else. The
+         registry's raw cookie path (``enhanced_auth``) and the token mint read
+         the session through the same function, so no other session field (its
+         ``provider`` or ``username``, which each service projects on its own)
+         can split the consent write from the vend. The stored key is the
+         account id, or for a non-OIDC login that mapped none, the namespaced
+         username fallback key computed at login (see
+         ``_login_vault_user_id``). A session without a stored key keys on
+         nothing, whatever its ``subject``.
       1. ``data.egress_user`` -- the explicit canonical egress id stamped onto a
          gateway-issued self-signed USER token (see ``generate_user_token``). That
          token's ``sub`` is the login username -- NOT the OIDC sub -- so without
@@ -333,35 +410,145 @@ def _canonical_egress_user(validation_result: dict) -> str:
          so it wins over the self-signed token's username ``sub`` -- but ONLY when
          the token is ``self_signed`` (minted by this gateway); it is ignored on
          any other method so an external issuer cannot inject a vault key.
+      1b. On a ``self_signed`` token WITHOUT ``egress_user``, resolution STOPS and
+         returns ``""``. Steps 2-4 below would resolve the login username (that
+         token's ``sub`` is the username by construction, and on Keycloak the
+         login username is the user's email), which is a DIFFERENT identifier
+         namespace from the OIDC sub the consent path wrote. Crossing namespaces
+         silently keys the vault on a second, parallel identity for the same
+         human -> the vend reads an empty bucket and every per-user egress server
+         returns 0 tools with nothing logged. Fail closed instead; the caller
+         re-mints a token that carries the claim.
+      1c. Okta (``method == "okta"``): resolution STOPS at ``_okta_user_id``:
+         ``data.uid`` when it is a non-empty string, else ``data.sub`` only on a
+         client-credentials token (``sub == cid``, the client id), else ``""``.
+         An Okta user access token's ``sub`` is the user's login, which an
+         administrator can edit or move to another user; ``uid`` is the
+         immutable user id, the same value the Okta id_token (and so the
+         session) carries as ``sub``. A user token without a usable ``uid``
+         therefore has no key and the vend refuses it. ``uid`` is read for this
+         method only, never for another issuer.
       2. ``data.sub`` -- the raw IdP subject. Bearer paths expose the verified
-         claims here; the cookie path carries the sub persisted into the session
-         at login (see create_session ``subject``).
-      3. ``data.subject`` -- the cookie session's persisted OIDC sub.
-      4. top-level ``sub`` -- direct-token paths that surface it there.
-      5. ``username`` -- fallback for callers with no sub (keeps pre-existing
-         non-OIDC behavior unchanged; only OIDC callers change bucket).
+         claims here.
+      3. ``data.subject`` -- a ``subject`` claim on a bearer with no ``sub``.
+      4. top-level ``sub`` -- direct-token paths that surface it there (the
+         ``SimplifiedCognitoValidator`` boto3 branch, whose ``data`` holds the
+         GetUser response rather than claims).
+      5. No account id: ``""``. The provider validators accept a bearer with
+         no ``sub`` (a Keycloak client without the ``basic`` scope issues one),
+         and the only name left on it is the login (``preferred_username``),
+         which an admin can rename and a later account can take. Keying on it
+         would let a PAT stored under that name reach the next holder, so such
+         a bearer owns no bucket and the vend and registry routes refuse it.
+         Only a session gets a username fallback key, computed once at login
+         for a non-OIDC provider (those providers have no bearer path), and a
+         token ``/internal/tokens`` mints from that session carries it.
+
+    An IdP account id (steps 1c-4) that starts with the fallback-key prefix
+    (``is_fallback_shaped``) keys nothing: a provider whose ``subject_claim``
+    names a user-chosen value could otherwise return ``name:github:alice`` and
+    read that fallback user's connections. Two values are exempt because the
+    gateway wrote them: a session's stored key (the login refused a
+    fallback-shaped subject before storing it), and the ``egress_user`` of a
+    ``self_signed`` token (step 1), which only ``generate_user_token`` stamps,
+    from the session's stored key or from a body value it refuses when
+    fallback-shaped.
     """
     data = validation_result.get("data") or {}
-    # ``egress_user`` is an identity-keying claim -- it selects which per-user
-    # egress-vault bucket the vend reads. Only trust it from a token THIS gateway
-    # minted itself (``self_signed``), where the claim's provenance is guaranteed.
-    # A JWT / M2M / other-issuer token could otherwise carry an attacker-chosen
-    # ``egress_user`` and key the vault on a victim's id -> a cross-user egress
-    # token vend. Gateway-built paths (session cookie, federation, network-trusted)
-    # never set ``egress_user``, so gating it here is a no-op for them and keeps
-    # the consent-write path resolving on ``sub``/``subject`` unchanged.
-    if validation_result.get("method") == AUTH_METHOD_SELF_SIGNED:
-        egress_user = data.get("egress_user")
+    method = validation_result.get("method")
+    if method == "session_cookie":
+        return session_vault_user_id(data)
+    if method == AUTH_METHOD_SELF_SIGNED:
+        # No ``egress_user`` on a token this gateway minted itself means the claim
+        # was never stamped (a token minted before the claim existed, or a mint
+        # path that failed to resolve it). The remaining candidates below are the
+        # LOGIN USERNAME for this token type, not the OIDC sub (a different
+        # identifier namespace), so returning one of them would silently key the
+        # vault on a second identity for the same human. Fail closed.
+        # The claim is read through _trusted_egress_user_claim so the trust gate
+        # stays in one place, shared with the audit identity path. A
+        # fallback-shaped value is kept: only generate_user_token writes this
+        # claim, and it stamps a fallback key only from the session that owns it.
+        return _trusted_egress_user_claim(validation_result) or ""
+    okta_user_id = _okta_user_id(validation_result)
+    if okta_user_id is not None:
+        account_id = okta_user_id
     else:
-        egress_user = None
-    return (
-        egress_user
-        or data.get("sub")
-        or data.get("subject")
-        or validation_result.get("sub")
-        or validation_result.get("username")
-        or ""
-    )
+        account_id = data.get("sub") or data.get("subject") or validation_result.get("sub") or ""
+    return "" if is_fallback_shaped(account_id) else account_id
+
+
+# Upper bound on a single audit identity value. Two reasons: these values are
+# signed into the mcp-proxy token, which rides back as the /validate response
+# header nginx copies (an oversized response header fails the request with
+# "upstream sent too big header"), and they land in audit records read by
+# operators. No real identifier comes close -- a UPN, an OIDC sub, and a GUID
+# pair are all well under this -- so a value that exceeds it is malformed, and
+# truncating beats either dropping the record or inflating every request.
+_MAX_AUDIT_CLAIM_LEN: int = 256
+
+# The audit display identity when no claim identified the caller. Named because
+# `_audit_identity_display` produces it and the mcp-proxy OBO hop tests for it to
+# avoid preferring it over a verified principal; a literal in both places is how
+# the two drift apart.
+AUDIT_IDENTITY_ANONYMOUS: str = "anonymous"
+
+
+def _claim_str(value: object) -> str | None:
+    """Coerce a raw JWT/session claim to a bounded, non-empty ``str``, or ``None``.
+
+    The audit record models type these fields as ``str``, and Pydantic does not
+    coerce -- so a claim arriving as a non-string (a Keycloak multivalued mapper
+    emitting a JSON array, a numeric directory id) raises ValidationError inside
+    the BEST-EFFORT audit emit, which swallows it and silently drops the entire
+    record while the request itself succeeds. That is audit evasion by claim
+    shape. Claim types come from the IdP, not from us, so they are not ours to
+    assume: normalize here so an unusable shape degrades ONE field to ``None``
+    instead of losing the event.
+
+    A list/tuple resolves to its first usable member (the multivalued-claim
+    case). ``bool`` is rejected outright: ``True`` is not an identifier, and
+    ``isinstance(True, int)`` would otherwise stringify it to ``"True"``.
+    Anything longer than ``_MAX_AUDIT_CLAIM_LEN`` is truncated.
+
+    A string is stripped before the emptiness test, so an all-whitespace claim
+    resolves to ``None`` rather than being stored as an identity value: `"   "`
+    is truthy, and a record whose principal name is three spaces identifies
+    nobody while looking like it does. Surrounding whitespace is not part of any
+    identifier, so trimming it also makes an equality lookup match.
+
+    Every lossy outcome increments ``audit_integrity_degraded_total`` with
+    ``reason="claim_dropped"`` so the degradation is rate-alertable instead of
+    silent. Counted ONLY when a value that was actually PRESENT is coerced away
+    (bool, unusable type) or truncated; an ABSENT claim (``None`` / ``""`` /
+    empty list / whitespace only) is normal for every IdP that omits it and
+    increments nothing, which is what keeps the series alertable. A list's
+    unusable MEMBERS account for themselves via the recursive call, so the
+    container never double-counts.
+    """
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if len(trimmed) > _MAX_AUDIT_CLAIM_LEN:
+            audit_integrity_degraded_total.add(1, {"reason": "claim_dropped"})
+            return trimmed[:_MAX_AUDIT_CLAIM_LEN]
+        return trimmed or None
+    if isinstance(value, bool):
+        audit_integrity_degraded_total.add(1, {"reason": "claim_dropped"})
+        return None
+    if isinstance(value, int | float):
+        coerced_number = str(value)
+        if len(coerced_number) > _MAX_AUDIT_CLAIM_LEN:
+            audit_integrity_degraded_total.add(1, {"reason": "claim_dropped"})
+        return coerced_number[:_MAX_AUDIT_CLAIM_LEN]
+    if isinstance(value, list | tuple):
+        for item in value:
+            coerced = _claim_str(item)
+            if coerced:
+                return coerced
+        return None
+    if value is not None:
+        audit_integrity_degraded_total.add(1, {"reason": "claim_dropped"})
+    return None
 
 
 def _audit_identity_display(validation_result: dict) -> str:
@@ -375,30 +562,384 @@ def _audit_identity_display(validation_result: dict) -> str:
     auth/vault/OBO decisions through this value.
 
     Resolution (first hit wins), per the audit-identity policy
-    (email -> preferred_username -> sub):
+    (email -> preferred_username -> upn -> sub):
       1. ``data.email`` / top-level ``email`` -- the self-signed token bakes in
          an ``email`` claim (see the /internal/tokens mint) and the validated
          claims are surfaced under ``data``; the session path carries it too.
       2. ``data.preferred_username`` -- present on browser id_tokens; a readable
          login handle when the IdP omits ``email``.
-      3. ``username`` -- the resolved username from validation; on the session
+      3. ``data.upn`` -- the Entra User Principal Name (``user@example.com``).
+         Entra ACCESS tokens (the OBO ingress token) omit both ``email`` and
+         ``preferred_username`` but carry ``upn``, so without this the OBO/Entra
+         audit identity fell through to the opaque ``sub``. Checked before
+         ``username`` because on the bearer/OBO path ``username`` is itself the
+         ``sub`` (the Entra provider resolves ``preferred_username or sub``).
+      4. ``username`` -- the resolved username from validation; on the session
          path this is already the human handle, on the self-signed path it is
-         the ``sub`` (opaque) -- which is why email/preferred_username come first.
-      4. ``data.sub`` / top-level ``sub`` -- opaque last resort.
-      5. ``"anonymous"`` -- nothing identified the caller.
+         the ``sub`` (opaque) -- which is why the readable claims come first.
+      5. ``data.sub`` / top-level ``sub`` -- opaque last resort.
+      6. ``"anonymous"`` -- nothing identified the caller.
+
+    Every candidate goes through ``_claim_str``, so a non-string claim degrades
+    to the next candidate rather than failing the audit record's validation.
 
     Forward-only: this changes what NEW audit records store. Historical
     ``sub``-only rows are not backfilled (no durable sub->email map exists).
     """
     data = validation_result.get("data") or {}
+    for candidate in (
+        data.get("email"),
+        validation_result.get("email"),
+        data.get("preferred_username"),
+        data.get("upn"),
+        validation_result.get("username"),
+        data.get("sub"),
+        validation_result.get("sub"),
+    ):
+        resolved = _claim_str(candidate)
+        if resolved:
+            return resolved
+    return AUDIT_IDENTITY_ANONYMOUS
+
+
+def _audit_identity_claims(validation_result: dict) -> dict:
+    """Durable + IdP identity claims to enrich an AUDIT identity record.
+
+    Companion to ``_audit_identity_display`` (the readable USER string) and
+    ``_canonical_egress_user`` (the vault key). Surfaces the correlation and
+    identity claims an operator needs to trace an actor -- ``sub`` for
+    protocol-level correlation, ``oid``+``tid`` for a durable tenant-scoped id,
+    ``upn`` for contact, and ``appid``/``azp`` for the calling app -- WITHOUT
+    routing any auth/vault/OBO decision through them (that stays on ``sub`` via
+    ``_canonical_egress_user``). This exists because the reported Entra OBO gap
+    was not only a display bug: the audit record also lacked the stable
+    ``oid``/``tid`` needed to correlate an opaque ``sub`` back to a user.
+
+    ``subject`` resolves the SAME id as ``_canonical_egress_user`` whenever the
+    vault key is an IdP id: the gated ``egress_user`` claim -> ``data.sub`` ->
+    ``data.subject`` -> top-level ``sub``, except that an Okta bearer's subject
+    is ``_okta_user_id`` alone (None when that finds no key, never the login).
+    It never falls back to ``username``, because a field named ``subject`` must
+    not hold a display name, so a caller the vault keys on its username gets
+    ``None`` here. (A gateway-minted token without ``egress_user``, which the
+    vault refuses, still records its own ``sub``.) Every hop after the first
+    matters and none is cosmetic:
+
+    * ``egress_user`` (only from a gateway-minted token, see
+      ``_trusted_egress_user_claim``) is where the real OIDC ``sub`` lives on a
+      self-signed USER token, whose own ``sub`` is the LOGIN USERNAME (see
+      ``generate_user_token``). Without this hop, every record from the
+      bearer-minted-from-browser-login path stored a username in a field
+      documented as an opaque OIDC ``sub`` -- duplicating ``username``, and
+      failing an exact-match lookup by the real ``sub``.
+    * The Okta ``uid`` is the user id on a raw Okta bearer, whose own ``sub`` is
+      the user's editable login. Without this hop the audit record of an Okta
+      bearer named the login while the vault keyed the same caller on ``uid``.
+    * ``data.subject`` is where the cookie session persists the OIDC sub (see
+      ``resolve_session``), so without it every browser-originated record stored
+      a null durable identity.
+
+    Resolving the same id as the vault key is what lets an operator join an audit
+    record to the egress-consent record for the same human.
+
+    ``canonical_id`` is the durable identity: Entra ``oid@tid`` when both are
+    present (an immutable object id scoped to its tenant), otherwise the
+    ``sub``. The composed pair goes through ``_claim_str`` like every other
+    field: two already-capped halves would otherwise compose to twice the cap,
+    and the mcp-proxy hop re-caps what it reads back
+    (``_audit_identity_from_token``) -- so an uncapped value here would land as
+    one string on the ``mcp_server_access`` record and a TRUNCATED one on the
+    ``token_mint`` record, breaking the cross-stream join this field exists for.
+
+    ``principal_name`` is the readable handle, resolved ``upn`` ->
+    ``preferred_username`` -> ``email`` (``data`` first, then the top-level copy
+    the providers surface). ``upn`` wins because it IS the principal name on
+    Entra; ``email`` is last because it is a contact address that may be an alias
+    rather than the login identity. It is included because Entra **v2.0** access
+    tokens carry neither ``upn`` nor ``preferred_username`` -- only ``email`` --
+    so without it this field is null for every v2.0 deployment even though a
+    readable handle demonstrably exists.
+
+    Deliberately NOT captured: the ``name`` claim (the user's full display
+    name). ``principal_name`` already makes the actor contactable, so storing a
+    person's name would add a PII category to every audit record for no
+    investigative gain -- GDPR Art. 25(2) data protection by default. ``app_id``
+    likewise comes ONLY from the token's ``appid``/``azp``, never from the
+    resolved ``client_id``, which is the gateway's own id (or the literal
+    ``"user-generated"`` sentinel) on paths where the token names no client.
+
+    Every value resolves to ``None`` when the claim is absent, and the matching
+    record fields are optional, so records for IdPs/tokens that omit these keys
+    are unchanged (forward-only).
+    """
+    data = validation_result.get("data") or {}
+    # Gated to Okta-validated tokens: their subject is the Okta account id only.
+    okta_user_id = _okta_user_id(validation_result)
+    if okta_user_id is not None:
+        sub = _claim_str(okta_user_id)
+    else:
+        sub = (
+            # Gated to gateway-minted tokens; see _trusted_egress_user_claim.
+            _claim_str(_trusted_egress_user_claim(validation_result))
+            or _claim_str(data.get("sub"))
+            or _claim_str(data.get("subject"))
+            or _claim_str(validation_result.get("sub"))
+        )
+    oid = _claim_str(data.get("oid"))
+    tid = _claim_str(data.get("tid"))
+    return {
+        "subject": sub,
+        "canonical_id": _claim_str(f"{oid}@{tid}") if oid and tid else sub,
+        "principal_name": (
+            _claim_str(data.get("upn"))
+            or _claim_str(data.get("preferred_username"))
+            or _claim_str(data.get("email"))
+            or _claim_str(validation_result.get("email"))
+        ),
+        "object_id": oid,
+        "tenant_id": tid,
+        "app_id": _claim_str(data.get("appid")) or _claim_str(data.get("azp")),
+    }
+
+
+def _audit_provider(validation_result: dict) -> str | None:
+    """The IdP name to record on an audit identity.
+
+    Most provider ``validate_token`` implementations do not return a ``provider``
+    key at all -- they return ``method`` (e.g. ``"entra"``) -- so reading
+    ``validation_result["provider"]`` alone left ``identity.provider`` null on
+    every bearer-authenticated record even though the IdP was known (observed in
+    production). Resolution:
+
+      1. top-level ``provider`` -- when a validator does surface it.
+      2. ``data.provider`` -- the cookie session persists it at login (see
+         ``create_session``), and the PingFederate fallback path sets it.
+      3. ``settings.auth_provider`` -- the gateway's configured IdP, which is the
+         truth for every token this deployment accepts from an IdP.
+
+    Step 3 is skipped for a ``self_signed`` token. Those are minted by the
+    gateway itself (the Connect button, a Cursor/Claude bearer), not issued by
+    the configured IdP, so attributing one to ``entra`` would name an IdP that
+    never saw the request -- the same misattribution issue #1642 is about. A
+    self-signed token still reports its IdP when the session it was minted from
+    recorded one, via step 2.
+
+    Returns ``None`` only when nothing identifies the IdP, keeping the field
+    optional rather than inventing a value.
+    """
+    data = validation_result.get("data") or {}
+    resolved = _claim_str(validation_result.get("provider")) or _claim_str(data.get("provider"))
+    if resolved:
+        return resolved
+    if validation_result.get("method") == AUTH_METHOD_SELF_SIGNED:
+        return None
+    return _claim_str(settings.auth_provider)
+
+
+def _audit_identity_token_claim(validation_result: dict, request_id: str) -> dict:
+    """Compact audit identity to sign into an internal hop token.
+
+    Bundles the readable display value with the durable claims, dropping empty
+    entries so the claim -- and the response header nginx copies -- stays small.
+    Read back with ``_audit_identity_from_token`` (identity) and
+    ``_audit_request_id_from_token`` (``rid``).
+
+    ``request_id`` is THIS /validate's audit request id -- the one the
+    ``mcp_server_access`` record is keyed on. Signing it as ``rid`` is what makes
+    the two audit streams joinable: the mcp-proxy hop needs its own unique
+    ``request_id`` for the ``(request_id, log_type)`` index, so it records the
+    value read back here as the mint record's ``correlation_id`` instead. Capped
+    like every other claim.
+    """
+    claim: dict = {"display": _audit_identity_display(validation_result)}
+    claim.update(
+        {key: value for key, value in _audit_identity_claims(validation_result).items() if value}
+    )
+    rid = _claim_str(request_id)
+    if rid:
+        claim["rid"] = rid
+    return claim
+
+
+def _audit_identity_from_token(claims: dict) -> tuple[str, dict]:
+    """Split a VERIFIED ``audit_identity`` hop claim into (display, claim fields).
+
+    Returns ``("", {})`` when the claim is absent or malformed; the caller then
+    falls back to the verified ``sub`` principal -- never to identity read from
+    the raw ingress header, which on a cookie-authenticated request was never
+    signature-checked. Absent is expected mid-rolling-deploy, where an in-flight
+    token can predate the claim; degrading to an opaque-but-true identity is the
+    safe direction.
+
+    Only the canonical keys are accepted and each is re-normalized: this token is
+    gateway-minted, but the audit record's fields are still typed, so a malformed
+    value must degrade that field rather than drop the whole record.
+    """
+    raw = (claims or {}).get("audit_identity")
+    if not isinstance(raw, dict):
+        return "", {}
+    # Enumerate the key set from the builder itself (an empty result is the
+    # all-None shape), so the two cannot drift apart.
+    canonical_keys = _audit_identity_claims({})
     return (
-        data.get("email")
-        or validation_result.get("email")
-        or data.get("preferred_username")
-        or validation_result.get("username")
-        or data.get("sub")
-        or validation_result.get("sub")
-        or "anonymous"
+        _claim_str(raw.get("display")) or "",
+        {key: _claim_str(raw.get(key)) for key in canonical_keys},
+    )
+
+
+def _audit_request_id_from_token(claims: dict) -> str | None:
+    """The /validate ``request_id`` signed as ``rid`` into the hop claim.
+
+    ``None`` when the hop token predates the claim (rolling deploy) or carries a
+    malformed value: the mint record then keeps its pre-join ``correlation_id``
+    (``None``) rather than failing, and only loses the join.
+
+    Deliberately NOT folded into ``_audit_identity_from_token``: that function's
+    second element is splatted into the audit record as identity FIELDS, and
+    ``rid`` is a correlation id, not an identity claim.
+    """
+    raw = (claims or {}).get("audit_identity")
+    if not isinstance(raw, dict):
+        return None
+    return _claim_str(raw.get("rid"))
+
+
+def _registered_proxy_url_matches(
+    original_url: str,
+    registered_path: str,
+    route_mode: str,
+) -> bool:
+    """Match the scope-bearing URL to the nginx-selected registration.
+
+    Mirrors the routing decision nginx already made instead of re-deriving a
+    narrower one. A generated direct location is the prefix
+    ``location <root>/<registered>/`` (see ``NginxConfigService._create_location_block``),
+    so every URL it serves -- ``/mcp``, ``/mcp/``, ``/sse``, ``/messages/?session_id=..``
+    -- starts with ``<root>/<registered>/``. Anything else did not come through
+    that location and fails closed. A virtual backend auth subrequest forces its
+    URL to exactly ``<root>/<registered>/mcp``.
+
+    nginx matches locations on the normalized ``$uri`` while ``X-Original-URL``
+    carries the raw ``$request_uri``, so the raw path is canonicalized the same
+    way first (decoded once, slashes merged, dot-segments resolved; the trailing
+    slash kept, as in ``$uri``). Otherwise ``//jira/mcp``, which nginx routes to
+    ``/jira/``, would be refused here.
+    """
+    if not registered_path.startswith("/") or not registered_path.strip("/"):
+        return False
+    raw_path = urlparse(original_url).path
+    path = normalize_request_path(raw_path)
+    if raw_path.endswith("/") and not path.endswith("/"):
+        path += "/"
+    base_path = f"{REGISTRY_ROOT_PATH.rstrip('/')}/{registered_path.strip('/')}"
+    if route_mode == "virtual":
+        return path == f"{base_path}/mcp"
+    # A root-endpoint server (append_mcp_path=False) is served at its bare path by
+    # an exact-match location, so the authorized URL carries no trailing slash.
+    # Accepting the exact path cannot reopen the #1501 prefix hijack: a sibling
+    # like /jira-other is neither equal to /jira nor prefixed by /jira/.
+    return path == base_path or path.startswith(f"{base_path}/")
+
+
+# Header carrying the marker secret that ONLY current nginx templates (the shared
+# /validate blocks and generated /_vs_auth_* locations) force-set. Older templates
+# force-set X-Validate-Source-Secret but neither set nor clear the registration
+# headers below, so behind an older nginx a client's own copies reach /validate.
+NGINX_BINDING_SECRET_HEADER = "X-Validate-Binding-Secret"  # nosec B105 - header name, not a secret  # pragma: allowlist secret
+_NGINX_REGISTRATION_HEADERS: dict[str, str] = {
+    "registered_path": "X-Registered-Server-Path",
+    "route_mode": "X-Registered-Route-Mode",
+    "resolved_version": "X-Resolved-Version",
+    "virtual_original_url": "X-Virtual-Original-URL",
+}
+
+
+def _nginx_registration(request: "Request") -> dict[str, str]:
+    """The registration headers a CURRENT nginx template asserted on /validate.
+
+    Every value is honored only when ``NGINX_BINDING_SECRET_HEADER`` carries the
+    marker secret; otherwise every value is ``""`` (an older nginx, a direct
+    :8888 caller, or no marker configured), which is the pre-binding behavior.
+    Reading these headers anywhere else would trust client-forged copies during
+    an auth-server-first rollout or a registry rollback.
+    """
+    marker = settings.auth_server_nginx_marker_secret
+    trusted = bool(marker) and secrets.compare_digest(
+        request.headers.get(NGINX_BINDING_SECRET_HEADER, ""), marker
+    )
+    return {
+        key: (request.headers.get(header, "") if trusted else "")
+        for key, header in _NGINX_REGISTRATION_HEADERS.items()
+    }
+
+
+# A marker mismatch (for example during a rotation where only one service has the
+# new value) refuses every mint, so the warning would otherwise fire on every
+# request. Log each token kind at most once per interval, with a suppressed count.
+_MARKER_MISMATCH_LOG_INTERVAL_SECONDS: float = 60.0
+_marker_mismatch_log_state: dict[str, tuple[float, int]] = {}
+
+
+def _warn_marker_mismatch(
+    routing_header: str,
+    token_kind: str,
+) -> None:
+    """Log a refused mint for a missing or mismatched nginx marker, rate-limited.
+
+    Args:
+        routing_header: The header that asked for the token (e.g. X-Registry-Api-Auth).
+        token_kind: The token that was refused (e.g. "registry-ui").
+    """
+    now = time.monotonic()
+    last, suppressed = _marker_mismatch_log_state.get(token_kind, (0.0, 0))
+    if last and now - last < _MARKER_MISMATCH_LOG_INTERVAL_SECONDS:
+        _marker_mismatch_log_state[token_kind] = (last, suppressed + 1)
+        return
+    _marker_mismatch_log_state[token_kind] = (now, 0)
+    logger.warning(
+        "/validate: %s present but nginx marker missing/mismatched; refusing to mint "
+        "%s token (possible direct-:8888 bypass, or AUTH_SERVER_NGINX_MARKER_SECRET "
+        "differs between registry and auth_server). %d similar refusals suppressed "
+        "since the previous warning (%.0f s ago).",
+        routing_header,
+        token_kind,
+        suppressed,
+        now - last if last else 0.0,
+    )
+
+
+# The /validate 500 for an oversized internal token. validate_request's generic
+# HTTPException handler re-raises it unchanged, so the refusal is logged once.
+_TOKEN_TOO_LARGE_DETAIL: str = "Authorization token too large"
+
+
+def _token_too_large(
+    exc: InternalTokenTooLargeError,
+    subject: str,
+    client_id: str = "",
+) -> HTTPException:
+    """Log an oversized internal token and build the 500 /validate returns for it.
+
+    A 500 (not a missing token, which the registry reports as 401) tells the
+    operator this is a server-side size limit, not a bad credential. The message
+    carries only sizes, counts, the hashed subject and the client id.
+
+    Args:
+        exc: The error ``_mint_internal_token`` raised.
+        subject: The caller the token was for; logged hashed.
+        client_id: The caller's OAuth client id or API-key id, when known.
+
+    Returns:
+        The HTTPException for the caller to raise.
+    """
+    logger.error(
+        f"/validate: refusing an oversized internal token for user={hash_username(subject)} "
+        f"client_id={client_id or '-'}: {exc}"
+    )
+    return HTTPException(
+        status_code=500,
+        detail=_TOKEN_TOO_LARGE_DETAIL,
+        headers={"Connection": "close"},
     )
 
 
@@ -410,6 +951,8 @@ def _attach_mcp_proxy_token(
     server_name: str,
     auth_method: str = "",
     egress_user: str = "",
+    audit_identity: dict | None = None,
+    obo_subject_sha256: str = "",
 ) -> None:
     """Mint and attach the X-Internal-Token for the /mcp-proxy hop.
 
@@ -421,26 +964,60 @@ def _attach_mcp_proxy_token(
     rather than trusting unsigned headers.
 
     ``auth_method`` is the canonical egress principal method; pass
-    ``_canonical_auth_method(validation_result)`` at the call sites, NOT the raw
+    ``canonical_auth_method(validation_result)`` at the call sites, NOT the raw
     ``validation_result["method"]``.
 
-    When ``AUTH_SERVER_NGINX_MARKER_SECRET`` is configured, the token is
-    minted ONLY if nginx force-set the matching ``X-Validate-Source-Secret`` on
-    this subrequest. An empty marker mints unconditionally; this is rejected at
-    startup when egress is enabled (see Settings._validate_egress_auth_config),
-    so the empty-marker branch only remains reachable when egress is disabled.
+    ``audit_identity`` is the audit identity resolved from the VERIFIED claims
+    (``_audit_identity_token_claim``); signing it here is what lets the
+    mcp-proxy hop attribute its OBO token-mint record without trusting the raw
+    ingress header. Omitted by the static-credential callers (federation-static /
+    network-trusted), which authenticate a machine credential with no IdP claims.
+
+    ``obo_subject_sha256`` is the digest of the bearer JWT this request's
+    /validate verified with an OBO-capable IdP (``_OBO_SUBJECT_VERIFIED_METHODS``);
+    empty otherwise. The mcp-proxy hop uses the OBO token cache only when its
+    subject token matches it (see ``_obo_cache_subject_verified``).
+
+    The token is minted ONLY if nginx force-set the matching
+    ``X-Validate-Source-Secret`` on this subrequest, and never when no marker is
+    configured (Settings refuses to start without one, so that branch only
+    guards against a misconfigured test or embedding). This is the same gate the
+    generic-proxy and registry-UI tokens use.
     """
     resolved_upstream = request.headers.get("X-Resolved-Upstream", "")
     if not resolved_upstream:
         return
 
     marker = settings.auth_server_nginx_marker_secret
-    if marker and not secrets.compare_digest(
+    if not marker or not secrets.compare_digest(
         request.headers.get("X-Validate-Source-Secret", ""), marker
     ):
+        _warn_marker_mismatch("X-Resolved-Upstream", "mcp-proxy")
+        return
+    registration = _nginx_registration(request)
+    registered_path = registration["registered_path"]
+    route_mode = registration["route_mode"]
+    if route_mode not in ("", "direct", "virtual") or bool(route_mode) != bool(registered_path):
+        return
+    virtual_backend = route_mode == "virtual"
+    if registered_path:
+        # Generated nginx auth locations force-set these two headers, and the
+        # shared /validate location clears client-supplied copies; both are
+        # honored only behind a current template (see _nginx_registration).
+        if not _registered_proxy_url_matches(
+            request.headers.get("X-Original-URL", ""), registered_path, route_mode
+        ) or server_name != registered_path.strip("/"):
+            logger.warning("/validate: registered path differs from authorized scope")
+            return
+    if not server_name:
+        return
+    version_id = registration["resolved_version"]
+    if version_id == INVALID_VERSION_SENTINEL:
+        # A permanent misconfiguration, not an outage: name it for operators.
         logger.warning(
-            "/validate: X-Resolved-Upstream present but nginx marker missing/mismatched; "
-            "refusing to mint mcp-proxy token (possible direct-:8888 bypass)"
+            "/validate: virtual mapping pins a version %s does not have; no mcp-proxy "
+            "token minted (fix the tool mapping's backend_version)",
+            server_name,
         )
         return
     try:
@@ -451,9 +1028,15 @@ def _attach_mcp_proxy_token(
             upstream_url=resolved_upstream,
             auth_method=auth_method,
             egress_user=egress_user,
+            audit_identity=audit_identity,
+            obo_subject_sha256=obo_subject_sha256,
+            version_id=version_id,
+            virtual_backend=virtual_backend,
         )
     except ValueError as exc:
         logger.error(f"/validate: could not mint mcp-proxy token: {exc}")
+    except InternalTokenTooLargeError as exc:
+        raise _token_too_large(exc, subject) from exc
 
 
 def _attach_generic_proxy_token(
@@ -515,10 +1098,7 @@ def _attach_generic_proxy_token(
     if not marker or not secrets.compare_digest(
         request.headers.get("X-Validate-Source-Secret", ""), marker
     ):
-        logger.warning(
-            "/validate: X-Resolved-Generic-Upstream present but nginx marker missing/mismatched; "
-            "refusing to mint generic-proxy token (possible direct-:8888 bypass)"
-        )
+        _warn_marker_mismatch("X-Resolved-Generic-Upstream", "generic-proxy")
         return
     try:
         response.headers["X-Internal-Token-Generic"] = mint_generic_proxy_token(
@@ -532,7 +1112,9 @@ def _attach_generic_proxy_token(
             has_upstream_auth=has_upstream_auth,
         )
     except ValueError as exc:
-        logger.error("/validate: could not mint generic-proxy token (%s)", type(exc).__name__)
+        logger.error(f"/validate: could not mint generic-proxy token: {exc}")
+    except InternalTokenTooLargeError as exc:
+        raise _token_too_large(exc, subject) from exc
 
 
 def _attach_registry_ui_token(
@@ -556,20 +1138,72 @@ def _attach_registry_ui_token(
     resolves entitlements server-side. If minting fails (e.g. empty subject), no
     token is attached: the registry then rejects (fail-closed) rather than trusting
     unsigned headers.
+
+    ``X-Registry-Api-Auth`` alone is a plain header, so the token is minted ONLY
+    when nginx also force-set the matching ``X-Validate-Source-Secret``, the same
+    gate the generic-proxy token uses. A direct auth-server caller gets no token.
+
+    A session-backed caller's token carries no groups: the registry resolves
+    them from the session store whenever ``session_id`` is set and never reads
+    the claim, so encoding them would only grow the auth_request response.
     """
     if not request.headers.get("X-Registry-Api-Auth"):
+        return
+    marker = settings.auth_server_nginx_marker_secret
+    if not marker or not secrets.compare_digest(
+        request.headers.get("X-Validate-Source-Secret", ""), marker
+    ):
+        _warn_marker_mismatch("X-Registry-Api-Auth", "registry-ui")
         return
     try:
         response.headers["X-Internal-Token-Registry"] = mint_registry_ui_token(
             subject=subject,
             session_id=session_id,
-            groups=groups,
+            groups=[] if session_id else groups,
             auth_method=auth_method,
             client_id=client_id,
             egress_user=egress_user,
         )
     except ValueError as exc:
         logger.error(f"/validate: could not mint registry-ui token: {exc}")
+    except InternalTokenTooLargeError as exc:
+        raise _token_too_large(exc, subject, client_id) from exc
+
+
+def _enforce_validate_header_budget(
+    response: "Response",
+    subject: str,
+) -> "Response":
+    """Return ``response``, or a 500 if its headers would overflow nginx's buffer.
+
+    Fails closed with a log line naming the large headers (names and sizes only,
+    never values) and the hashed caller, so an oversized authorization response is
+    diagnosable in the auth server log instead of only as an nginx error.
+
+    Args:
+        response: The /validate response about to be returned.
+        subject: The validated caller; logged hashed.
+
+    Returns:
+        The same response when it fits, otherwise a 500 JSON response.
+    """
+    header_bytes = sum(len(name) + len(value) + 4 for name, value in response.headers.items())
+    if header_bytes <= VALIDATE_RESPONSE_HEADER_BUDGET:
+        return response
+    large = {name: len(value) for name, value in response.headers.items() if len(value) > 1024}
+    logger.error(
+        "/validate: response headers for user=%s are %d bytes, over the %d-byte budget "
+        "for nginx's /validate buffer; refusing. Large headers (bytes): %s",
+        hash_username(subject),
+        header_bytes,
+        VALIDATE_RESPONSE_HEADER_BUDGET,
+        large,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Authorization response too large"},
+        headers={"Connection": "close"},
+    )
 
 
 # HTTP verbs that do not change server state. Used by the generic-hop CSRF gate
@@ -597,6 +1231,130 @@ def _is_cookie_auth_method(auth_method: str) -> bool:
     return (auth_method or "").lower() in ("session_cookie", "cookie", "session")
 
 
+# Response header that carries the JSON-RPC error body for a refused MCP request.
+# nginx captures it with auth_request_set and @forbidden_error returns it as the
+# 403 body (issue #2006). Only /validate sets it, so a client cannot supply it.
+_MCP_ERROR_BODY_HEADER: str = "X-Mcp-Error-Body"
+
+# Configured URLs whose origins count as the gateway's own (issue #1996). Each is
+# a deployment setting, never the request's Host or X-Forwarded-* headers.
+_GATEWAY_ORIGIN_URL_ENV_VARS: tuple[str, ...] = ("AUTH_SERVER_EXTERNAL_URL", "REGISTRY_URL")
+
+
+def _gateway_trusted_origins() -> frozenset[str]:
+    """Return the gateway's own origins, from configuration only.
+
+    A cookie-authenticated MCP request must come from one of these. They come
+    from AUTH_SERVER_EXTERNAL_URL, REGISTRY_URL and settings.registry_url, so a
+    client-controlled Host or forwarded header cannot add one.
+    """
+    urls = [os.environ.get(name, "") for name in _GATEWAY_ORIGIN_URL_ENV_VARS]
+    urls.append(getattr(settings, "registry_url", "") or "")
+    origins = set()
+    for url in urls:
+        origin = origin_of_url(url)
+        if origin:
+            origins.add(origin)
+    return frozenset(origins)
+
+
+def _mcp_denied_headers(
+    payload: object,
+    reason: str,
+    method: str,
+    tool_name: str | None,
+    server_name: str,
+) -> dict[str, str]:
+    """Headers for a 403 that tell nginx which JSON-RPC error body to return.
+
+    Returns an empty dict when the payload is not a JSON-RPC request with an
+    id, so nginx falls back to its plain 403 body.
+    """
+    server_path = "/" + (server_name or "").strip("/") + "/"
+    error = access_denied_error(payload, reason, method, tool_name, server_path)
+    if error is None:
+        return {}
+    # json.dumps escapes CR, LF and non-ASCII, so the value is header-safe.
+    return {_MCP_ERROR_BODY_HEADER: json.dumps(error, separators=(",", ":"))}
+
+
+def _refuse_cross_origin_cookie_request(
+    request: Request,
+    auth_method: str,
+    original_url: str,
+    original_method: str,
+    request_payload: object,
+    server_name: str | None,
+) -> None:
+    """Refuse a cookie-authenticated MCP request from another site (issue #1996).
+
+    A browser attaches the session cookie to a request any site makes, so on
+    MCP, agent and proxy routes a cookie-authenticated request must carry an
+    Origin header naming the gateway's own origin (see origin_refusal for the
+    rules). Bearer-token requests are not checked. Registry API routes keep
+    their own CSRF token check.
+
+    Raises:
+        HTTPException: 403 when the request is refused.
+    """
+    if not _is_cookie_auth_method(auth_method):
+        return
+    if _is_registry_api_request(original_url):
+        return
+    origin_header = request.headers.get("Origin")
+    refusal = origin_refusal(origin_header, original_method, _gateway_trusted_origins())
+    if refusal is None:
+        return
+    method = ""
+    tool_name = None
+    if isinstance(request_payload, dict):
+        method = str(request_payload.get("method") or "")
+        params = request_payload.get("params")
+        if method == "tools/call" and isinstance(params, dict):
+            tool_name = params.get("name")
+    logger.warning(
+        "Refusing cookie-authenticated %s %s to %s: %s (Origin=%r)",
+        original_method,
+        method or "-",
+        server_name or "-",
+        refusal,
+        (origin_header or "")[:200],
+    )
+    headers = {"Connection": "close"}
+    headers.update(
+        _mcp_denied_headers(
+            request_payload, DENIED_ORIGIN, method or original_method, tool_name, server_name or ""
+        )
+    )
+    raise HTTPException(
+        status_code=403,
+        detail="Cookie-authenticated request refused: Origin is not the gateway's own origin",
+        headers=headers,
+    )
+
+
+def _expire_other_session_cookie_variant(
+    response: Response,
+    cookie: SessionCookieAttributes,
+) -> None:
+    """Expire the host-only session cookie when the login callback set one with a Domain.
+
+    A browser keeps a host-only cookie and one with a Domain as two cookies, so
+    after ``SESSION_COOKIE_DOMAIN`` changes from empty to a domain it would send
+    both, and both services refuse a duplicated session cookie. The login takes
+    its Domain from ``SESSION_COOKIE_DOMAIN``, so a host-only login has no
+    configured domain whose cookie it could expire. A domain the deployment no
+    longer names, or one another host under the parent domain set, is unknown
+    here and stays.
+
+    Args:
+        response: The login callback response.
+        cookie: The session cookie attributes the login set the cookie with.
+    """
+    for expiry in cookie.expiries_of_other_variants():
+        response.delete_cookie(**expiry)
+
+
 def _generic_write_csrf_refused(
     is_generic_request: bool,
     http_verb: str,
@@ -613,7 +1371,7 @@ def _generic_write_csrf_refused(
       - the caller authenticated with an ambient session cookie (not a Bearer
         token a programmatic client sets explicitly).
 
-    A browser carrying only an mcp_gateway_session cookie therefore cannot make a
+    A browser carrying only a session cookie therefore cannot make a
     cross-site DELETE/PUT/PATCH to a proxied resource; Bearer callers are exempt.
     """
     if not (is_generic_request and require_bearer):
@@ -1237,7 +1995,9 @@ def _evaluate_redirect(
             return True, "allowlist_match"
         return False, "not_in_allowlist"
 
-    cookie_domain = os.environ.get("SESSION_COOKIE_DOMAIN", "").strip()
+    # The login sets the session cookie on settings.session_cookie_domain, which
+    # also loads .env; os.environ would miss a domain set only there.
+    cookie_domain = (settings.session_cookie_domain or "").strip()
     allowed = _is_redirect_within_cookie_domain(url, cookie_domain, request)
     return allowed, "cookie_domain"
 
@@ -1524,6 +2284,14 @@ async def map_groups_to_scopes(groups: list[str]) -> list[str]:
     Returns:
         List of MCP scopes
     """
+    if not isinstance(groups, list) or not all(isinstance(group, str) for group in groups):
+        logger.warning(
+            "map_groups_to_scopes received a non-array groups value (%s); "
+            "treating as no groups (fail closed)",
+            type(groups).__name__,
+        )
+        return []
+
     scopes = []
 
     # Resolve all groups to scopes in a single query. Issuing one query per
@@ -1583,9 +2351,15 @@ async def validate_session_cookie(cookie_value: str) -> dict[str, Any]:
         raise ValueError("Session cookie validation not configured")
 
     try:
-        # Decrypt cookie (max_age=28800 for 8 hours). The cookie now carries
-        # only an opaque session_id; the full record lives server-side.
-        payload = signer.loads(cookie_value, max_age=28800)
+        # The cookie carries only an opaque session_id; the full record lives
+        # server-side. SESSION_MAX_AGE_SECONDS bounds the signature's age, as
+        # in the registry, and with the __Host- prefix the salt names the
+        # cookie, so a value signed for another cookie name is refused.
+        payload = signer.loads(
+            cookie_value,
+            max_age=settings.session_max_age_seconds,
+            salt=settings.session_cookie_signing_salt,
+        )
 
         # Reject legacy dict-payload cookies (forces re-login post-rollout).
         if not isinstance(payload, str):
@@ -1859,37 +2633,117 @@ def _server_names_match(name1: str, name2: str) -> bool:
     return normalized_name1 == _normalize_server_name(name2)
 
 
-def _registered_server_from_proxy_path(
-    server_path: str,
-) -> str:
-    """Derive the registered server name (the scope key) from a proxy path.
+async def _resolve_server_path(server_name: str) -> str:
+    """Map the proxy's server identifier to a registered server path.
 
-    The ``/mcp-proxy/{server_name:path}`` capture and the ``X-Original-URL``
-    /validate parses both contain the registered server name plus any MCP
-    transport endpoint the client appended (``mcp``/``sse``/``messages``). The
-    scope allowlist is keyed on the registered server name WITHOUT that trailing
-    transport segment. Both the /validate hop and the mcp-proxy hop must strip
-    it identically, otherwise they authorize against different keys and a body
-    authorized by one is not re-checked by the other.
+    The proxy passes a bare name (e.g. "airegistry-tools") while servers are
+    stored under an _id like "/airegistry-tools/". The repository matches both
+    trailing-slash forms, so a leading slash is all that is needed here.
+    """
+    if not server_name:
+        raise LookupError("empty server identifier")
+    return "/" + server_name.strip("/")
 
-    For local servers the path is ``server-name[/transport]``; for federated
-    servers it is ``peer-name/server-name[/transport]``. Only a trailing
-    transport segment is stripped -- the rest of the path is preserved so
-    federated ``peer/server`` keys stay intact.
+
+async def _get_blocked_tools(server_name: str) -> set[str]:
+    """Fresh, fail-closed read of the blocked-tool set for a server."""
+    path = await _resolve_server_path(server_name)
+    return await get_server_repository().get_blocked_tools(path)
+
+
+# Synthetic per-server "connect" tool (issue #1860). While a user has not yet
+# connected an oauth_user server's provider account, tools/list returns this one
+# tool so chat clients, which only call tools they can see, have a way to reach
+# the consent URL. The mcp-proxy hop answers every call to this name itself and
+# never forwards it upstream, so on a direct route it is authorized like
+# tools/list (access to the server) rather than as an individual tool.
+CONNECT_TOOL_PREFIX: str = "connect_mcpgw_"
+# MCP tool names are limited to 128 characters of [A-Za-z0-9_.-].
+_TOOL_NAME_MAX_LENGTH: int = 128
+_TOOL_NAME_UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _connect_tool_name(server_path: str) -> str:
+    """Return the synthetic connect tool's name for one registered server.
 
     Args:
-        server_path: The proxied path segment (e.g. ``currenttime/mcp`` or
-            ``peer-registry-lob-1/cloudflare-docs``).
+        server_path: The registered server path, with or without slashes.
 
     Returns:
-        The registered server name used for the scope lookup.
+        ``connect_mcpgw_<server>`` with characters MCP does not allow in a tool
+        name replaced by ``_``, truncated to the MCP length limit.
     """
-    parts = [p for p in server_path.strip("/").split("/") if p]
-    if not parts:
-        return server_path.strip("/")
-    if len(parts) >= 2 and parts[-1] in MCP_TRANSPORT_ENDPOINTS:
-        return "/".join(parts[:-1])
-    return "/".join(parts)
+    safe_path = _TOOL_NAME_UNSAFE_CHARS.sub("_", server_path.strip("/"))
+    return (CONNECT_TOOL_PREFIX + safe_path)[:_TOOL_NAME_MAX_LENGTH]
+
+
+def _is_connect_tool_call(
+    server_path: str,
+    method: str | None,
+    tool_name: object,
+) -> bool:
+    """True when the request calls this server's synthetic connect tool.
+
+    The comparison is against the one exact name derived for ``server_path``:
+    no prefix matching, so another server's connect name or any name that only
+    starts with the prefix is an ordinary tool.
+    """
+    if method != "tools/call" or not isinstance(tool_name, str):
+        return False
+    return tool_name == _connect_tool_name(server_path)
+
+
+def _scope_check_target(
+    server_path: str,
+    method: str,
+    tool_name: str | None,
+    direct_route: bool,
+) -> tuple[str, str | None]:
+    """Return the method and tool a request must be authorized for.
+
+    A call to the server's synthetic connect tool on a DIRECT route is checked
+    as ``tools/list``: the caller still needs access to the server, but not a
+    grant for a tool the backend does not have. This is safe only because every
+    direct-route MCP request passes through the mcp-proxy hop, which answers
+    the connect tool locally. Virtual routes never get the exemption: nginx
+    proxies a virtual route's non-egress backends straight to the backend.
+
+    Args:
+        server_path: The registered server path being authorized.
+        method: The JSON-RPC method of the request.
+        tool_name: ``params.name`` of a ``tools/call``, else None.
+        direct_route: True only when nginx asserted a direct route (or the
+            signed hop token says the route is not virtual).
+
+    Returns:
+        ``(method, tool_name)`` to pass to ``validate_server_tool_access``.
+    """
+    if direct_route and _is_connect_tool_call(server_path, method, tool_name):
+        logger.info(
+            "Authorizing synthetic connect tool for server='%s' as tools/list",
+            server_path,
+        )
+        return "tools/list", None
+    return method, tool_name
+
+
+# MCP methods that any scope with access to a server allows, whatever its methods
+# list says. server/discover (MCP 2026-07-28) only reports the server's protocol
+# versions and capabilities. A client notification acknowledges or cancels and
+# returns no data. Neither reveals or changes anything the server-level grant
+# does not already cover. Never applied to HTTP verbs (the generic-proxy hop).
+_SERVER_ACCESS_METHODS: frozenset[str] = frozenset({"server/discover"})
+_SERVER_ACCESS_METHOD_PREFIX: str = "notifications/"
+
+
+def _granted_by_server_access(
+    method: str,
+    is_http_verb: bool,
+) -> bool:
+    """Whether any access to a server is enough for this MCP method."""
+    if is_http_verb or not isinstance(method, str):
+        return False
+    return method in _SERVER_ACCESS_METHODS or method.startswith(_SERVER_ACCESS_METHOD_PREFIX)
 
 
 async def validate_server_tool_access(
@@ -1918,6 +2772,18 @@ async def validate_server_tool_access(
     Returns:
         True if access is allowed, False otherwise
     """
+    if method == "tools/call" and tool_name:
+        try:
+            blocked = await _get_blocked_tools(server_name)
+        except Exception as exc:
+            # Fail closed: if block state is indeterminate, deny the call.
+            logger.error(f"blocked-tool lookup failed for {server_name}: {exc}")
+            logger.info(f"Access denied (block lookup): server='{server_name}' tool='{tool_name}'")
+            return False
+        if tool_name in blocked:
+            logger.info(f"Access denied (blocked tool): server='{server_name}' tool='{tool_name}'")
+            return False
+
     try:
         # Verbose per-request trace. Kept at DEBUG (never INFO): this runs on the
         # hot /validate path for every MCP proxy request, and user_scopes /
@@ -1957,6 +2823,13 @@ async def validate_server_tool_access(
 
                 if _server_names_match(server_config_name, server_name):
                     logger.debug("  Server name matches")
+
+                    if _granted_by_server_access(method, is_http_verb):
+                        logger.info(
+                            f"Access granted: server='{server_name}' method='{method}' "
+                            f"tool='{tool_name}' (any server access)"
+                        )
+                        return True
 
                     # Check methods first
                     allowed_methods = server_config.get("methods", [])
@@ -2035,9 +2908,21 @@ async def validate_server_tool_access(
                         else:
                             logger.debug(f"  Tool '{tool_name}' NOT found in allowed tools")
                     else:
-                        # For other methods, check if method is in tools list (backward compatibility)
+                        # Backward compatibility: a scope may list a method name in
+                        # its tools list. Only an explicitly named method counts.
+                        # A wildcard tools list ("*" / "all") grants every TOOL for
+                        # tools/call; it must not grant every METHOD, or the methods
+                        # list stops restricting anything. HTTP verbs already skip
+                        # this branch (above).
                         logger.debug(f"  Checking if method '{method}' is in allowed tools...")
-                        if method in allowed_tools or has_wildcard_tools:
+                        # A body-less request (opening an HTTP+SSE stream) is
+                        # authorized as its URL tail (mcp / sse / messages), which
+                        # no methods list names. Wildcard-tool scopes allowed it
+                        # through this branch before, so keep exactly that case.
+                        transport_open = has_wildcard_tools and method in MCP_TRANSPORT_ENDPOINTS
+                        if transport_open or (
+                            isinstance(allowed_tools, list) and method in allowed_tools
+                        ):
                             logger.debug(f"  Method '{method}' found in allowed tools")
                             logger.debug(f"scope '{scope}' allows access to {server_name}.{method}")
                             logger.info(
@@ -2109,6 +2994,24 @@ async def _scopes_with_server_entry(
     return matched
 
 
+def _mark_filtered_list_private(
+    result: dict,
+) -> None:
+    """Mark a per-user filtered tools/list result as not shareable.
+
+    MCP 2026-07-28 lets a server say whether a shared cache may store a list
+    (cacheScope "public") or not ("private"). The gateway filters tools/list by
+    the caller's scopes and blocked tools, so whatever the upstream said, the
+    filtered list belongs to this caller alone. Results without cacheScope
+    (handshake-era servers) are left as they are.
+
+    Args:
+        result: The JSON-RPC result object, modified in place.
+    """
+    if "cacheScope" in result:
+        result["cacheScope"] = "private"
+
+
 async def filter_tools_list_response(
     server_name: str,
     user_scopes: list[str],
@@ -2125,11 +3028,8 @@ async def filter_tools_list_response(
     tools: ["*"] / ["all"]).
 
     Args:
-        server_name: The REGISTERED server name, i.e. the scope key, with no
-            transport suffix. Callers holding a proxy path (``myserver/mcp``)
-            must run it through _registered_server_from_proxy_path first --
-            passing the suffixed form silently matches no scope entry and
-            filters every tool out (issue #1647).
+        server_name: The registered server name from the signed proxy token,
+            not a URL-derived transport suffix (a registered name can end /mcp).
         user_scopes: Scopes resolved for the caller.
         tools_list: The raw tools array from the upstream JSON-RPC result.
 
@@ -2198,6 +3098,106 @@ async def filter_tools_list_response(
     return kept
 
 
+def _is_sse_content_type(content_type: str) -> bool:
+    """Whether a response is Server-Sent Events."""
+    return "text/event-stream" in (content_type or "").lower()
+
+
+def _should_filter_tools_list(
+    filter_enabled: bool,
+    incoming_method: str,
+    status_code: int,
+    content_type: str,
+) -> bool:
+    """Whether this upstream response's tool list must be filtered.
+
+    SSE counts. Streamable-http upstreams answer tools/list with
+    text/event-stream, and this gate used to require application/json, so for
+    those servers the tool-level filter silently never ran and the unfiltered
+    list was forwarded (true since #1026). Narrowing the content types here
+    re-opens that hole, so this is asserted directly in the unit tests.
+    """
+    if not filter_enabled or incoming_method != "tools/list":
+        return False
+    if not 200 <= status_code < 300:
+        return False
+    lowered = (content_type or "").lower()
+    return "application/json" in lowered or _is_sse_content_type(lowered)
+
+
+async def _filter_sse_tools_list_body(
+    body_text: str,
+    server_name: str,
+    user_scopes: list[str],
+) -> str | None:
+    """Filter the tools array carried inside an SSE tools/list response.
+
+    Streamable-http upstreams answer tools/list with ``text/event-stream``
+    ("event: message" then a "data:" line holding the JSON-RPC payload) rather
+    than plain JSON. The filter used to require ``application/json``, so for
+    those upstreams it never ran and the unfiltered tool list was forwarded.
+
+    Rewrites each ``data:`` payload that carries ``result.tools`` and leaves the
+    SSE framing byte-identical otherwise, so session semantics are unaffected.
+
+    Args:
+        body_text: The decoded SSE response body.
+        server_name: Registered server name, transport suffix already stripped.
+        user_scopes: The caller's scopes.
+
+    Returns:
+        The rewritten body, or None when a ``data:`` payload could not be parsed.
+        None means the caller MUST fail closed: this is known to be a tools/list
+        response, so forwarding a body we could not inspect would leak the very
+        tools the filter exists to withhold.
+    """
+    out: list[str] = []
+    filtered_any = False
+
+    for line in body_text.split("\n"):
+        stripped = line.lstrip()
+        if not stripped.startswith("data:"):
+            out.append(line)
+            continue
+
+        payload = stripped[len("data:") :].strip()
+        if not payload:
+            out.append(line)
+            continue
+
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                f"_filter_sse_tools_list_body: server={server_name} could not parse an "
+                f"SSE data payload ({exc}); failing closed rather than forwarding an "
+                f"unfiltered tools list"
+            )
+            return None
+
+        result = parsed.get("result") if isinstance(parsed, dict) else None
+        if not (isinstance(result, dict) and isinstance(result.get("tools"), list)):
+            out.append(line)
+            continue
+
+        result["tools"] = await filter_tools_list_response(
+            server_name,
+            user_scopes,
+            result["tools"],
+        )
+        _mark_filtered_list_private(result)
+        parsed["result"] = result
+        filtered_any = True
+        indent = line[: len(line) - len(stripped)]
+        out.append(f"{indent}data: {json.dumps(parsed)}")
+
+    if not filtered_any:
+        # No tools array anywhere: an error result or a notification frame. There
+        # is nothing to withhold, so forward it untouched.
+        logger.debug(f"_filter_sse_tools_list_body: server={server_name} carried no tools array")
+    return "\n".join(out)
+
+
 def validate_scope_subset(user_scopes: list[str], requested_scopes: list[str]) -> bool:
     """
     Validate that requested scopes are a subset of user's current scopes.
@@ -2262,15 +3262,72 @@ def check_rate_limit(username: str) -> bool:
     return True
 
 
+# The auth-path flush task, held so the lifespan can cancel it on shutdown and so
+# the loop is not garbage-collected mid-flight.
+_auth_path_flush_task: asyncio.Task | None = None
+# OBO exchanged-token cache; built in the lifespan only when
+# EGRESS_OBO_CACHE_ENABLED is true. None -> the OBO hop runs the stateless
+# obo_exchange (cache off, init failure, or a test harness without the lifespan).
+_obo_cache = None
+
+
+def _build_obo_cache():
+    """Build the OBO token cache when enabled; None when off or on any init error.
+
+    Construction never crashes startup: an error leaves the OBO hop stateless.
+    """
+    if not settings.egress_obo_cache_enabled:
+        return None
+    try:
+        try:
+            from obo_token_cache import OboTokenCache
+        except ImportError:
+            from auth_server.obo_token_cache import OboTokenCache
+        from registry.egress_auth.factory import get_egress_lease_manager
+        from registry.egress_auth.service import _InProcessLeaseManager
+        from registry.secrets.factory import get_secret_store
+
+        lease_mgr = get_egress_lease_manager()
+        if isinstance(lease_mgr, _InProcessLeaseManager):
+            logger.warning(
+                "OBO token cache: cross-replica lease manager unavailable; "
+                "single-flight is per-replica only (a cold-miss herd across "
+                "auth-server replicas may issue one exchange per replica)."
+            )
+        cache = OboTokenCache(
+            store=get_secret_store(),
+            lease_manager=lease_mgr,
+            max_ttl_s=settings.egress_obo_cache_max_ttl_seconds,
+            skew_s=settings.egress_obo_cache_expiry_skew_seconds,
+        )
+    except Exception as exc:
+        logger.error(
+            "OBO token cache init failed (%s); OBO exchange runs stateless", exc, exc_info=True
+        )
+        return None
+    logger.info(
+        "OBO token cache ENABLED (max_ttl=%ss, skew=%ss)",
+        settings.egress_obo_cache_max_ttl_seconds,
+        settings.egress_obo_cache_expiry_skew_seconds,
+    )
+    return cache
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for FastAPI application."""
     # Log OTel SDK + metrics emission state (issue #1122)
     _log_otel_state()
 
-    # Materialize the generic-proxy counter series so dashboards and alerts bind
-    # at deploy rather than at first failure (issue #1735).
-    zero_init_generic_proxy_metrics()
+    # Materialize the counter series so dashboards and alerts bind at deploy
+    # rather than at first failure (issue #1735).
+    zero_init_metrics()
+
+    # Carry the per-auth-path request counts to the registry's telemetry
+    # heartbeat. Started here, not via @app.on_event: Starlette ignores on_event
+    # once a lifespan is provided.
+    global _auth_path_flush_task
+    _auth_path_flush_task = asyncio.create_task(auth_path_flush_loop())
 
     # Startup: Load scopes configuration
     global SCOPES_CONFIG
@@ -2291,6 +3348,15 @@ async def lifespan(app: FastAPI):
             "OAUTH2_ALLOWED_REDIRECT_URIS not set; using legacy cookie-domain "
             "redirect validation. Configure the allowlist for the hardened posture."
         )
+
+    # Resolve forward-proxy egress configuration now (issue #1832), so a bad
+    # EGRESS_FORWARD_PROXY_CA_BUNDLE path fails the process here rather than
+    # surfacing as a certificate error on the first proxied runtime hop. The
+    # auth-server needs this as much as the registry: the egress-credential-
+    # injected tool call and the OBO token exchange both run here.
+    from registry.utils.url_guard import validate_forward_proxy_config
+
+    validate_forward_proxy_config()
 
     # Build multi-key static token map (Issue #779).
     # Runs after scopes are loaded so map_groups_to_scopes can resolve groups.
@@ -2322,10 +3388,33 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Generic-proxy feature init failed during startup (%s)", type(e).__name__)
 
+    # Build the optional OBO exchanged-token cache (None when off or on error).
+    global _obo_cache
+    _obo_cache = _build_obo_cache()
+
     yield
 
-    # Shutdown: Add cleanup code here if needed in the future
+    # Shutdown: close the pooled egress HTTP clients (built lazily on first use).
+    try:
+        from registry.utils.url_guard import aclose_shared_clients
+
+        await aclose_shared_clients()
+    except Exception as e:  # noqa: BLE001 - best-effort teardown
+        logger.error(f"Error closing pooled egress clients: {e}", exc_info=True)
     logger.info("Shutting down auth server")
+    # Drop the OBO cache with the app: it holds the SecretStore/lease-manager
+    # handles, and a stale instance must not outlive the lifespan that built it.
+    _obo_cache = None
+
+    # Stop the periodic flush, then flush once more: a graceful stop would
+    # otherwise drop whatever accumulated since the last tick.
+    if _auth_path_flush_task is not None:
+        _auth_path_flush_task.cancel()
+        try:
+            await _auth_path_flush_task
+        except asyncio.CancelledError:
+            pass
+    await auth_path_flush_once()
 
 
 # Create FastAPI app
@@ -2398,6 +3487,7 @@ class TokenValidationResponse(BaseModel):
 # check and the auth-server's /validate guard call the same functions so
 # they can never disagree on what is blocked or how a URL classifies.
 from registry.auth.resource_binding import (
+    INVALID_VERSION_SENTINEL,
     RESOURCE_ID_CLAIM,
     RESOURCE_TYPE_CLAIM,
     RESOURCE_TYPES,
@@ -2407,6 +3497,7 @@ from registry.auth.resource_binding import (
     check_resource_token_allowed,
     classify_request_url,
     is_resource_token_introspection_path,
+    normalize_request_path,
     normalize_resource_id,
 )
 
@@ -2440,7 +3531,7 @@ class ResourceBinding(BaseModel):
 
     @field_validator("id")
     @classmethod
-    def _normalize_id(cls, v: str) -> str:
+    def _normalize_id(cls, v: str, info: ValidationInfo) -> str:
         # Reject path traversal, URL-encoded payloads, and control
         # characters (null byte, CR, LF, tabs, etc.) before any
         # normalization. Control characters in particular can cause
@@ -2453,9 +3544,12 @@ class ResourceBinding(BaseModel):
         stripped = v.strip()
         if not stripped:
             raise ValueError("Resource id cannot be empty")
-        # Delegate to the shared normalizer so mint-time and compare-time
-        # canonicalize identically.
-        return normalize_resource_id(stripped)
+        # The skill API uses /api/skills/<slug>, while persisted skill ids are
+        # /skills/<slug>. Both accepted request forms must mint the same claim.
+        normalized = normalize_resource_id(stripped)
+        if info.data.get("type") == ResourceType.SKILL and not normalized.startswith("skills/"):
+            normalized = f"skills/{normalized}"
+        return normalized
 
 
 class GenerateTokenRequest(BaseModel):
@@ -2727,10 +3821,8 @@ class SimplifiedCognitoValidator:
             scope_string = claims.get("scope", "")
             scopes = scope_string.split() if scope_string else []
 
-            # Extract groups from claims (for OAuth user tokens)
-            groups = claims.get("groups", [])
-            if isinstance(groups, str):
-                groups = [groups]
+            # Extract groups from claims (fail closed on a non-array claim).
+            groups = normalize_groups_claim(claims.get("groups"), source="self-signed groups")
 
             logger.info(
                 f"Successfully validated self-signed token for user: {claims.get('sub')}, "
@@ -2776,7 +3868,18 @@ class SimplifiedCognitoValidator:
             region: AWS region
 
         Returns:
-            Dict containing validation results and token information
+            Dict containing validation results and token information. On the
+            Cognito branches (``method`` ``jwt`` or ``boto3``) the top-level
+            ``sub`` is the account's immutable Cognito ``sub``: the token claim,
+            or the GetUser ``sub`` attribute. The login callback stores it as the
+            session subject and the egress vault keys on it; ``username`` is the
+            Cognito username, which Cognito frees for reuse when the user is
+            deleted, so it must never stand in for ``sub``.
+
+        Raises:
+            ValueError: If every method fails, including when JWT verification
+                fails and the boto3 GetUser response has no non-empty ``sub``
+                attribute.
         """
         if not region:
             region = self.default_region
@@ -2806,10 +3909,13 @@ class SimplifiedCognitoValidator:
                 "method": "jwt",
                 "data": jwt_claims,
                 "client_id": jwt_claims.get("client_id") or "",
+                "sub": jwt_claims.get("sub") or "",
                 "username": jwt_claims.get("cognito:username") or jwt_claims.get("username") or "",
                 "expires_at": jwt_claims.get("exp"),
                 "scopes": scopes,
-                "groups": jwt_claims.get("cognito:groups", []),
+                "groups": normalize_groups_claim(
+                    jwt_claims.get("cognito:groups"), source="cognito jwt groups"
+                ),
             }
 
         except ValueError as jwt_error:
@@ -2818,6 +3924,13 @@ class SimplifiedCognitoValidator:
             # Try boto3 validation as fallback
             try:
                 boto3_data = self.validate_with_boto3(access_token, region)
+                user_attributes = boto3_data.get("user_attributes", {})
+                cognito_sub = user_attributes.get("sub")
+                if not isinstance(cognito_sub, str) or not cognito_sub:
+                    # The sub is the egress vault key; the username Cognito
+                    # returns beside it is reusable after a delete. Refuse
+                    # rather than return a result that keys on the username.
+                    raise ValueError("GetUser response has no 'sub' attribute")
 
                 return {
                     "valid": True,
@@ -2825,7 +3938,8 @@ class SimplifiedCognitoValidator:
                     "data": boto3_data,
                     "client_id": "",  # boto3 method doesn't provide client_id
                     "username": boto3_data.get("username") or "",
-                    "user_attributes": boto3_data.get("user_attributes", {}),
+                    "sub": cognito_sub,
+                    "user_attributes": user_attributes,
                     "scopes": [],  # boto3 method doesn't provide scopes
                     "groups": [],
                 }
@@ -3141,10 +4255,8 @@ def _obo_extra_audiences(server_name_from_url: str | None) -> list[str]:
         from registry.auth.oauth_metadata import build_per_server_resource_url
     except Exception:
         return []
-    # Normalize: strip a trailing /mcp transport segment to get the server path.
+    # server_name_from_url is already the registered path, not a transport URL.
     path = "/" + server_name_from_url.strip("/")
-    if path.endswith("/mcp"):
-        path = path[: -len("/mcp")]
     auds: list[str] = []
     seen: set[str] = set()
     for base_url in base_urls:
@@ -3161,6 +4273,33 @@ def _obo_extra_audiences(server_name_from_url: str | None) -> list[str]:
     return auds
 
 
+def _virtual_parent_server_path(
+    route_mode: str,
+    virtual_original_url: str,
+) -> str | None:
+    """Parent virtual server path (e.g. ``virtual/test``) for a backing-grant hop.
+
+    A virtual server's router authorizes each backing server through the
+    generated internal ``/_vs_auth_*`` location, re-using the caller's ingress
+    token. On an IdP with per-server PRMs (Entra), that token's ``aud`` is the
+    VIRTUAL server's resource (``https://gw/virtual/<name>/mcp``), never the
+    backing server's, so the backing hop must also accept the parent's audience.
+
+    Returns ``None`` unless nginx asserted route mode ``virtual`` and the
+    parent URL classifies as a virtual server. Both values come from
+    ``_nginx_registration``, which honors them only behind the binding secret,
+    so a client cannot widen audiences by forging the header. The accepted
+    audience is bound to that one parent, and scope checks still run against
+    the backing server's own grants.
+    """
+    if route_mode != "virtual" or not virtual_original_url:
+        return None
+    parent = classify_request_url(urlparse(virtual_original_url).path, root_path=REGISTRY_ROOT_PATH)
+    if parent is None or parent[0] != ResourceType.VIRTUAL_SERVER:
+        return None
+    return parent[1]
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -3173,17 +4312,19 @@ async def validate_request(request: Request):
     Validate a request by extracting configuration from headers and validating the bearer token.
 
     Expected headers:
-    - Authorization: Bearer <token>
-    - X-User-Pool-Id: <user_pool_id>
-    - X-Client-Id: <client_id>
-    - X-Region: <region> (optional, defaults to us-east-1)
+    - Authorization: Bearer <token> (or X-Authorization), or the session cookie
     - X-Original-URL: <original_url> (optional, for scope validation)
+
+    The configured provider validates a bearer token with its own settings. The
+    request never chooses them: X-User-Pool-Id, X-Client-Id and X-Region are
+    ignored, and nginx sends them empty.
 
     Returns:
         HTTP 200 with user info headers if valid, HTTP 401/403 if invalid
 
     Raises:
-        HTTPException: If the token is missing, invalid, or configuration is incomplete
+        HTTPException: If the token is missing or invalid, or the configured
+            provider cannot validate tokens (500).
     """
 
     # Capture start time for MCP audit logging
@@ -3202,6 +4343,9 @@ async def validate_request(request: Request):
     try:
         # Extract headers
         original_url = request.headers.get("X-Original-URL")
+        # Registration headers count only when a current nginx template set them.
+        registration = _nginx_registration(request)
+        virtual_original_url = registration["virtual_original_url"]
         x_authorization = request.headers.get("X-Authorization")
         raw_authorization = request.headers.get("Authorization")
 
@@ -3257,10 +4401,8 @@ async def validate_request(request: Request):
                 headers={"WWW-Authenticate": "Bearer", "Connection": "close"},
             )
 
-        cookie_header = request.headers.get("Cookie", "")
-        user_pool_id = request.headers.get("X-User-Pool-Id")
-        client_id = request.headers.get("X-Client-Id")
-        region = request.headers.get("X-Region", "us-east-1")
+        # Every Cookie field, so a cookie an HTTP/2 client sent in a later field counts.
+        cookie_header = join_cookie_fields(request.headers.getlist("cookie"))
         body = request.headers.get("X-Body")
         # capture_body.lua sets this when the request body was too large to buffer
         # in memory and spilled to a temp file, so no X-Body could be captured.
@@ -3311,10 +4453,9 @@ async def validate_request(request: Request):
 
                 path_parts = path.split("/") if path else []
 
-                # MCP transport endpoints that should be treated as endpoints,
-                # not server names. Shared with the mcp-proxy hop via
-                # MCP_TRANSPORT_ENDPOINTS / _registered_server_from_proxy_path so
-                # both authorize against the identical scope key.
+                # Legacy URL parsing for paths without a trusted registered-path
+                # header; generated MCP auth locations override this with the
+                # exact registration before authorizing its scopes.
                 mcp_endpoints = MCP_TRANSPORT_ENDPOINTS
 
                 # For peer/federated registries, path is: peer-name/server-name/endpoint
@@ -3331,7 +4472,6 @@ async def validate_request(request: Request):
                     if path_parts[0] != "api":
                         server_name_from_url = "/".join(path_parts)
                         endpoint_from_url = None
-
                 logger.debug(
                     "Extracted server_name '%s' and endpoint '%s' from original_url: %s",
                     server_name_from_url,
@@ -3342,6 +4482,18 @@ async def validate_request(request: Request):
                 logger.warning(
                     f"Failed to extract server_name from original_url {original_url}: {e}"
                 )
+        registered_path = registration["registered_path"]
+        route_mode = registration["route_mode"]
+        if registered_path or route_mode:
+            if (
+                route_mode not in ("direct", "virtual")
+                or not _registered_proxy_url_matches(
+                    original_url or "", registered_path, route_mode
+                )
+                or not request.headers.get("X-Resolved-Upstream")
+            ):
+                raise HTTPException(status_code=403, detail="Invalid registered proxy binding")
+            server_name_from_url = registered_path.strip("/")
 
         # Read request body
         request_payload = None
@@ -3391,21 +4543,21 @@ async def validate_request(request: Request):
         # Log specific headers for debugging with masked sensitive data
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "Key Headers: Authorization=%s, Cookie=%s, "
-                "User-Pool-Id=%s, Client-Id=%s, Region=%s, Original-URL=%s",
+                "Key Headers: Authorization=%s, Cookie=%s, Original-URL=%s",
                 bool(authorization),
                 bool(cookie_header),
-                mask_sensitive_id(user_pool_id) if user_pool_id else "None",
-                mask_sensitive_id(client_id) if client_id else "None",
-                region,
                 original_url,
             )
 
         logger.debug("Server Name from URL: %s", server_name_from_url)
 
         # Only activate static token auth when there is no session cookie
-        # (UI uses cookies, CLI uses Bearer)
-        has_session_cookie = cookie_header and "mcp_gateway_session=" in cookie_header
+        # (UI uses cookies, CLI uses Bearer). A session cookie the header carries
+        # more than once is refused and counts as none: another host under the
+        # parent domain can add the second one, so neither can be trusted.
+        session_cookie_name = settings.session_cookie_effective_name
+        session_cookie = single_session_cookie(cookie_header, session_cookie_name)
+        has_session_cookie = session_cookie is not None
 
         # Federation static token auth: scoped access to federation/peer endpoints only
         # Check this BEFORE the full admin static token
@@ -3493,7 +4645,7 @@ async def validate_request(request: Request):
                     client_id="federation-static",
                 )
 
-                return response
+                return _enforce_validate_header_budget(response, "federation-peer")
 
             # If federation token didn't match, DON'T return 403 here.
             # Fall through to the admin static token check below (if enabled).
@@ -3563,7 +4715,7 @@ async def validate_request(request: Request):
                         client_id=identity["client_id"],
                     )
 
-                    return response
+                    return _enforce_validate_header_budget(response, identity["username"])
 
                 # Bearer present but does not match any static token. Fall
                 # through to JWT validation below (Okta RS256 / self-signed
@@ -3579,9 +4731,14 @@ async def validate_request(request: Request):
 
         # Initialize validation result
         validation_result = None
+        auth_provider = None
+        delegated_provider_user = False
+        # A successful Graph lookup (including zero memberships) is authoritative;
+        # local idp_user_groups mappings must not replace it.
+        entra_graph_groups_resolved = False
 
         # Log which cookie names are present on the inbound /validate request.
-        # Distinguishes "browser didn't send mcp_gateway_session" (cookie scope
+        # Distinguishes "browser didn't send the session cookie" (cookie scope
         # / jar collision) from "nginx stripped it" (sub-request config drift)
         # when diagnosing spurious 401s.
         if cookie_header:
@@ -3592,21 +4749,16 @@ async def validate_request(request: Request):
                     if c.strip() and "=" in c
                 }
             )
-            mgs_count = cookie_header.count("mcp_gateway_session=")
             logger.info(
                 f"Cookie names present: {cookie_names} "
-                f"(mcp_gateway_session occurrences: {mgs_count})"
+                f"({session_cookie_name} occurrences: "
+                f"{len(session_cookie_values(cookie_header, session_cookie_name))})"
             )
 
-        # FIRST: Check for session cookie if present
-        if "mcp_gateway_session=" in cookie_header:
+        # FIRST: Check for session cookie if present (and sent once).
+        if session_cookie is not None:
             logger.info("Session cookie detected, attempting session validation")
-            # Extract cookie value
-            cookie_value = None
-            for cookie in cookie_header.split(";"):
-                if cookie.strip().startswith("mcp_gateway_session="):
-                    cookie_value = cookie.strip().split("=", 1)[1]
-                    break
+            cookie_value = session_cookie
 
             if cookie_value:
                 try:
@@ -3675,39 +4827,32 @@ async def validate_request(request: Request):
                         # does not accept the kwarg still work (fall back to the
                         # bare call).
                         extra_audiences = _obo_extra_audiences(server_name_from_url)
+                        virtual_parent = _virtual_parent_server_path(
+                            route_mode, virtual_original_url
+                        )
+                        if virtual_parent:
+                            for audience in _obo_extra_audiences(virtual_parent):
+                                if audience not in extra_audiences:
+                                    extra_audiences.append(audience)
                         try:
                             validation_result = auth_provider.validate_token(
                                 access_token, extra_audiences=extra_audiences
                             )
                         except TypeError:
                             validation_result = auth_provider.validate_token(access_token)
+                        # Every supported provider implements the optional
+                        # recovery contract; the default leaves claims unchanged.
                         logger.info(
                             f"Token validation successful using {auth_provider.__class__.__name__}"
                         )
                     else:
-                        # Fallback to old validation for compatibility
-                        if not user_pool_id:
-                            logger.warning("Missing X-User-Pool-Id header for Cognito validation")
-                            raise HTTPException(
-                                status_code=400,
-                                detail="Missing X-User-Pool-Id header",
-                                headers={"Connection": "close"},
-                            )
-
-                        if not client_id:
-                            logger.warning("Missing X-Client-Id header for Cognito validation")
-                            raise HTTPException(
-                                status_code=400,
-                                detail="Missing X-Client-Id header",
-                                headers={"Connection": "close"},
-                            )
-
-                        # Use old validator for backward compatibility
-                        validation_result = validator.validate_token(
-                            access_token=access_token,
-                            user_pool_id=user_pool_id,
-                            client_id=client_id,
-                            region=region,
+                        # Every provider in providers/factory.py implements
+                        # validate_token. One that does not cannot validate the
+                        # bearer, so refuse it rather than trusting anything the
+                        # request says about how to validate it.
+                        raise RuntimeError(
+                            f"authentication provider {auth_provider.__class__.__name__} "
+                            "has no validate_token; refusing the bearer token"
                         )
 
             except ValueError as e:
@@ -3738,6 +4883,69 @@ async def validate_request(request: Request):
 
         logger.debug("Token validation successful using method: %s", validation_result["method"])
 
+        # Ask the provider that verified the bearer whether it needs delegated
+        # group recovery before machine-client enrichment runs.
+        if auth_provider is not None:
+            from providers.entra import GraphGroupLookupError
+
+            try:
+                recovered_groups = await auth_provider.recover_bearer_groups(
+                    validation_result, access_token
+                )
+                delegated_provider_user = auth_provider.is_delegated_user(validation_result)
+            except ValueError as e:
+                logger.warning("Invalid Entra bearer group claims; refusing validation")
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid Entra group claims",
+                    headers={"WWW-Authenticate": "Bearer", "Connection": "close"},
+                ) from e
+            except GraphGroupLookupError as e:
+                logger.warning("Entra bearer group recovery failed; reason=%s", e.reason)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Entra group lookup unavailable",
+                    headers={"Connection": "close", "X-Entra-Group-Lookup-Unavailable": "1"},
+                ) from e
+            if recovered_groups is not None:
+                from group_filter import ScopeGroupMappingsUnavailable, filter_session_groups
+
+                try:
+                    filtered_groups = await filter_session_groups(
+                        recovered_groups,
+                        username_hash=hash_username(validation_result.get("username") or ""),
+                        fail_closed=True,
+                    )
+                except ScopeGroupMappingsUnavailable as e:
+                    logger.warning(
+                        "Entra bearer group mappings unavailable; reason=%s",
+                        "storage" if e.__cause__ else "empty",
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Entra group mappings unavailable",
+                        headers={"Connection": "close", "X-Entra-Group-Lookup-Unavailable": "1"},
+                    ) from e
+                # auth_request copies the /validate response headers, including the
+                # registry token that encodes these groups, into a finite nginx
+                # buffer. Refuse oversized unfiltered membership sets rather than
+                # dropping arbitrary group grants.
+                from providers.entra import GRAPH_GROUP_MAX_BYTES, graph_group_bytes
+
+                if graph_group_bytes(filtered_groups) > GRAPH_GROUP_MAX_BYTES:
+                    logger.warning("Entra recovered group set exceeds the safe token size")
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Entra group lookup unavailable",
+                        headers={"Connection": "close", "X-Entra-Group-Lookup-Unavailable": "1"},
+                    )
+                validation_result["groups"] = filtered_groups
+                # recover_bearer_groups also returns [] when recovery is disabled;
+                # only an enabled delegated lookup establishes Graph membership.
+                from providers.entra import _group_recovery_enabled
+
+                entra_graph_groups_resolved = delegated_provider_user and _group_recovery_enabled()
+
         # Enrich groups from MongoDB if empty (for M2M clients)
         try:
             from mongodb_groups_enrichment import (
@@ -3747,10 +4955,14 @@ async def validate_request(request: Request):
 
             client_id = validation_result.get("client_id")
             current_groups = validation_result.get("groups", [])
-            should_enrich = should_enrich_groups(validation_result)
+            # A confirmed empty delegated-user membership must never acquire
+            # M2M client groups from the local collection.
+            should_enrich = not delegated_provider_user and should_enrich_groups(validation_result)
             logger.info(
-                f"Enrichment check: client_id={client_id}, "
-                f"groups={current_groups}, should_enrich={should_enrich}"
+                "Enrichment check: client_id=%s, group_count=%d, should_enrich=%s",
+                client_id,
+                len(current_groups),
+                should_enrich,
             )
 
             if should_enrich:
@@ -3791,7 +5003,15 @@ async def validate_request(request: Request):
             username_for_lookup = data.get("username") or validation_result.get("username", "")
             current_user_groups = validation_result.get("groups", [])
 
-            if should_enrich_user_groups(
+            if not (
+                entra_graph_groups_resolved
+                or (
+                    user_provider == "entra"
+                    and data.get("entra_graph_groups_resolved") is True
+                    and validation_result.get("method")
+                    in {"session_cookie", AUTH_METHOD_SELF_SIGNED}
+                )
+            ) and should_enrich_user_groups(
                 username_for_lookup,
                 current_user_groups,
                 user_provider,
@@ -3855,6 +5075,14 @@ async def validate_request(request: Request):
         # For providers that use groups (Keycloak, Entra ID, Cognito, Okta, Auth0), map groups to scopes
         user_groups = validation_result.get("groups", [])
         auth_method = validation_result.get("method", "")
+        _refuse_cross_origin_cookie_request(
+            request,
+            auth_method,
+            original_url,
+            original_method,
+            request_payload,
+            server_name_from_url,
+        )
         existing_scopes = validation_result.get("scopes", []) or []
         if user_groups and auth_method in ["keycloak", "entra", "cognito", "okta", "auth0"]:
             # Map IdP groups to scopes using the group mappings (query DocumentDB)
@@ -3868,6 +5096,10 @@ async def validate_request(request: Request):
                 len(user_groups),
                 len(user_scopes),
             )
+            # Group mappings are the only source of registry scopes here. A
+            # delegated Entra `scp` value must not add to them: scp names are
+            # defined by an app registration and granted by user consent, not
+            # by the group membership an admin controls.
         elif (
             user_groups
             and not existing_scopes
@@ -4051,13 +5283,26 @@ async def validate_request(request: Request):
                 raise HTTPException(
                     status_code=403,
                     detail=f"Access denied to {server_name}.{method} - user has no scopes configured",
-                    headers={"Connection": "close"},
+                    headers={
+                        "Connection": "close",
+                        **_mcp_denied_headers(
+                            request_payload, DENIED_NO_SCOPES, method, actual_tool_name, server_name
+                        ),
+                    },
                 )
 
-            if not await validate_server_tool_access(
+            # The synthetic connect tool is checked as tools/list, only on a
+            # direct route nginx asserted (see _scope_check_target).
+            scope_method, scope_tool_name = _scope_check_target(
                 server_name,
                 method,
                 actual_tool_name,
+                direct_route=registration["route_mode"] == "direct",
+            )
+            if not await validate_server_tool_access(
+                server_name,
+                scope_method,
+                scope_tool_name,
                 user_scopes,
                 is_http_verb=is_generic_request,
             ):
@@ -4067,7 +5312,12 @@ async def validate_request(request: Request):
                 raise HTTPException(
                     status_code=403,
                     detail=f"Access denied to {server_name}.{method}",
-                    headers={"Connection": "close"},
+                    headers={
+                        "Connection": "close",
+                        **_mcp_denied_headers(
+                            request_payload, DENIED_BY_SCOPES, method, actual_tool_name, server_name
+                        ),
+                    },
                 )
             logger.debug(
                 "Scope validation passed for %s.%s (tool: %s)",
@@ -4185,6 +5435,31 @@ async def validate_request(request: Request):
                 logger.info(f"Resource-bound token on introspection endpoint: {request_path}")
             else:
                 classified = classify_request_url(request_path, root_path=REGISTRY_ROOT_PATH)
+                # Only the generated internal /_vs_auth_* location can forward
+                # this header: normal nginx /validate blocks clear it. Scope
+                # authorization above still checks the REAL backend URL/body.
+                # A virtual-bound resource token may reuse its verified ingress
+                # identity at that backend hop, but only for its own parent URI.
+                if virtual_original_url:
+                    # virtual_original_url is non-empty only behind a current
+                    # nginx template (_nginx_registration), and only the internal
+                    # virtual-backend auth location asserts route mode "virtual".
+                    parent_path = urlparse(virtual_original_url).path
+                    parent = classify_request_url(parent_path, root_path=REGISTRY_ROOT_PATH)
+                    if (
+                        registration["route_mode"] != "virtual"
+                        or not request.headers.get("X-Resolved-Upstream")
+                        or parent is None
+                        or parent[0] != ResourceType.VIRTUAL_SERVER
+                        or classified is None
+                        or classified[0] != ResourceType.SERVER
+                    ):
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Virtual backend binding could not be validated",
+                            headers={"Connection": "close"},
+                        )
+                    classified = parent
                 if classified is None:
                     logger.warning(
                         f"Resource token for "
@@ -4291,17 +5566,27 @@ async def validate_request(request: Request):
                     # Build identity from validation result
                     mcp_identity = Identity(
                         # Human-readable identity for the audit record
-                        # (email -> preferred_username -> sub). The resolved
-                        # claims are surfaced under validation_result["data"];
-                        # the auth/vault/OBO plumbing continues to key on `sub`
-                        # via `username`, which this does not change.
+                        # (email -> preferred_username -> upn -> sub). The
+                        # resolved claims are surfaced under
+                        # validation_result["data"]; the auth/vault/OBO plumbing
+                        # continues to key on `sub` via `username`, which this
+                        # does not change.
                         username=_audit_identity_display(validation_result),
                         auth_method=validation_result.get("method") or "unknown",
-                        provider=validation_result.get("provider"),
+                        # Most validators return `method`, not `provider`, so this
+                        # falls back to the session's provider and then the
+                        # configured IdP; see _audit_provider.
+                        provider=_audit_provider(validation_result),
                         groups=validation_result.get("groups", []),
                         scopes=user_scopes,
                         is_admin=validation_result.get("is_admin", False),
                         credential_type="bearer_token" if authorization else "session_cookie",
+                        # Durable + IdP claims (sub, oid+tid canonical id, upn,
+                        # appid/azp) for correlation without an IdP reverse
+                        # lookup. The `name` claim is deliberately excluded --
+                        # see _audit_identity_claims. Optional; None for IdPs
+                        # that omit them.
+                        **_audit_identity_claims(validation_result),
                     )
 
                     # Build MCP server info
@@ -4342,12 +5627,14 @@ async def validate_request(request: Request):
         response.headers["X-Auth-Method"] = validation_result.get("method") or ""
         response.headers["X-Server-Name"] = server_name or ""
         response.headers["X-Tool-Name"] = tool_name or ""
-        response.headers["X-Groups"] = " ".join(validation_result.get("groups", []))
+        # No X-Groups header: nothing downstream reads it (the registry takes
+        # groups from the signed X-Internal-Token-Registry), and repeating the
+        # group list doubled the auth_request response size (issue #1939).
 
         # Canonical egress principal method: cookie callers resolve to
         # "oauth2" (the session record's value), not the literal "session_cookie".
         # Both internal tokens stamp THIS so consent-write and vend-read agree.
-        _canon_auth_method = _canonical_auth_method(validation_result)
+        _canon_auth_method = canonical_auth_method(validation_result)
         # Canonical egress vault user id (OIDC sub). Both internal tokens stamp
         # THIS so the consent-write and vend paths key the vault on one value for
         # one human -- avoids the preferred_username-vs-sub divergence that made
@@ -4362,6 +5649,21 @@ async def validate_request(request: Request):
             server_name=server_name or "",
             auth_method=_canon_auth_method,
             egress_user=_egress_user,
+            # Sign the audit identity resolved from the VERIFIED claims so the
+            # mcp-proxy hop attributes its OBO mint record from this, not from
+            # the raw ingress header it also receives. `request_id` rides along
+            # as `rid` so that hop's token_mint record can be joined to the
+            # mcp_server_access record this request writes above.
+            audit_identity=_audit_identity_token_claim(validation_result, request_id),
+            # Bind the bearer this request actually verified with an OBO-capable
+            # IdP, so the hop's OBO cache never serves a token for a subject token
+            # nobody verified (a cookie request's bearer header is never checked).
+            obo_subject_sha256=(
+                _obo_subject_digest(access_token)
+                if auth_provider is not None
+                and validation_result.get("method") in _OBO_SUBJECT_VERIFIED_METHODS
+                else ""
+            ),
         )
 
         # Generic-proxy hop token (proxied non-MCP entities). Keyed on the
@@ -4384,8 +5686,9 @@ async def validate_request(request: Request):
 
         # Registry /api/ hop token. Discriminate cookie vs JWT-bearer: the cookie
         # sub-path has an opaque server-side session_id (the registry resolves live
-        # groups from the session store); the JWT-bearer sub-path has no session
-        # row, so session_id is empty and the registry uses the groups claim.
+        # groups from the session store, so the helper omits them from the token);
+        # the JWT-bearer sub-path has no session row, so session_id is empty and the
+        # registry uses the groups claim.
         _registry_session_id = ""
         if validation_result.get("method") == "session_cookie":
             _registry_session_id = (validation_result.get("data") or {}).get("session_id") or ""
@@ -4403,7 +5706,10 @@ async def validate_request(request: Request):
             egress_user=_egress_user,
         )
 
-        return response
+        return _enforce_validate_header_budget(
+            response,
+            validation_result.get("username") or "",
+        )
 
     except ValueError as e:
         logger.warning(f"Token validation failed: {e}")
@@ -4448,8 +5754,17 @@ async def validate_request(request: Request):
             headers={"WWW-Authenticate": "Bearer", "Connection": "close"},
         )
     except HTTPException as e:
-        # Re-raise client error HTTPExceptions (4xx) as-is
+        # Keep the Graph-unavailable result distinct from invalid credentials
+        # and an empty, successful membership lookup.
+        if e.status_code == 503 and e.detail in {
+            "Entra group lookup unavailable",
+            "Entra group mappings unavailable",
+        }:
+            raise
         if 400 <= e.status_code < 500:
+            raise
+        # Already logged by _token_too_large; keep its detail and log it once.
+        if e.status_code == 500 and e.detail == _TOKEN_TOO_LARGE_DETAIL:
             raise
         # For non-client HTTPExceptions, convert to 500
         logger.error(f"HTTP error during validation: {e}")
@@ -4487,13 +5802,9 @@ async def get_auth_config():
         else:
             return {
                 "auth_type": "cognito",
-                "description": "Header-based Cognito token validation",
-                "required_headers": [
-                    "Authorization: Bearer <token>",
-                    "X-User-Pool-Id: <pool_id>",
-                    "X-Client-Id: <client_id>",
-                ],
-                "optional_headers": ["X-Region: <region> (default: us-east-1)"],
+                "description": "Cognito JWT token validation",
+                "required_headers": ["Authorization: Bearer <token>"],
+                "optional_headers": [],
                 "provider_info": provider_info,
             }
     except Exception as e:
@@ -4585,7 +5896,9 @@ async def manage_federation_token(request: Request):
 async def _emit_token_mint_audit(
     request_id: str,
     correlation_id: str | None,
-    username: str,
+    # `object`, not `str`: both identity values are IdP-claim-derived at several
+    # call sites, and their shape is the IdP's choice (see _claim_str).
+    username: object,
     auth_method: str,
     provider: str | None,
     internal_caller: str,
@@ -4597,15 +5910,29 @@ async def _emit_token_mint_audit(
     expires_in_seconds: int | None,
     outcome: str,
     failure_reason: str | None = None,
-    display_username: str | None = None,
+    display_username: object = None,
+    identity_claims: dict | None = None,
 ) -> None:
     """Emit a token-mint audit record and increment the mint metric.
 
     ``username`` is what the record's DEPRECATED ``username_hash`` is derived
-    from (kept identical to preserve existing hash values / back-compat).
-    ``display_username`` is the raw, human-readable identity stored in the new
-    ``username`` field (email -> preferred_username -> sub); when omitted it
+    from. ``display_username`` is the raw, human-readable identity stored in the
+    new ``username`` field (email -> preferred_username -> sub); when omitted it
     falls back to ``username`` (already human-readable on most mint paths).
+
+    BOTH go through ``_claim_str`` here -- this is the ONE cap and the ONE
+    coercion for this stream, so no mint site can reintroduce the drop. Hash
+    values for real principals are unchanged (every identifier is far below
+    ``_MAX_AUDIT_CLAIM_LEN``); a value that exceeds the cap is truncated before
+    hashing, which is strictly better than the previous behaviour of raising
+    inside the best-effort block below and losing the whole record.
+
+    ``identity_claims`` are the durable/IdP identity claims (``subject``,
+    ``canonical_id``, ``principal_name``, ``object_id``, ``tenant_id``,
+    ``app_id``) stored as top-level record fields, so an operator can correlate
+    an opaque subject back to a user on this stream too. Callers MUST derive them
+    from verified claims (see ``_audit_identity_from_token``); omit for mint
+    paths that have none.
 
     Best-effort: any failure here is logged and swallowed so token minting is
     never broken by observability.
@@ -4624,11 +5951,18 @@ async def _emit_token_mint_audit(
         logger.debug("token_mint metric increment failed", exc_info=True)
 
     try:
+        # A multivalued IdP mapper (Keycloak `email`/`username` emitted as a JSON
+        # array) or a numeric directory id reaches here as a non-str: unguarded it
+        # raises in `hash_username` (a list has no `.encode`) or in Pydantic (both
+        # fields are typed `str`), and the `except` below then swallows the
+        # exception -- dropping the ENTIRE audit record while the mint itself
+        # succeeds. Coerce once, here, for every call site.
+        hash_source = _claim_str(username) or ""
         record = TokenMintAuditRecord(
             request_id=request_id,
             correlation_id=correlation_id,
-            username=display_username or username or "anonymous",
-            username_hash=hash_username(username),
+            username=_claim_str(display_username) or hash_source or "anonymous",
+            username_hash=hash_username(hash_source),
             auth_method=auth_method,
             provider=provider,
             internal_caller=internal_caller,
@@ -4640,6 +5974,7 @@ async def _emit_token_mint_audit(
             expires_in_seconds=expires_in_seconds,
             outcome=outcome,
             failure_reason=failure_reason,
+            **{key: value for key, value in (identity_claims or {}).items() if value},
         )
         emit_audit_event(record)
 
@@ -4647,6 +5982,9 @@ async def _emit_token_mint_audit(
         if audit_logger is not None:
             await audit_logger.log_event(record)
     except Exception:
+        # The mint is already done; the record is not. Count it so the loss is
+        # rate-alertable instead of living only in a log line.
+        audit_integrity_degraded_total.add(1, {"reason": "record_dropped"})
         logger.warning("Failed to emit token-mint audit record", exc_info=True)
 
 
@@ -4683,7 +6021,7 @@ def _validate_context_group_scope_shape(
 
 async def _reconcile_context_against_session(
     user_context: dict[str, Any],
-) -> tuple[list[str], list[str], str]:
+) -> tuple[list[str], list[str], str, bool]:
     """Reconcile a mint request's groups/scopes against the authoritative session.
 
     The mint endpoint receives the caller-supplied ``user_context`` in the
@@ -4702,12 +6040,15 @@ async def _reconcile_context_against_session(
     internal signing key.
 
     Returns:
-        Tuple ``(groups, scopes, subject)`` to stamp into the token. ``subject``
-        is the session's canonical OIDC ``sub`` (persisted at login), stamped as
-        the token's ``egress_user`` claim so the vend keys the egress vault on the
-        SAME id the browser-consent path wrote (see ``_canonical_egress_user``).
-        Empty when there is no session-backed source or the session predates
-        subject persistence.
+        Tuple ``(groups, scopes, egress_user, entra_graph_groups_resolved)``.
+        ``egress_user`` is the session's vault key, read through
+        ``session_vault_user_id`` like every other reader of a session's key,
+        including a username fallback key the login stored for a subject-less
+        session, so a token minted from that session vends what its browser
+        consented. Without a session it is the body's value, or ``""`` when that
+        is fallback-shaped or not a string: only a session's stored key may be a
+        fallback key. The Graph marker comes only from a resolved Entra session;
+        a caller-supplied context cannot assert it.
 
     Raises:
         HTTPException: 403 if the body claims a privileged group the resolved
@@ -4722,8 +6063,13 @@ async def _reconcile_context_against_session(
         # is the internal-JWT gate + validate_scope_subset; use the body as-is.
         # A non-session caller may still assert its canonical egress id in the
         # body (explicit trust boundary); absent that there is no OIDC sub to key.
+        # A fallback-shaped or non-string value is dropped (never coerced): only
+        # a session's stored key may be a fallback key, and _canonical_egress_user
+        # trusts a fallback-shaped egress_user on a minted token for that reason.
         body_subject = user_context.get("egress_user") or user_context.get("subject") or ""
-        return body_groups, body_scopes, body_subject
+        if not isinstance(body_subject, str) or is_fallback_shaped(body_subject):
+            body_subject = ""
+        return body_groups, body_scopes, body_subject, False
 
     from session_store import resolve_session
 
@@ -4761,10 +6107,17 @@ async def _reconcile_context_against_session(
     else:
         reconciled_groups = session_groups
     reconciled_scopes = await map_groups_to_scopes(reconciled_groups)
-    # The session's OIDC sub is the authoritative canonical egress id; the vend
-    # and the browser-consent path must key the vault on this one value.
-    session_subject = session_data.get("subject") or ""
-    return reconciled_groups, reconciled_scopes, session_subject
+    # The key the login stored on the session, a fallback key included; the
+    # vend and the browser-consent path read the same session through
+    # session_vault_user_id, so the token vends what that browser consented.
+    session_egress_user = session_vault_user_id(session_data)
+    return (
+        reconciled_groups,
+        reconciled_scopes,
+        session_egress_user,
+        session_data.get("provider") == "entra"
+        and session_data.get("entra_graph_groups_resolved") is True,
+    )
 
 
 @internal_router.post("/tokens", response_model=GenerateTokenResponse)
@@ -4826,14 +6179,17 @@ async def generate_user_token(
         _validate_context_group_scope_shape(user_context)
         username = user_context.get("username")
         user_scopes = user_context.get("scopes", [])
-        # Human-readable identity for the audit record (email ->
-        # preferred_username -> username). `username` still drives the
-        # deprecated username_hash and all auth/vault logic unchanged.
-        audit_display_username = (
-            user_context.get("email")
-            or user_context.get("preferred_username")
-            or username
-            or "anonymous"
+        # Human-readable identity for the audit record, resolved by the ONE audit
+        # display helper (email -> preferred_username -> upn -> username -> sub,
+        # every candidate capped and coerced by _claim_str). The mint body is the
+        # shape that helper reads: the caller-supplied claims live under `data`
+        # and the resolved login handle at the top level. This adds `upn`/`sub` as
+        # fallbacks after the three keys the mint path resolved before -- a
+        # superset in the same precedence order, so no existing value changes.
+        # `username` still drives the deprecated username_hash and all
+        # auth/vault logic unchanged.
+        audit_display_username = _audit_identity_display(
+            {"data": user_context, "username": username}
         )
 
         if not username:
@@ -4889,9 +6245,12 @@ async def generate_user_token(
         # session store when a session_id is present, so a forged body cannot
         # inject groups/scopes the session never granted. When no session_id is
         # present the body is used as-is (explicit, documented trust boundary).
-        user_groups, reconciled_scopes, egress_user = await _reconcile_context_against_session(
-            user_context
-        )
+        (
+            user_groups,
+            reconciled_scopes,
+            egress_user,
+            entra_graph_groups_resolved,
+        ) = await _reconcile_context_against_session(user_context)
         # Re-narrow the requested scopes to what the reconciled context allows so
         # a session-backed mint can never exceed the session's granted scopes.
         requested_scopes = [s for s in requested_scopes if s in set(reconciled_scopes)]
@@ -4948,13 +6307,19 @@ async def generate_user_token(
                     TokenKind.RESOURCE.value if request.resource else TokenKind.USER.value
                 ),
             }
+            if entra_graph_groups_resolved:
+                jwt_claims["entra_graph_groups_resolved"] = True
 
-            # Canonical egress vault id (the session's OIDC sub). This token's
-            # ``sub`` is the login username, which is NOT what the egress vault
-            # keys on; stamp the OIDC sub as ``egress_user`` so a bearer minted
-            # here vends against the SAME id the browser-consent path wrote (see
-            # _canonical_egress_user). Omitted when there is no OIDC sub (non-
-            # session / legacy callers) -- the vend then falls back to username.
+            # Canonical egress vault id (the key stored on the session, read
+            # through session_vault_user_id, a username fallback key included).
+            # This token's ``sub`` is the login username, which is NOT what the
+            # egress vault keys on; stamp the session's key as ``egress_user`` so
+            # a bearer minted here vends against the SAME id the browser-consent
+            # path wrote (see _canonical_egress_user). Omitted when the session
+            # owns no key (a session record without a stored key, or a non-session
+            # caller that asserted none or a fallback-shaped one) -- the per-user
+            # vend then refuses the token rather than key the vault on its
+            # username ``sub``.
             if egress_user:
                 jwt_claims["egress_user"] = egress_user
 
@@ -5224,20 +6589,171 @@ if __name__ == "__main__":
     main()
 
 
+def _entra_enabled() -> bool:
+    """Read ENTRA_ENABLED without letting a malformed value stop other providers.
+
+    This runs at import time for every deployment, including ones that use
+    Keycloak, Okta or another provider. An unrecognized value is logged and
+    treated as disabled, so Entra logins stay unavailable (closed) while the
+    other providers keep working.
+
+    Returns:
+        True when Entra is enabled.
+    """
+    raw = os.environ.get("ENTRA_ENABLED", "false").strip().lower()
+    if raw in _ENTRA_ENABLED_TRUE:
+        return True
+    if raw not in _ENTRA_ENABLED_FALSE:
+        logger.error(
+            "ENTRA_ENABLED=%r is not a recognized boolean; treating Entra as disabled. "
+            "Use true or false.",
+            raw,
+        )
+    return False
+
+
+def _resolve_okta_endpoints(
+    config: dict,
+) -> None:
+    """Point the Okta login at the authorization server OktaProvider validates against.
+
+    With OKTA_AUTH_SERVER_ID set, OktaProvider accepts only tokens from that
+    custom authorization server. A login sent to the org server returns an
+    id_token with another issuer and signing keys, and every login fails. Both
+    now take their endpoints from ``okta_oauth2_base_url``.
+
+    Args:
+        config: The parsed ``oauth2_providers.yml``; its Okta URLs are updated in place.
+    """
+    okta = config.get("providers", {}).get("okta")
+    okta_domain = os.environ.get("OKTA_DOMAIN", "")
+    if not okta or not okta_domain:
+        return
+    from providers.okta import okta_oauth2_base_url
+
+    base = okta_oauth2_base_url(okta_domain, os.environ.get("OKTA_AUTH_SERVER_ID", ""))
+    for field in ("auth_url", "token_url", "user_info_url", "logout_url"):
+        if field in okta:
+            okta[field] = Template(okta[field]).safe_substitute(OKTA_OAUTH2_BASE_URL=base)
+
+
+# The one session key oauth2_providers.yml ships, as shipped. It expands to
+# SESSION_COOKIE_DOMAIN, so it cannot disagree with the domain the login uses.
+_SESSION_DOMAIN_PLACEHOLDER: str = "${SESSION_COOKIE_DOMAIN}"
+# Every session cookie key an edited yml may still set, with what decides it now.
+_IGNORED_SESSION_KEYS: dict[str, str] = {
+    "secure": "set SESSION_COOKIE_SECURE",
+    "max_age_seconds": "set SESSION_MAX_AGE_SECONDS",
+    "cookie_name": "set SESSION_COOKIE_NAME",
+    "domain": "set SESSION_COOKIE_DOMAIN",
+    "samesite": "always SameSite=Lax",
+    "httponly": "always HttpOnly",
+}
+
+
+def _check_provider_session_block(
+    oauth2_config: dict[str, Any],
+) -> None:
+    """Refuse an oauth2_providers.yml ``session`` block that sets a cookie key the login ignores.
+
+    The shared settings are the one source of the session cookie, and SameSite
+    and HttpOnly are fixed, so a yml value would be ignored without notice.
+    The yml ships in the image and no deployment surface mounts it, so only an
+    operator who mounts an edited copy reaches this. The shipped
+    ``domain: "${SESSION_COOKIE_DOMAIN}"``, or an empty domain, loads.
+
+    Args:
+        oauth2_config: The provider configuration before environment expansion.
+
+    Raises:
+        ValueError: The block sets one of the keys; the message names each one
+            and the variable to set instead.
+    """
+    session = oauth2_config.get("session") or {}
+    ignored = [
+        key
+        for key in _IGNORED_SESSION_KEYS
+        if key in session
+        and not (
+            key == "domain" and str(session[key] or "").strip() in ("", _SESSION_DOMAIN_PLACEHOLDER)
+        )
+    ]
+    if ignored:
+        listed = "; ".join(f"session.{key} ({_IGNORED_SESSION_KEYS[key]})" for key in ignored)
+        raise ValueError(
+            "oauth2_providers.yml sets session cookie keys the auth server does not read: "
+            f"{listed}. Remove them from the session block, keep "
+            f'domain: "{_SESSION_DOMAIN_PLACEHOLDER}" as shipped, and set the variables on '
+            "the registry and the auth server."
+        )
+
+
 # Load OAuth2 providers configuration
 def load_oauth2_config():
-    """Load the OAuth2 providers configuration from oauth2_providers.yml"""
-    try:
-        oauth2_file = Path(__file__).parent / "oauth2_providers.yml"
-        with open(oauth2_file) as f:
-            config = yaml.safe_load(f)
+    """Load the OAuth2 providers configuration from oauth2_providers.yml.
 
-        # Substitute environment variables in configuration
-        processed_config = substitute_env_vars(config)
-        return processed_config
-    except Exception as e:
-        logger.error(f"Failed to load OAuth2 configuration: {e}")
-        return {"providers": {}, "session": {}, "registry": {}}
+    Raises:
+        ValueError: The configuration is unusable, for example a ``session``
+            block that sets a session cookie key the settings own.
+    """
+    oauth2_file = Path(__file__).parent / "oauth2_providers.yml"
+    with open(oauth2_file) as f:
+        config = yaml.safe_load(f)
+    _check_provider_session_block(config)
+
+    # Resolve only an active Entra provider; disabled settings cannot break
+    # another IdP's login. Active Entra misconfiguration fails at startup.
+    entra = config.get("providers", {}).get("entra")
+    entra_on = _entra_enabled()
+    if entra and entra_on:
+        from providers.entra import (
+            _entra_login_base,
+            _group_cache_ttl_seconds,
+            _group_recovery_enabled,
+            _infer_graph_base_url,
+            _validated_graph_override,
+            _validated_graph_resource_url,
+        )
+
+        _group_recovery_enabled()
+        _group_cache_ttl_seconds()
+        browser_read = os.environ.get("ENTRA_BROWSER_USER_READ_ENABLED", "false").lower()
+        if browser_read not in {"true", "false"}:
+            raise ValueError("ENTRA_BROWSER_USER_READ_ENABLED must be true or false")
+        if browser_read == "true" and "User.Read" not in entra["scopes"]:
+            entra["scopes"].append("User.Read")
+        # Resolve Entra browser endpoints from the selected Graph cloud.
+        login_base = _entra_login_base()
+        login_resource = _infer_graph_base_url(login_base)
+        graph_resource = _validated_graph_resource_url(login_resource)
+        graph_override = _validated_graph_override(graph_resource)
+        if login_resource is None and graph_override is None:
+            raise ValueError("ENTRA_GRAPH_BASE_URL required for custom Entra login origin")
+        if (
+            login_resource is None
+            and graph_resource is None
+            and (_group_recovery_enabled() or browser_read == "true")
+        ):
+            raise ValueError("ENTRA_GRAPH_RESOURCE_URL required for Entra Graph scopes")
+        graph_base = graph_override or graph_resource
+        for field in ("auth_url", "token_url", "logout_url"):
+            if field in entra:
+                entra[field] = Template(entra[field]).safe_substitute(
+                    ENTRA_LOGIN_BASE_URL=login_base
+                )
+        if "user_info_url" in entra:
+            entra["user_info_url"] = Template(entra["user_info_url"]).safe_substitute(
+                ENTRA_GRAPH_BASE_URL=graph_base
+            )
+
+    _resolve_okta_endpoints(config)
+    resolved = substitute_env_vars(config)
+    # substitute_env_vars turns only "true"/"false" into booleans, so a value
+    # such as "0" would stay a truthy string and enable Entra. Use the parsed
+    # value so the provider flag always matches the resolution above.
+    if entra:
+        resolved["providers"]["entra"]["enabled"] = entra_on
+    return resolved
 
 
 def auto_derive_cognito_domain(user_pool_id: str) -> str:
@@ -5535,6 +7051,9 @@ async def oauth2_login(provider: str, request: Request, redirect_uri: str = None
             "nonce": nonce,  # Bind the returned id_token to this login
             "code_verifier": code_verifier,  # PKCE: sent on token exchange
         }
+        requested_scope = " ".join(provider_config["scopes"])
+        if provider == "entra":
+            session_data["requested_scopes"] = requested_scope
 
         # Create temporary session for OAuth2 flow
         temp_session = signer.dumps(session_data)
@@ -5542,7 +7061,7 @@ async def oauth2_login(provider: str, request: Request, redirect_uri: str = None
         auth_params = {
             "client_id": provider_config["client_id"],
             "response_type": provider_config["response_type"],
-            "scope": " ".join(provider_config["scopes"]),
+            "scope": requested_scope,
             "state": state,
             "redirect_uri": callback_uri,
             "nonce": nonce,
@@ -5562,6 +7081,8 @@ async def oauth2_login(provider: str, request: Request, redirect_uri: str = None
                 status_code=400,
                 detail="Invalid OAuth2 provider configuration",
             )
+        if provider == "entra" and parsed_auth_url.scheme != "https":
+            raise HTTPException(status_code=400, detail="Entra authorization URL must use HTTPS")
 
         # Create response with temporary session cookie
         response = RedirectResponse(url=auth_url, status_code=302)
@@ -5644,6 +7165,100 @@ def _verify_id_token_or_deny(
         # id_token can never silently fall through to an unverified source.
         logger.warning(f"ID token verification failed for {provider}: {e}")
         raise HTTPException(status_code=401, detail="ID token verification failed") from e
+
+
+def _require_login_subject(
+    provider: str,
+    mapped_user: dict,
+    token_data: dict,
+) -> None:
+    """Refuse an OIDC login that did not identify the account by its subject.
+
+    The session subject becomes the per-user egress vault key (see
+    ``_login_vault_user_id``). Without one, the vault falls back to the
+    username, which an IdP may let another account hold later. An OIDC login
+    always returns the account's ``sub``, so a missing subject there means a
+    broken or unexpected response: deny before any session exists. A login is
+    OIDC when the provider is in ``_OIDC_LOGIN_PROVIDERS`` or when its token
+    response carried an ``id_token``, which also covers a provider an operator
+    added to ``oauth2_providers.yml``. Other logins (GitHub, Google or a custom
+    provider with no ``id_token``) keep working and only get a warning, since
+    their subject depends on the operator's ``subject_claim`` setting.
+
+    Any login, OIDC or not, whose subject starts with the fallback-key prefix
+    (``name:``) is refused too: that subject would equal the vault key of a
+    login with no subject, so a provider whose ``subject_claim`` names a
+    user-chosen value could hand one user another user's connections. So is a
+    subject that is not a string (an id_token ``sub`` of another JSON type):
+    the session would store a vault key that keys nothing, and the user would
+    pass login only to be refused by every vault route with nothing logged.
+    ``map_user_info`` already turns a userInfo subject into a string.
+
+    Args:
+        provider: The OAuth2 provider key from the callback path.
+        mapped_user: The identity the callback mapped from the IdP response.
+        token_data: The provider's token endpoint response.
+
+    Raises:
+        HTTPException: 401 when an OIDC login mapped no subject, or any login
+            mapped a subject that is not a string or is shaped like a fallback
+            key.
+    """
+    subject = mapped_user.get("subject")
+    if subject is not None and not isinstance(subject, str):
+        logger.warning(
+            "OAuth2 login via %s yielded a subject that is not a string (%s); "
+            "refusing the login (check the provider's subject claim)",
+            provider,
+            type(subject).__name__,
+        )
+        raise HTTPException(status_code=401, detail="Login response did not identify the account")
+    if is_fallback_shaped(subject):
+        logger.warning(
+            "OAuth2 login via %s yielded a subject shaped like a username-fallback "
+            "vault key; refusing the login (check the provider's subject_claim)",
+            provider,
+        )
+        raise HTTPException(status_code=401, detail="Login response did not identify the account")
+    if subject:
+        return
+    if provider in _OIDC_LOGIN_PROVIDERS or token_data.get("id_token"):
+        logger.warning("OAuth2 login via %s yielded no subject; refusing the login", provider)
+        raise HTTPException(status_code=401, detail="Login response did not identify the account")
+    logger.warning(
+        "OAuth2 login via %s yielded no subject; per-user egress vends from "
+        "tokens minted for this session will be refused (set subject_claim "
+        "for the provider)",
+        provider,
+    )
+
+
+def _login_vault_user_id(
+    provider: str,
+    mapped_user: dict,
+) -> str:
+    """Return the per-user egress vault key to store on a new session.
+
+    Computed once, at login, and stored as the session's ``egress_user``; every
+    later reader takes it from there through ``session_vault_user_id`` rather
+    than rebuilding it from the session's other fields. Called after
+    ``_require_login_subject``, so a subject is a string that is never
+    fallback-shaped, and a login without one is a provider allowed to log in
+    that way.
+
+    Args:
+        provider: The OAuth2 provider key from the callback path.
+        mapped_user: The identity the callback mapped from the IdP response.
+
+    Returns:
+        The account id (``mapped_user["subject"]``) when present, else
+        ``username_fallback_key(provider, username)``, which is ``""`` for a
+        login with no usable username.
+    """
+    subject = mapped_user.get("subject")
+    if subject:
+        return subject
+    return username_fallback_key(provider, mapped_user.get("username"))
 
 
 @app.get("/oauth2/callback/{provider}")
@@ -5733,6 +7348,7 @@ async def oauth2_callback(
             provider, code, provider_config, auth_server_url, code_verifier=code_verifier
         )
         logger.info(f"Token data keys: {list(token_data.keys())}")
+        entra_graph_groups_resolved = False
 
         # For Cognito and Keycloak, try to extract user info from JWT tokens
         if provider in ["cognito", "keycloak"]:
@@ -5762,8 +7378,10 @@ async def oauth2_callback(
                                 "username"
                             ),  # Cognito username is usually email
                             "name": token_validation.get("username"),
-                            "subject": token_validation.get("sub")
-                            or token_validation.get("username"),
+                            # The immutable Cognito sub. Never the username:
+                            # Cognito frees a username for reuse when its user
+                            # is deleted, and the egress vault keys on this.
+                            "subject": token_validation.get("sub"),
                             "groups": token_validation.get("groups", []),
                         }
                         logger.info(
@@ -5833,10 +7451,11 @@ async def oauth2_callback(
                     safe_identity_summary(mapped_user),
                 )
         elif provider == "entra":
-            # For Entra ID, prioritize ID token claims over userinfo endpoint
+            # Entra login requires an ID token; a userinfo-only response cannot
+            # supply this flow's verified nonce and group claims.
             try:
                 if "id_token" in token_data:
-                    from providers.entra import EntraIdProvider
+                    from providers.entra import EntraIdProvider, GraphGroupLookupError
 
                     # Verify signature/issuer/audience/expiry against the tenant
                     # JWKS before trusting any claim. A present but unverifiable
@@ -5849,25 +7468,43 @@ async def oauth2_callback(
                         safe_identity_summary(id_token_claims),
                     )
 
-                    # Extract user info from ID token claims
-                    # Entra ID can return groups as either 'groups' or 'roles' depending on configuration
-                    groups = id_token_claims.get("groups", [])
-                    if not groups:
-                        groups = id_token_claims.get("roles", [])
-
-                    # Group overage: when a user is a member of more groups
-                    # than will fit in the token (Entra caps inline groups
-                    # around 150-200), Entra omits them and signals via
-                    # `hasgroups` or `_claim_names.groups`. Fall back to
-                    # Microsoft Graph /me/memberOf so the user gets their
-                    # real group set instead of an empty session (#929).
-                    if EntraIdProvider.has_group_overage(id_token_claims):
-                        logger.info("Entra ID token signals group overage; resolving via Graph")
-                        graph_groups = await EntraIdProvider.fetch_groups_via_graph(
-                            token_data["access_token"]
+                    # Inline claims remain authoritative unless the token signals
+                    # overage. Recover absent claims, including nested memberships.
+                    try:
+                        requested_scopes = temp_session_data.get("requested_scopes")
+                        graph_requested = (
+                            isinstance(requested_scopes, str)
+                            and "User.Read" in requested_scopes.split()
                         )
-                        if graph_groups:
-                            groups = graph_groups
+                        groups = await EntraIdProvider.resolve_groups(
+                            id_token_claims,
+                            token_data["access_token"],
+                            graph_requested=graph_requested,
+                        )
+                        # resolve_groups returns only a list. Distinguish a Graph
+                        # result from an inline claim or disabled recovery before
+                        # allowing the local user-group fallback below.
+                        from providers.entra import _group_recovery_enabled
+
+                        entra_graph_groups_resolved = (
+                            graph_requested
+                            and _group_recovery_enabled()
+                            and (
+                                EntraIdProvider.has_group_overage(id_token_claims)
+                                or not (
+                                    id_token_claims.get("groups") or id_token_claims.get("roles")
+                                )
+                            )
+                        )
+                    except GraphGroupLookupError as e:
+                        logger.warning("Entra login group recovery failed; reason=%s", e.reason)
+                        raise HTTPException(
+                            status_code=503, detail="Entra group lookup unavailable"
+                        ) from e
+                    except ValueError as e:
+                        raise HTTPException(
+                            status_code=401, detail="Invalid Entra group claims"
+                        ) from e
 
                     mapped_user = {
                         "username": id_token_claims.get("preferred_username")
@@ -5885,28 +7522,14 @@ async def oauth2_callback(
                         safe_identity_summary(mapped_user),
                     )
                 else:
-                    logger.warning("No ID token found in Entra response, falling back to userInfo")
-                    raise ValueError("Missing ID token")
+                    raise HTTPException(status_code=401, detail="Missing Entra ID token")
 
             except HTTPException:
                 raise
             except Exception as e:
-                logger.warning(
-                    f"Entra ID token parsing failed: {e}, falling back to userInfo endpoint"
-                )
-                # Fallback to userInfo endpoint (only when no id_token present).
-                user_info = await get_user_info(token_data["access_token"], provider_config)
-                logger.info(
-                    "User info fetched from %s userInfo: %s",
-                    provider,
-                    safe_identity_summary(user_info),
-                )
-                mapped_user = map_user_info(user_info, provider_config)
-                logger.info(
-                    "User mapped from %s userInfo: %s",
-                    provider,
-                    safe_identity_summary(mapped_user),
-                )
+                logger.warning("Entra ID token processing failed; type=%s", type(e).__name__)
+                raise HTTPException(status_code=401, detail="Invalid Entra ID token") from e
+
         elif provider == "okta":
             # For Okta, verify the ID token to get groups (userinfo doesn't include groups)
             try:
@@ -6085,6 +7708,8 @@ async def oauth2_callback(
                 safe_identity_summary(mapped_user),
             )
 
+        _require_login_subject(provider, mapped_user, token_data)
+
         # Issue #1127: PingFederate (and any IdP in the fallback allow-list)
         # may return an empty groups claim because group memberships are not
         # configured in the IdP's user store. Enrich groups from the
@@ -6100,7 +7725,7 @@ async def oauth2_callback(
                 should_enrich_user_groups,
             )
 
-            if should_enrich_user_groups(
+            if not entra_graph_groups_resolved and should_enrich_user_groups(
                 mapped_user["username"],
                 session_groups,
                 provider,
@@ -6129,11 +7754,11 @@ async def oauth2_callback(
 
         # Filter the (possibly enriched) group list down to the scope-relevant
         # subset BEFORE persisting it. IdPs such as Entra ID can return hundreds
-        # or thousands of groups; storing them all bloats the X-Groups header
-        # (nginx buffer overflow -> 500s) and makes the per-request groups->scopes
-        # lookup do one DB query per group. Filtering here is lossless for
-        # authorization because unmapped groups never produce scopes. Runs after
-        # enrichment so the final set is filtered.
+        # or thousands of groups, and every session-backed request resolves the
+        # stored list. The filter never changes the user's scopes, but it does drop
+        # groups that only group-restricted visibility (allowed_groups) would match;
+        # see the group_filter module docstring. Runs after enrichment so the final
+        # set is filtered.
         from group_filter import filter_session_groups
 
         session_groups = await filter_session_groups(
@@ -6141,11 +7766,18 @@ async def oauth2_callback(
             username_hash=hash_username(mapped_user["username"]),
         )
 
+        if provider == "entra":
+            from providers.entra import GRAPH_GROUP_MAX_BYTES, graph_group_bytes
+
+            if graph_group_bytes(session_groups) > GRAPH_GROUP_MAX_BYTES:
+                logger.warning("Entra session group set exceeds the safe membership size")
+                raise HTTPException(status_code=503, detail="Entra group lookup unavailable")
+
         # Persist the full session record server-side and put only an opaque
         # session_id in the browser cookie. This prevents cookie-size failures
         # for IdPs that return large groups claims (e.g. Entra ID with many
         # group memberships) and keeps id_token off the client entirely.
-        session_max_age = OAUTH2_CONFIG.get("session", {}).get("max_age_seconds", 28800)
+        session_max_age = settings.session_max_age_seconds
         # id_token is encrypted at rest server-side and required for OIDC SSO
         # logout (id_token_hint).
         from session_store import create_session
@@ -6158,10 +7790,12 @@ async def oauth2_callback(
             provider=provider,
             auth_method="oauth2",
             max_age_seconds=session_max_age,
+            egress_user=_login_vault_user_id(provider, mapped_user),
             id_token=token_data.get("id_token"),
             subject=mapped_user.get("subject"),
+            entra_graph_groups_resolved=entra_graph_groups_resolved,
         )
-        registry_session = signer.dumps(session_id)
+        registry_session = signer.dumps(session_id, salt=settings.session_cookie_signing_salt)
 
         # Redirect to registry with session cookie
         redirect_url = temp_session_data.get(
@@ -6184,54 +7818,27 @@ async def oauth2_callback(
             redirect_url = "/"
         response = RedirectResponse(url=redirect_url, status_code=302)
 
-        # Set registry-compatible session cookie
-        # Check if HTTPS is terminated at load balancer/CloudFront
+        # Set registry-compatible session cookie. HTTPS may be terminated at a
+        # load balancer or CloudFront, which is_request_https accounts for.
         is_https = is_request_https(request)
-
-        # Secure-by-default: the Secure flag is enabled unless an operator has
-        # explicitly set session.secure to false for a plain-HTTP local dev
-        # stack. A missing config key must NOT silently drop the flag, so the
-        # code-level fallback is True (fail closed). The flag is only actually
-        # emitted when the inbound request is HTTPS, because a browser rejects a
-        # Secure Set-Cookie sent over plain HTTP.
-        cookie_secure_config = OAUTH2_CONFIG.get("session", {}).get("secure", True)
-        cookie_secure = cookie_secure_config and is_https
-        # SameSite MUST remain "lax" for the OAuth login flow. The session
-        # cookie is set on the callback response, which is reached via a
-        # top-level cross-site navigation from the IdP. A "strict" cookie is
-        # NOT sent on such cross-site navigations, so the browser would drop it
-        # and login would silently fail. Do not "harden" this to Strict; CSRF
-        # is defended separately by the CSRF token, not by SameSite=Strict.
-        cookie_samesite = OAUTH2_CONFIG.get("session", {}).get("samesite", "lax")
-        cookie_domain = OAUTH2_CONFIG.get("session", {}).get("domain", "")
-
-        # Handle domain configuration - only use explicitly configured values
-        # Empty string or placeholder means no domain attribute (exact host only)
-        if not cookie_domain or cookie_domain == "${SESSION_COOKIE_DOMAIN}":
-            cookie_domain = None
-            logger.info("No cookie domain configured - cookie will be set for exact host only")
-        else:
-            logger.info("Using explicitly configured cookie domain")
-
-        logger.info(
-            f"Auth server setting session cookie: is_https={is_https}, domain={'configured' if cookie_domain else 'not set'}, x-forwarded-proto={request.headers.get('x-forwarded-proto', 'not set')}, request_scheme={request.url.scheme}"
+        # Every attribute, and the expiry of the other variant, comes from the
+        # function the registry's expiries use: the effective name, Path=/,
+        # SESSION_COOKIE_DOMAIN (none with the __Host- prefix), Secure from
+        # SESSION_COOKIE_SECURE on HTTPS, SameSite=Lax, HttpOnly, and Max-Age
+        # SESSION_MAX_AGE_SECONDS.
+        cookie = session_cookie_attributes(
+            name=settings.session_cookie_effective_name,
+            is_https=is_https,
+            secure=settings.session_cookie_secure,
+            domain=settings.session_cookie_domain,
+            host_prefix=settings.session_cookie_host_prefix,
+            max_age=session_max_age,
         )
-
-        cookie_params = {
-            "key": "mcp_gateway_session",  # Same as registry SESSION_COOKIE_NAME
-            "value": registry_session,
-            "max_age": session_max_age,
-            "httponly": OAUTH2_CONFIG.get("session", {}).get("httponly", True),
-            "samesite": cookie_samesite,
-            "secure": cookie_secure,
-            "path": "/",  # Ensure cookie is sent for all paths
-        }
-
-        # Only set domain if configured or inferred (for cross-subdomain cookies)
-        if cookie_domain:
-            cookie_params["domain"] = cookie_domain
-
-        response.set_cookie(**cookie_params)
+        logger.info(
+            f"Auth server setting session cookie: secure={cookie.set_cookie['secure']}, is_https={is_https}, domain={'configured' if cookie.set_cookie['domain'] else 'not set'}, x-forwarded-proto={request.headers.get('x-forwarded-proto', 'not set')}, request_scheme={request.url.scheme}"
+        )
+        response.set_cookie(value=registry_session, **cookie.set_cookie)
+        _expire_other_session_cookie_variant(response, cookie)
 
         # Clear temporary OAuth2 session. The cookie was set without a
         # domain attribute, so delete must also omit domain to match.
@@ -6275,47 +7882,73 @@ async def exchange_code_for_token(
             os.environ.get("AUTH_SERVER_URL", "http://localhost:8888").rstrip("/") + ROOT_PATH
         )
 
-    async with httpx.AsyncClient() as client:
-        token_data = {
-            "grant_type": provider_config["grant_type"],
-            "client_id": provider_config["client_id"],
-            "client_secret": provider_config["client_secret"],
-            "code": code,
-            "redirect_uri": f"{auth_server_url}/oauth2/callback/{provider}",
-        }
-        if code_verifier:
-            token_data["code_verifier"] = code_verifier
+    # Entra sends a client secret and code to an HTTPS token endpoint. Use the
+    # credentialed OAuth guard to pin its public DNS answer or an explicitly
+    # trusted IdP proxy host. In-cluster IdPs keep their existing plain client.
+    from registry.utils.url_guard import (
+        CREDENTIALED_OAUTH_PROFILE,
+        shared_guarded_async_client,
+        shared_plain_async_client,
+    )
 
-        headers = {"Accept": "application/json"}
-        if provider == "github":
-            headers["Accept"] = "application/json"
+    if provider == "entra":
+        client = shared_guarded_async_client(profile=CREDENTIALED_OAUTH_PROFILE)
+    else:
+        client = shared_plain_async_client()
+    token_data = {
+        "grant_type": provider_config["grant_type"],
+        "client_id": provider_config["client_id"],
+        "client_secret": provider_config["client_secret"],
+        "code": code,
+        "redirect_uri": f"{auth_server_url}/oauth2/callback/{provider}",
+    }
+    if code_verifier:
+        token_data["code_verifier"] = code_verifier
 
-        response = await client.post(provider_config["token_url"], data=token_data, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    headers = {"Accept": "application/json"}
+    if provider == "github":
+        headers["Accept"] = "application/json"
+
+    response = await client.post(
+        provider_config["token_url"],
+        data=token_data,
+        headers=headers,
+        timeout=httpx.Timeout(5.0),
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 async def get_user_info(access_token: str, provider_config: dict) -> dict:
     """Get user information from OAuth2 provider"""
-    async with httpx.AsyncClient() as client:
-        headers = {"Authorization": f"Bearer {access_token}"}
+    # Same operator-configured IdP as exchange_code_for_token (userinfo endpoint), so
+    # the pooled PLAIN client is used here too (5s timeout preserved).
+    from registry.utils.url_guard import shared_plain_async_client
 
-        response = await client.get(provider_config["user_info_url"], headers=headers)
-        response.raise_for_status()
-        return response.json()
+    client = shared_plain_async_client()
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = await client.get(
+        provider_config["user_info_url"], headers=headers, timeout=httpx.Timeout(5.0)
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def map_user_info(user_info: dict, provider_config: dict) -> dict:
     """Map provider-specific user info to our standard format"""
+    # Stable subject: stored on the session as its egress vault key (see
+    # _login_vault_user_id). OIDC userinfo names it "sub";
+    # userinfo endpoints that are not OIDC (GitHub /user, Google oauth2/v2) expose
+    # the stable account id under another name, configured via subject_claim. A
+    # provider that yields none leaves the session without a subject, and every
+    # bearer token minted from it is refused at the per-user egress vend.
+    subject = user_info.get(provider_config.get("subject_claim") or "sub")
     mapped = {
         "username": user_info.get(provider_config["username_claim"]),
         "email": user_info.get(provider_config["email_claim"]),
         "name": user_info.get(provider_config["name_claim"]),
-        # OIDC subject: stable across id_tokens and access_tokens for the same
-        # (user, app) on every provider. Persisted into the session so the egress
-        # vault can key on it consistently (see canonical_egress_user); "sub" is
-        # the standard claim name across IdPs.
-        "subject": user_info.get("sub"),
+        # GitHub's id is an integer; the vault key is a string.
+        "subject": str(subject) if subject not in (None, "") else None,
         "groups": [],
     }
 
@@ -6569,26 +8202,124 @@ _FORWARDED_RESPONSE_HEADERS: frozenset[str] = frozenset(
 )
 
 
+_SSE_EVENT_TERMINATOR: bytes = b"\n\n"
+_SSE_EVENT_TERMINATOR_CRLF: bytes = b"\r\n\r\n"
+
+
+class _UpstreamStreamTruncated(Exception):
+    """The upstream closed a chunked response before its terminating chunk.
+
+    Carries the bytes received so far, so a caller that can still use them --
+    an SSE stream whose earlier events completed cleanly -- can deliver them
+    instead of discarding a response that was mostly received.
+
+    Args:
+        partial: Body bytes read before the stream was cut.
+    """
+
+    def __init__(
+        self,
+        partial: bytes,
+    ) -> None:
+        super().__init__("upstream closed the response body before its terminating chunk")
+        self.partial = partial
+
+
+def _complete_events_only(
+    partial: bytes,
+) -> bytes:
+    """Return the prefix of a truncated SSE body made of complete events.
+
+    An event counts as complete only once its blank-line terminator arrived,
+    so a stream cut mid-`data:` cannot reach the caller as a half frame. This
+    also keeps truncation fail-closed for the tools/list filter: an event cut
+    in half is dropped, so a partial list can only ever lose tools rather than
+    expose ones the filter had not seen yet.
+
+    Args:
+        partial: Body bytes read before the stream was cut.
+
+    Returns:
+        The complete-event prefix, or empty when no event ever completed.
+    """
+    lf = partial.rfind(_SSE_EVENT_TERMINATOR)
+    crlf = partial.rfind(_SSE_EVENT_TERMINATOR_CRLF)
+    if crlf > lf:
+        return partial[: crlf + len(_SSE_EVENT_TERMINATOR_CRLF)]
+    if lf >= 0:
+        return partial[: lf + len(_SSE_EVENT_TERMINATOR)]
+    return b""
+
+
+def _has_jsonrpc_response(
+    body: bytes,
+) -> bool:
+    """Whether any complete SSE event in the body carries a JSON-RPC response.
+
+    A truncated stream can end after notifications but before the response to
+    the request. Delivering that as a 200 leaves an MCP client waiting for an
+    answer that never arrives, so the caller treats it the same as a stream in
+    which no event completed.
+
+    Args:
+        body: Complete-event prefix returned by `_complete_events_only`.
+
+    Returns:
+        True when a `data:` payload is a JSON object with an `id` and either a
+        `result` or an `error`.
+    """
+    for line in body.decode("utf-8", errors="replace").splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            message = json.loads(line[len("data:") :].strip())
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(message, dict) or "id" not in message:
+            continue
+        if "result" in message or "error" in message:
+            return True
+    return False
+
+
 async def _read_bounded(
     response: httpx.Response,
     max_bytes: int,
+    *,
+    partial_on_truncation: bool = False,
 ) -> bytes:
     """Read upstream body in chunks, enforcing an upper size bound.
 
-    Raises HTTPException(413) if total bytes exceed max_bytes.
+    Args:
+        response: Streaming upstream response to read.
+        max_bytes: Refuse the body once it exceeds this many bytes.
+        partial_on_truncation: When True, an upstream that closes a chunked
+            stream without its terminating chunk raises
+            `_UpstreamStreamTruncated` carrying what arrived. When False the
+            httpx error propagates untouched, which is what callers that
+            cannot use a partial body want.
+
+    Raises:
+        HTTPException: 413 if total bytes exceed max_bytes.
+        _UpstreamStreamTruncated: only when partial_on_truncation is True.
     """
     size = 0
     chunks: list[bytes] = []
-    async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
-        size += len(chunk)
-        if size > max_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"Upstream tools/list response exceeded {max_bytes} bytes; refusing to buffer."
-                ),
-            )
-        chunks.append(chunk)
+    try:
+        async for chunk in response.aiter_bytes():
+            size += len(chunk)
+            if size > max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Upstream tools/list response exceeded {max_bytes} bytes; refusing to buffer."
+                    ),
+                )
+            chunks.append(chunk)
+    except httpx.RemoteProtocolError as exc:
+        if not partial_on_truncation:
+            raise
+        raise _UpstreamStreamTruncated(b"".join(chunks)) from exc
     return b"".join(chunks)
 
 
@@ -6630,13 +8361,37 @@ _PROXY_CONTEXT_HEADERS: frozenset[str] = frozenset(
     }
 )
 
+# Gateway-internal hop credentials. Each is a JWT this gateway mints for ONE
+# internal hop (nginx -> auth_server / registry) and nothing upstream of the
+# gateway consumes any of them, so they are stripped on EVERY egress hop --
+# unconditionally, not only on the vault/OBO branches that apply
+# _EGRESS_STRIP_HEADERS. Two reasons this must be unconditional:
+#   1. Credential leak: X-Internal-Token is signed with SECRET_KEY and bound to
+#      the resolved upstream, so a registrant-controlled MCP backend that
+#      received it could replay it against this gateway's /mcp-proxy hop.
+#   2. Identity leak: since the #1642 fix it carries the caller's signed
+#      `audit_identity` claim (UPN/email + Entra oid/tid/appid) -- readable by
+#      anyone holding the token, base64 needs no key.
+# nginx sets X-Internal-Token on the /mcp-proxy hop (see nginx_service.py's
+# generated location block); the -Generic / -Registry variants belong to other
+# locations and can only arrive here client-supplied, which is exactly why they
+# are stripped too rather than forwarded as attacker-chosen values.
+_INTERNAL_HOP_TOKEN_HEADERS: frozenset[str] = frozenset(
+    {
+        "x-internal-token",
+        "x-internal-token-generic",
+        "x-internal-token-registry",
+    }
+)
+
 
 def _forward_headers(
     incoming: dict[str, str],
     relay_authorization: bool = False,
 ) -> dict[str, str]:
     """Copy incoming request headers to the upstream, stripping hop-by-hop and
-    proxy-context headers so httpx can set them correctly for the connection.
+    proxy-context headers so httpx can set them correctly for the connection,
+    plus every gateway-internal credential.
 
     Ingress-auth policy (issue #1266): Cookie is ALWAYS stripped (never
     forwarded to any upstream). Authorization and X-Authorization are also
@@ -6645,6 +8400,14 @@ def _forward_headers(
     receives BOTH forms (the MCP Gateway carries the caller bearer in
     X-Authorization, not Authorization). Every other server gets no client auth
     header on egress; upstream creds come from the vault.
+
+    The gateway-internal hop tokens (_INTERNAL_HOP_TOKEN_HEADERS) are stripped
+    for EVERY upstream, including plain registered MCP servers that never touch
+    the egress-vault branches: X-Internal-Token is a SECRET_KEY-signed
+    credential carrying the caller's audit identity, and a registrant-controlled
+    backend must not receive it. ``relay_authorization`` does NOT re-admit them
+    -- even the built-in internal server has no use for a token minted for a
+    different hop.
     """
     forwarded: dict[str, str] = {}
     for key, value in incoming.items():
@@ -6655,6 +8418,10 @@ def _forward_headers(
             # Never leak this internal routing header to the upstream.
             continue
         if lower in _PROXY_CONTEXT_HEADERS:
+            continue
+        if lower in _INTERNAL_HOP_TOKEN_HEADERS:
+            # Gateway-internal, single-hop credentials; see the set's comment.
+            # Read the MCP hop's token off `request.headers`, never off this dict.
             continue
         if lower in ("x-body", "x-body-uninspectable"):
             # Gateway-internal body-capture headers set by capture_body.lua for
@@ -6779,8 +8546,11 @@ def _assert_generic_authorization_not_gateway_cred(
 # Headers that MUST be stripped before injecting a vaulted egress token:
 # the user's gateway IdP JWT / session cookie / X-Authorization are full gateway
 # credentials and must never reach a third-party SaaS upstream; the X-User*/
-# X-Internal-Token/X-Scopes family is gateway-internal identity/routing. Only
-# applied on the oauth_user egress path (other servers keep existing behavior).
+# X-Scopes family is gateway-internal identity/routing. Applied on the
+# oauth_user / PAT egress paths only (other servers keep existing behavior) --
+# with the exception of x-internal-token, which _forward_headers now strips for
+# EVERY upstream (_INTERNAL_HOP_TOKEN_HEADERS); it is kept here so this set
+# remains a self-contained, independently verifiable invariant.
 _EGRESS_STRIP_HEADERS: frozenset[str] = frozenset(
     {
         "authorization",
@@ -6804,7 +8574,8 @@ _EGRESS_STRIP_HEADERS: frozenset[str] = frozenset(
 
 
 # The gateway-internal headers that /validate sets on the auth_request subresponse
-# and nginx copies onto the proxied request. On the GENERIC hop the backend is
+# (plus X-Groups, which older auth servers set and a client can still send) and that
+# nginx copies onto the proxied request. On the GENERIC hop the backend is
 # always registrant-controlled, so these are stripped UNCONDITIONALLY (before any
 # operator/caller header merge) -- neither the caller's identity/scopes/groups nor
 # the gateway's own signed internal tokens may ever reach the backend, where they
@@ -6956,14 +8727,18 @@ def _strip_generic_internal_headers(headers: dict[str, str]) -> dict[str, str]:
 
 async def _vend_egress_token(
     internal_proxy_token: str,
-    server_first_segment: str,
+    registered_server: str,
+    *,
+    include_pre_consent_tools: bool = False,
 ) -> dict | None:
-    """Call the registry's internal egress-token vend endpoint.
+    """Vend for the registered server path bound by the verified proxy token.
 
-    Forwards the verified X-Internal-Token; the registry re-verifies it,
-    re-derives sub/auth_method from the signed claims, runs the allowlist
-    and upstream cross-check, and vends. Returns the JSON response dict on a
-    clean answer (a hit, or a 200 ``consent_required`` miss).
+    ``include_pre_consent_tools`` asks the registry to return the server's
+    stored tools on a consent miss when the server opted in (issue #1986). The
+    mcp-proxy hop sets it only for a direct-route ``tools/list``.
+
+    The registry re-verifies the token and checks its bound upstream against
+    this server's registered destinations before returning a credential.
 
     Raises ``EgressVendUnavailable`` on a *transient* failure (registry
     unreachable/timeout, or a 5xx after the registry exhausted its own Vault
@@ -6981,16 +8756,36 @@ async def _vend_egress_token(
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_egress_vend_timeout_seconds()) as client:
-            resp = await client.post(
-                f"{base}/_egress_internal/egress-token",
-                json={"server_path": server_first_segment},
-                headers={
-                    "Authorization": f"Bearer {service_token}",
-                    "X-Internal-Token": internal_proxy_token,
-                    "Content-Type": "application/json",
-                },
-            )
+        # Pooled, process-lifetime PLAIN client for this in-cluster registry hop
+        # (already-trusted internal target). Timeout per-request; a keep-alive
+        # closed while idle is transparently re-POSTed once (the registry
+        # re-derives + re-vends per request, so the POST is idempotent).
+        #
+        # Flat-first import: the container flattens auth_server/* into /app, so
+        # the packaged form resolves only when running from the repo root (tests).
+        try:
+            from observability.meters import record_egress_conn_reset
+        except ImportError:
+            from auth_server.observability.meters import record_egress_conn_reset
+
+        from registry.utils.url_guard import post_with_reconnect, shared_plain_async_client
+
+        client = shared_plain_async_client()
+        resp = await post_with_reconnect(
+            client,
+            f"{base}/_egress_internal/egress-token",
+            json={
+                "server_path": registered_server,
+                "include_pre_consent_tools": include_pre_consent_tools,
+            },
+            headers={
+                "Authorization": f"Bearer {service_token}",
+                "X-Internal-Token": internal_proxy_token,
+                "Content-Type": "application/json",
+            },
+            timeout=_egress_vend_timeout_seconds(),
+            on_reset=lambda: record_egress_conn_reset("vend"),
+        )
     except httpx.HTTPError as exc:
         # Transport failure or timeout: the registry never gave a definitive
         # answer, so this is transient by nature -- do not degrade to a tokenless
@@ -7045,16 +8840,38 @@ async def _vend_generic_upstream_headers(
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_egress_vend_timeout_seconds()) as client:
-            resp = await client.post(
-                f"{base}/_egress_internal/generic-upstream-headers",
-                json={"entity_type": entity_type, "registered_path": registered_path},
-                headers={
-                    "Authorization": f"Bearer {service_token}",
-                    "X-Internal-Token-Generic": generic_token,
-                    "Content-Type": "application/json",
-                },
-            )
+        # Pooled, process-lifetime PLAIN client for this in-cluster registry hop,
+        # matching its sibling vend above. A bare httpx.AsyncClient here would
+        # default to trust_env=True, so an operator-set HTTP_PROXY would send this
+        # internal POST to the corporate forward proxy unless NO_PROXY happened to
+        # cover the internal registry URL (issue #1832). The plain shared client
+        # passes a custom transport and is therefore proxy-blind, which is what
+        # keeps this hop reaching the registry directly. The registry re-derives
+        # and re-vends per request, so the POST is idempotent and safe to re-POST
+        # once when a pooled keep-alive was closed while idle.
+        #
+        # Flat-first import: the container flattens auth_server/* into /app, so
+        # the packaged form resolves only when running from the repo root (tests).
+        try:
+            from observability.meters import record_egress_conn_reset
+        except ImportError:
+            from auth_server.observability.meters import record_egress_conn_reset
+
+        from registry.utils.url_guard import post_with_reconnect, shared_plain_async_client
+
+        client = shared_plain_async_client()
+        resp = await post_with_reconnect(
+            client,
+            f"{base}/_egress_internal/generic-upstream-headers",
+            json={"entity_type": entity_type, "registered_path": registered_path},
+            headers={
+                "Authorization": f"Bearer {service_token}",
+                "X-Internal-Token-Generic": generic_token,
+                "Content-Type": "application/json",
+            },
+            timeout=_egress_vend_timeout_seconds(),
+            on_reset=lambda: record_egress_conn_reset("generic-headers-vend"),
+        )
     except httpx.HTTPError as exc:
         logger.error("generic upstream-headers vend: registry unreachable (%s)", type(exc).__name__)
         return None
@@ -7088,6 +8905,89 @@ _ELICITATION_PERMITTED_METHODS: frozenset[str] = frozenset(
     {"tools/call", "prompts/get", "resources/read"}
 )
 
+# MCP 2026-07-28 consent prompt (multi round-trip request). The gateway answers
+# with resultType "input_required" holding one URL-mode elicitation/create under
+# EGRESS_CONSENT_INPUT_KEY, and a requestState that starts with
+# EGRESS_CONSENT_REQUEST_STATE_PREFIX. The client asks the user, then retries the
+# same request with inputResponses and that requestState. The gateway removes
+# both before authorizing and forwarding the retry, so the upstream never sees a
+# prompt it did not send. The state carries no data the gateway trusts: a client
+# that forges the prefix only gets its own two fields removed.
+# Spec: https://modelcontextprotocol.io/specification/2026-07-28/changelog
+EGRESS_CONSENT_INPUT_KEY: str = "egress_connect"
+EGRESS_CONSENT_REQUEST_STATE_PREFIX: str = "mcpgw-egress-consent."
+_CONSENT_DECLINE_ACTIONS: frozenset[str] = frozenset({"decline", "cancel"})
+
+
+def _client_accepts_url_input_request(
+    payload: object,
+) -> bool:
+    """Whether a request is MCP 2026-07-28 and its client handles URL prompts.
+
+    The spec lets a server send a URL-mode elicitation only to a client that
+    declared ``elicitation.url`` in its capabilities. A 2026-07-28 request
+    carries the capabilities in ``params._meta`` on every call.
+    """
+    if not is_modern_request(payload):
+        return False
+    capabilities = request_meta(payload).get(META_CLIENT_CAPABILITIES_KEY)
+    if not isinstance(capabilities, dict):
+        return False
+    elicitation = capabilities.get("elicitation")
+    return isinstance(elicitation, dict) and isinstance(elicitation.get("url"), dict)
+
+
+def _strip_gateway_consent_retry(
+    payload: object,
+) -> tuple[bool, str | None]:
+    """Remove the gateway's own consent round-trip fields from a retried request.
+
+    Changes ``payload`` in place when its ``params.requestState`` is one the
+    gateway issued.
+
+    Returns:
+        (stripped, action): whether anything was removed, and the user's answer
+        to the consent prompt ("accept", "decline", "cancel") when present.
+    """
+    if not isinstance(payload, dict):
+        return False, None
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return False, None
+    state = params.get("requestState")
+    if not isinstance(state, str) or not state.startswith(EGRESS_CONSENT_REQUEST_STATE_PREFIX):
+        return False, None
+    params.pop("requestState", None)
+    responses = params.pop("inputResponses", None)
+    answer = responses.get(EGRESS_CONSENT_INPUT_KEY) if isinstance(responses, dict) else None
+    action = answer.get("action") if isinstance(answer, dict) else None
+    return True, action if isinstance(action, str) else None
+
+
+def _input_required_consent_response(
+    req_id: object,
+    message: str,
+    url: str,
+) -> JSONResponse:
+    """Ask a 2026-07-28 client to open the connect URL, then retry the request."""
+    return JSONResponse(
+        status_code=200,
+        content={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resultType": "input_required",
+                "inputRequests": {
+                    EGRESS_CONSENT_INPUT_KEY: {
+                        "method": "elicitation/create",
+                        "params": {"mode": "url", "message": message, "url": url},
+                    }
+                },
+                "requestState": EGRESS_CONSENT_REQUEST_STATE_PREFIX + secrets.token_urlsafe(12),
+            },
+        },
+    )
+
 
 def _ingress_subject_token(request: "Request") -> str:
     """Extract the raw ingress JWT to use as the OBO exchange subject.
@@ -7117,9 +9017,11 @@ def _obo_subject_matches_principal(subject_token: str, internal_claims: dict) ->
     removing reliance on the implicit "nginx forwards the same header to both the
     auth_request subrequest and this hop" invariant.
 
-    The subject token's signature was already verified by /validate; here we only
-    read identity claims (unverified decode) to compare. A missing internal
-    principal, no matching claim, or an undecodable token fails closed.
+    This reads identity claims with an unverified decode. /validate verifies the
+    bearer token's signature only when no session cookie authenticated the
+    request, so do not assume the subject token was verified. The IdP verifies it
+    during the exchange that follows. A missing internal principal, no matching
+    claim, or an undecodable token fails closed.
     """
     principal = (internal_claims or {}).get("sub") or ""
     if not principal:
@@ -7134,6 +9036,26 @@ def _obo_subject_matches_principal(subject_token: str, internal_claims: dict) ->
     }
     candidates.discard("")
     return principal in candidates
+
+
+def _obo_subject_digest(subject_token: str) -> str:
+    """SHA-256 hex digest of a bearer JWT, as signed into the hop token."""
+    return hashlib.sha256(subject_token.encode("utf-8")).hexdigest()
+
+
+def _obo_cache_subject_verified(subject_token: str, internal_claims: dict) -> bool:
+    """True if the hop's subject token is the bearer /validate verified with the IdP.
+
+    A cache hit skips the IdP exchange, and the exchange is what rejects a forged
+    or expired assertion. So the OBO cache may serve a request only when
+    /validate itself verified this exact token with an OBO-capable IdP and signed
+    its digest into the hop token (``obo_subject_sha256``). Cookie-authenticated,
+    self-signed and legacy hop tokens carry no digest and always exchange.
+    """
+    expected = str((internal_claims or {}).get("obo_subject_sha256") or "")
+    if not expected or not subject_token:
+        return False
+    return hmac.compare_digest(_obo_subject_digest(subject_token), expected)
 
 
 def _obo_failure_reason(exc: OboExchangeError) -> str:
@@ -7204,19 +9126,291 @@ def _obo_error_response(req_id: object, detail: str):
     )
 
 
+# JSON-RPC methods that mcp_proxy answers locally instead of forwarding (#1890).
+# The proxy buffers the whole upstream response before it answers, so it cannot
+# relay a response that never ends. A ``subscriptions/listen`` response (MCP
+# 2026-07-28, SEP-2575) is an open-ended SSE stream with keep-alive events: the
+# buffered read would never finish and would hold an upstream connection, from
+# the shared egress pool on the egress path. Method-not-found lets the client
+# carry on without notifications.
+_MCP_PROXY_UNSUPPORTED_METHODS: frozenset[str] = frozenset({"subscriptions/listen"})
+_JSONRPC_METHOD_NOT_FOUND: int = -32601
+
+
+def _unsupported_method_response(
+    req_id: object,
+    method: str,
+) -> JSONResponse:
+    """JSON-RPC method-not-found for a method the buffering proxy cannot relay.
+
+    Args:
+        req_id: The ``id`` of the client's request, echoed back.
+        method: The refused method, one of ``_MCP_PROXY_UNSUPPORTED_METHODS``.
+
+    Returns:
+        A 200 JSON-RPC error response with code -32601.
+    """
+    return JSONResponse(
+        status_code=200,
+        content={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": _JSONRPC_METHOD_NOT_FOUND,
+                "message": f"Method not found: {method}",
+                "data": {"detail": "This method is not supported through the gateway proxy."},
+            },
+        },
+    )
+
+
+# Discovery list methods and the result key each returns. Before the user has a
+# usable egress credential, every one of them answers with an EMPTY list plus
+# ``EGRESS_CONSENT_REQUIRED_HEADER``: list methods MUST NOT error (that dead-ends
+# clients), and the header lets an aggregating caller (the virtual router) tell
+# "consent pending" apart from "this backend genuinely has nothing". One table for
+# the PAT and OAuth branches so the two cannot answer differently.
+_PRE_CONSENT_LIST_RESULT_KEYS: dict[str, str] = {
+    "tools/list": "tools",
+    "resources/list": "resources",
+    "resources/templates/list": "resourceTemplates",
+    "prompts/list": "prompts",
+}
+EGRESS_CONSENT_REQUIRED_HEADER = "X-Egress-Consent-Required"
+# Methods the gateway reports as unsupported while consent is pending, rather
+# than answering them with the consent error. A client probes these and falls
+# back on "method not found", but treats any other error as a failure it shows
+# the user (Claude Desktop does this for server/discover).
+_PRE_CONSENT_UNSUPPORTED_METHODS: frozenset[str] = frozenset({"server/discover"})
+JSONRPC_METHOD_NOT_FOUND: int = -32601
+
+
+def _connect_tool_definition(
+    server_path: str,
+    provider: str,
+) -> dict:
+    """Build the synthetic connect tool listed while consent is pending.
+
+    Calling it reaches the normal pre-consent ``tools/call`` path, which returns
+    the connect URL (``-32042`` URL elicitation, or the ``isError`` baseline).
+
+    Args:
+        server_path: The registered server path; names the tool.
+        provider: The provider's display name for the description.
+
+    Returns:
+        An MCP tool definition with no arguments.
+    """
+    return {
+        "name": _connect_tool_name(server_path),
+        "title": f"Connect your {provider} account",
+        # The model reads this to decide when to call the tool and what to
+        # tell the user, so it names the trigger, the user's two steps, and
+        # what the tool list looks like afterwards.
+        "description": (
+            f"This server's {provider} tools stay hidden until the user connects "
+            f"a {provider} account. Call this tool when the user asks for anything "
+            f"this server handles. It takes no arguments and returns a link. Show "
+            f"the link to the user and ask them to open it in a browser and approve "
+            f"access. Then ask them to reconnect this server in their MCP client "
+            f"(or reload its tool list). The full set of {provider} tools then "
+            f"appears, and this tool is no longer listed."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    }
+
+
+async def _stored_tools_before_consent(
+    registered_server: str,
+    user_scopes: list[str],
+    vend: dict,
+    direct_route: bool,
+) -> list[dict] | None:
+    """The caller's share of the server's stored tools, listed before consent.
+
+    The registry sends ``pre_consent_tools`` only for a direct-route
+    ``tools/list`` on a server that opted in (issue #1986). This applies the
+    same per-tool grant and block check as an upstream ``tools/list``, and it
+    runs whatever ``MCP_TOOLS_LIST_FILTER_ENABLED`` says: the list comes from
+    the registry, not the upstream, so there is no upstream decision to defer
+    to. An entry named like this server's connect tool is dropped, because the
+    gateway owns that name.
+
+    Args:
+        registered_server: The registered server path from the signed proxy token.
+        user_scopes: The caller's scopes.
+        vend: The registry's vend response.
+        direct_route: True only when nginx asserted a direct route.
+
+    Returns:
+        The filtered tools (possibly empty), or None when the server did not opt
+        in or the route is not direct.
+    """
+    stored = vend.get("pre_consent_tools")
+    if not direct_route or not isinstance(stored, list):
+        return None
+    connect_name = _connect_tool_name(registered_server)
+    candidates: list[dict] = []
+    for tool in stored:
+        if isinstance(tool, dict) and tool.get("name") != connect_name:
+            candidates.append(tool)
+    kept = await filter_tools_list_response(registered_server, user_scopes, candidates)
+    logger.info(
+        "mcp_proxy: egress server=%s has no credential; listing %d of %d stored tools "
+        "before consent",
+        registered_server,
+        len(kept),
+        len(stored),
+    )
+    return kept
+
+
+def _connect_tool_local_result(
+    server_name: str,
+    req_id: object,
+    account_connected: bool,
+    incoming_payload: object = None,
+) -> JSONResponse:
+    """Answer a call to the synthetic connect tool when no consent is pending.
+
+    The connect tool is the gateway's own, so a call to it is never forwarded
+    upstream, even once a credential exists: an upstream tool with the same
+    name must not run with that credential on the strength of the connect
+    tool's narrower authorization.
+
+    Args:
+        server_name: The server being called, for the log line.
+        req_id: The JSON-RPC request id.
+        account_connected: True when a credential was found for this user.
+
+    Returns:
+        A successful tool result explaining what to do next.
+    """
+    if account_connected:
+        text = (
+            "Your account for this server is already connected. Reconnect this "
+            "server in your MCP client to load its tools."
+        )
+    else:
+        text = "This server does not need an account connection."
+    logger.info(
+        "mcp_proxy: answering synthetic connect tool locally for server=%s (account_connected=%s)",
+        server_name,
+        account_connected,
+    )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": shape_result(
+                {"content": [{"type": "text", "text": text}], "isError": False},
+                "tools/call",
+                incoming_payload,
+            ),
+        },
+    )
+
+
+def _pre_consent_local_response(
+    incoming_method: str | None,
+    req_id: object,
+    incoming_payload: object,
+    mode: str,
+    connect_url: str = "",
+    provider: str = "the provider",
+    listed_tools: list[dict] | None = None,
+) -> Response | None:
+    """Answer the methods that never need the upstream while consent is pending.
+
+    One definition for the PAT and OAuth branches so they cannot diverge:
+
+    - ``initialize``: answered locally, negotiating from the client's own request.
+    - ``notifications/*``: 202 with no body (Streamable HTTP).
+    - ``ping``: an empty result.
+    - ``server/discover``: JSON-RPC "method not found", so the client falls
+      back to ``initialize`` instead of showing an error.
+    - discovery lists: an empty list marked ``EGRESS_CONSENT_REQUIRED_HEADER``.
+      When ``listed_tools`` is given, ``tools/list`` returns those tools
+      instead: the caller decides what is listed (the connect tool, issue
+      #1860, and, for a server that opted in, its stored tools, issue #1986)
+      and this helper decides the response shape. The header stays, so an
+      aggregating caller still sees "consent pending" and ignores the body.
+
+    Returns None for every other method; the caller answers those with its
+    consent/PAT instruction.
+    """
+    method = incoming_method or ""
+    if method == "initialize":
+        payload = incoming_payload if isinstance(incoming_payload, dict) else {"params": {}}
+        return _local_initialize_response(
+            req_id, payload, connect_url=connect_url, provider=provider
+        )
+    if method.startswith("notifications/"):
+        return Response(status_code=202)
+    if method == "ping":
+        return JSONResponse(
+            status_code=200,
+            content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": shape_result({}, method, incoming_payload),
+            },
+        )
+    if method in _PRE_CONSENT_UNSUPPORTED_METHODS:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": JSONRPC_METHOD_NOT_FOUND, "message": "Method not found"},
+            },
+        )
+    result_key = _PRE_CONSENT_LIST_RESULT_KEYS.get(method)
+    if result_key is None:
+        return None
+    items: list[dict] = []
+    if method == "tools/list" and listed_tools:
+        items = listed_tools
+    return JSONResponse(
+        status_code=200,
+        content={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": shape_result({result_key: items}, method, incoming_payload),
+        },
+        headers={EGRESS_CONSENT_REQUIRED_HEADER: mode},
+    )
+
+
 def _pat_missing_response(
     server_name: str,
     incoming_method: str | None,
     req_id: object,
+    incoming_payload: object = None,
+    listed_tools: list[dict] | None = None,
 ):
     """Terminal tool result for a ``pat`` server with no usable PAT.
 
     Unlike the ``oauth_user`` consent path there is no interactive flow the
     gateway can initiate for a PAT (the user must generate one at the provider),
-    so a miss (never submitted OR expired) is TERMINAL. We return a SUCCESSFUL
-    JSON-RPC result with ``isError=true`` (works on every MCP client, no -32042
-    URL elicitation) whose text tells the human where to submit a PAT.
+    so a miss (never submitted, expired, or submitted before the server's
+    endpoint changed) is TERMINAL. We return a SUCCESSFUL JSON-RPC result with
+    ``isError=true`` (works on every MCP client, no -32042 URL elicitation)
+    whose text tells the human where to submit a PAT. Methods that never need
+    the upstream are answered by ``_pre_consent_local_response``.
     """
+    local = _pre_consent_local_response(
+        incoming_method,
+        req_id,
+        incoming_payload,
+        "pat",
+        listed_tools=listed_tools,
+    )
+    if local is not None:
+        return local
+
     logger.info(
         "mcp_proxy: pat server=%s method=%s has no usable PAT; returning terminal "
         "isError=true tool result (submit via Connected Accounts)",
@@ -7228,18 +9422,24 @@ def _pat_missing_response(
         content={
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "No PAT configured for this server. Submit one via the "
-                            "Registry Connected Accounts page, then retry."
-                        ),
-                    }
-                ],
-                "isError": True,
-            },
+            "result": shape_result(
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "No usable PAT for this server: none was submitted, it "
+                                "expired, or it was submitted before the server's endpoint "
+                                "changed. Submit one via the Registry Connected Accounts "
+                                "page, then retry."
+                            ),
+                        }
+                    ],
+                    "isError": True,
+                },
+                incoming_method,
+                incoming_payload,
+            ),
         },
     )
 
@@ -7291,14 +9491,43 @@ def _local_initialize_response(
         "serverInfo": {"name": "mcp-gateway-registry", "version": "1.0.0"},
     }
     if connect_url:
+        # Same next steps as the connect tool's description: the client holds
+        # the pre-consent tool list until the server is reconnected.
         result["instructions"] = (
             f"This server requires connecting your {provider} account before its "
-            f"tools can be used. Open this URL in a browser, approve access, then "
-            f"use the server's tools:\n{connect_url}"
+            f"tools can be used. Open this URL in a browser and approve access, "
+            f"then reconnect this server in your MCP client to load its "
+            f"{provider} tools:\n{connect_url}"
         )
     return JSONResponse(
         status_code=200,
         content={"jsonrpc": "2.0", "id": req_id, "result": result},
+        headers={"X-MCP-Backend-Initialized": "0"},
+    )
+
+
+def _baseline_consent_text(
+    message: str,
+    provider: str,
+    url: str,
+    is_connect_tool: bool,
+) -> str:
+    """Text of the isError consent result that carries the connect URL.
+
+    An ordinary tool asks the user to run it again after connecting. The
+    synthetic connect tool must not: running it again only reports "already
+    connected". Its next step is reconnecting the server so the client reloads
+    the tool list, which then holds the provider's real tools.
+    """
+    if is_connect_tool:
+        return (
+            f"Open this URL in your browser and approve access:\n{url}\n\n"
+            f"Then reconnect this server in your MCP client to load its "
+            f"{provider} tools."
+        )
+    return (
+        f"{message}\n\nTo connect, open this URL in your browser, approve "
+        f"access, then run this tool again:\n{url}"
     )
 
 
@@ -7307,6 +9536,9 @@ def _egress_consent_response(
     incoming_method: str | None,
     req_id: object,
     vend: dict,
+    is_connect_tool: bool = False,
+    incoming_payload: object = None,
+    consent_answer: str | None = None,
 ):
     """Build the consent-required response for an egress server with no token.
 
@@ -7327,8 +9559,18 @@ def _egress_consent_response(
     ``resultType: "input_required"``) is a DIFFERENT, later mechanism that
     replaced server-initiated requests; current clients negotiate ``2025-11-25``
     and do not understand it, so we emit ``-32042`` here.
+
+    ``is_connect_tool`` is True for a call to the synthetic connect tool, whose
+    baseline text asks the user to reconnect the server rather than retry.
+
+    With elicitation enabled, a 2026-07-28 request whose client declared URL
+    elicitation gets the 2026-07-28 form instead of ``-32042``: an
+    ``input_required`` result the client answers by retrying the request. Every
+    other request is answered as before. ``consent_answer`` is the user's answer
+    from such a retry; "decline" or "cancel" ends the round trip with the
+    baseline result.
     """
-    connect_url = vend.get("connect_url") or vend.get("authorize_url") or ""
+    connect_url = vend.get("connect_url") or ""
     provider = vend.get("provider") or "the provider"
     message = f"Connect your {provider} account to use this server."
     # A short, unique correlation handle for this elicitation. It is only an
@@ -7355,8 +9597,17 @@ def _egress_consent_response(
     # works on EVERY MCP client (no -32042 support needed); the human sees the URL
     # in the tool output, connects, and re-runs. Elicitation below is the opt-in
     # enhancement for clients that understand url-mode.
+    # A 2026-07-28 client that declared URL elicitation can take the prompt as
+    # an input_required result. If the user declined it, stop asking.
+    modern_prompt = (
+        settings.egress_consent_use_elicitation
+        and incoming_method in _ELICITATION_PERMITTED_METHODS
+        and bool(connect_url)
+        and _client_accepts_url_input_request(incoming_payload)
+    )
+    declined = modern_prompt and consent_answer in _CONSENT_DECLINE_ACTIONS
     if (
-        not settings.egress_consent_use_elicitation
+        (not settings.egress_consent_use_elicitation or declined)
         and incoming_method in _ELICITATION_PERMITTED_METHODS
         and connect_url
     ):
@@ -7371,21 +9622,35 @@ def _egress_consent_response(
             content={
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                f"{message}\n\nTo connect, open this URL in your "
-                                f"browser, approve access, then run this tool "
-                                f"again:\n{url_with_id}"
-                            ),
-                        }
-                    ],
-                    "isError": True,
-                },
+                "result": shape_result(
+                    {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": _baseline_consent_text(
+                                    message,
+                                    provider,
+                                    url_with_id,
+                                    is_connect_tool,
+                                ),
+                            }
+                        ],
+                        "isError": True,
+                    },
+                    incoming_method,
+                    incoming_payload,
+                ),
             },
         )
+
+    if modern_prompt:
+        logger.info(
+            "mcp_proxy: egress consent required for server=%s method=%s; "
+            "returning input_required with a URL elicitation (MCP 2026-07-28)",
+            server_name,
+            incoming_method,
+        )
+        return _input_required_consent_response(req_id, message, url_with_id)
 
     if incoming_method in _ELICITATION_PERMITTED_METHODS and connect_url:
         logger.info(
@@ -7469,9 +9734,10 @@ def _select_forwarded_response_headers(
 
 
 async def _authorize_forwarded_mcp_body(
-    server_name: str,
+    registered_server: str,
     request_body: bytes,
     user_scopes: list[str],
+    direct_route: bool = False,
 ) -> None:
     """Re-authorize the caller's scopes against the EXACT body being forwarded.
 
@@ -7495,22 +9761,20 @@ async def _authorize_forwarded_mcp_body(
         be allowed; a missing/blank tool name is rejected.
 
     Args:
-        server_name: The full ``/mcp-proxy/{server_name:path}`` value. The
-            registered server name (scope key) is derived from it the same way
-            /validate derives it from X-Original-URL, so both hops authorize
-            against the identical key.
+        registered_server: The path verified in the signed proxy token;
+            transport suffixes in the proxy route are not resource identities.
         request_body: The exact bytes being forwarded to the upstream.
         user_scopes: The scopes from the verified X-Internal-Token claims.
+        direct_route: True when the signed hop token says the route is not
+            virtual. Only then is the synthetic connect tool checked as
+            ``tools/list`` (see ``_scope_check_target``).
 
     Raises:
         HTTPException: 403 when the forwarded body is not authorized by the
             caller's scopes, or when the body is present but cannot be parsed
             to determine the scope-relevant method/tool.
     """
-    # Strip only a trailing MCP transport segment (mcp/sse/messages) so the
-    # scope key matches what /validate authorized against -- including federated
-    # "peer/server" keys, which the naive first-segment split would truncate.
-    registered_server = _registered_server_from_proxy_path(server_name)
+    # The token verifier has already matched the registered path to this route.
 
     method: str | None = None
     actual_tool_name: str | None = None
@@ -7569,8 +9833,14 @@ async def _authorize_forwarded_mcp_body(
             headers={"Connection": "close"},
         )
 
+    scope_method, scope_tool_name = _scope_check_target(
+        registered_server,
+        effective_method,
+        actual_tool_name,
+        direct_route=direct_route,
+    )
     if not await validate_server_tool_access(
-        registered_server, effective_method, actual_tool_name, user_scopes
+        registered_server, scope_method, scope_tool_name, user_scopes
     ):
         logger.warning(
             "mcp_proxy: access denied to %s.%s (tool=%s) on forwarded body",
@@ -7609,6 +9879,10 @@ async def mcp_proxy(
     For methods other than "tools/list" or when filtering is disabled,
     the upstream response is returned verbatim. For "tools/list", the
     result.tools array is filtered using filter_tools_list_response.
+
+    The upstream response is buffered, and the whole exchange is bounded by
+    MCP_PROXY_TIMEOUT (504 on expiry). Streaming-only methods listed in
+    _MCP_PROXY_UNSUPPORTED_METHODS are answered locally with JSON-RPC -32601.
     """
     # verify_mcp_proxy_token (route dependency) has already verified the token
     # and stashed the claims; it raises 401 before reaching here on any failure,
@@ -7618,24 +9892,20 @@ async def mcp_proxy(
     upstream_url = claims["upstream_url"]
     user_scopes: list[str] = list(claims.get("scopes") or [])
 
-    # Append the MCP sub-path from the request. server_name captures the full
-    # path after /mcp-proxy/ (e.g. "airegistry-tools/mcp"). The first segment
-    # is the registered server name; everything after is the sub-path that must
-    # be appended to the upstream URL so the backend receives the correct route.
-    # Skip if the upstream URL already ends with the sub-path (e.g. proxy_pass_url
-    # is https://docs.mcp.cloudflare.com/mcp and sub_path is also /mcp).
-    #
-    # SECURITY: do NOT move this sub-path append into nginx. The X-Internal-Token
-    # binds the PRE-append upstream_url (the $backend_url /validate saw). Keeping
-    # the append here means the bound claim equals the upstream BASE and the
-    # outbound URL is base + sub_path on that same bound host -- the destination
-    # host is cryptographically pinned and the sub-path is confined to it. Moving
-    # the append to nginx would diverge the signed base from what /validate saw
-    # and 401 every request.
-    if "/" in server_name:
-        sub_path = server_name.split("/", 1)[1].lstrip("/")
-        if sub_path and not upstream_url.rstrip("/").endswith("/" + sub_path):
-            upstream_url = upstream_url.rstrip("/") + "/" + sub_path
+    # Only direct proxy routes may append a transport suffix. For virtual
+    # routes the entire capture is the registered path, even if it ends /mcp.
+    # The client's trailing slash is kept: SSE servers mount ``/messages/`` and
+    # redirect (or 404) the slashless form.
+    registered_server = claims["server"]
+    route_path = server_name.strip("/")
+    if route_path != registered_server:
+        segment = route_path.rsplit("/", 1)[-1]
+        trailing_slash = "/" if server_name.endswith("/") else ""
+        base = upstream_url.rstrip("/")
+        if not base.endswith("/" + segment):
+            upstream_url = base + "/" + segment + trailing_slash
+        elif trailing_slash and not upstream_url.endswith("/"):
+            upstream_url += "/"
 
     # Read the incoming body once; we forward it to the upstream.
     try:
@@ -7659,6 +9929,19 @@ async def mcp_proxy(
         logger.debug(f"mcp_proxy: could not parse incoming body as JSON-RPC: {exc}")
         incoming_method = None
 
+    # A retry of the gateway's own 2026-07-28 consent prompt carries the
+    # gateway's requestState and the user's answer. Remove both before the body
+    # is authorized and forwarded, so the bytes checked are the bytes sent.
+    retried_consent, consent_answer = _strip_gateway_consent_retry(incoming_payload)
+    if retried_consent:
+        request_body = json.dumps(incoming_payload, separators=(",", ":")).encode("utf-8")
+        logger.info(
+            "mcp_proxy: server=%s method=%s retries the gateway consent prompt (answer=%s)",
+            server_name,
+            incoming_method,
+            consent_answer,
+        )
+
     filter_enabled = _read_mcp_filter_enabled()
     max_body_bytes = _read_mcp_proxy_max_body_bytes()
     proxy_timeout = _read_mcp_proxy_timeout()
@@ -7668,8 +9951,10 @@ async def mcp_proxy(
     # the built-in internal registry-tools server, which receives the relayed
     # Authorization (it is a same-trust-domain component). The decision keys on
     # the verified, path-validated `server` claim, never a forgeable header.
-    registered_server = (claims.get("server") or "").lower()
-    relay_ingress_auth = registered_server in _INTERNAL_INGRESS_RELAY_SERVERS
+    # ``registered_server`` stays the case-preserving claim: it is the identity
+    # /validate authorized, and scope matching is case-sensitive. Only the relay
+    # allowlist lookup is case-folded.
+    relay_ingress_auth = registered_server.lower() in _INTERNAL_INGRESS_RELAY_SERVERS
     forward_headers = _forward_headers(
         dict(request.headers),
         relay_authorization=relay_ingress_auth,
@@ -7689,7 +9974,28 @@ async def mcp_proxy(
     # "retry later" in responses, logs, and metrics. Authorized-but-not-connected
     # callers still pass here and reach the egress consent/local-answer paths
     # below (they already had these methods in scope on the connected path).
-    await _authorize_forwarded_mcp_body(server_name, request_body, user_scopes)
+    # A token without the claim (minted before it existed) is not treated as
+    # direct: the synthetic connect tool exemption fails closed.
+    direct_route = claims.get("virtual_backend") is False
+    await _authorize_forwarded_mcp_body(
+        registered_server,
+        request_body,
+        user_scopes,
+        direct_route=direct_route,
+    )
+
+    # A streaming-only method cannot go through the buffered path below. Answer
+    # it here, after authorization and before the egress vend and the upstream
+    # call, so it never takes an upstream connection (#1890).
+    if incoming_method in _MCP_PROXY_UNSUPPORTED_METHODS:
+        req_id = incoming_payload.get("id") if isinstance(incoming_payload, dict) else None
+        logger.info(
+            "mcp_proxy: server=%s method=%s cannot be relayed by the buffering proxy; "
+            "answering -32601 locally",
+            server_name,
+            incoming_method,
+        )
+        return _unsupported_method_response(req_id, incoming_method)
 
     # True once we inject a vaulted egress token below. An egress upstream is
     # itself an OAuth resource server: if it rejects our injected token it 401s
@@ -7702,6 +10008,17 @@ async def mcp_proxy(
     # We drop the foreign header on this path (see the 401 handling below).
     egress_token_injected = False
 
+    # Whether this request calls the server's synthetic connect tool (issue
+    # #1860). The consent path words its reply for it, and the check before
+    # forwarding answers it locally.
+    incoming_params = incoming_payload.get("params") if isinstance(incoming_payload, dict) else None
+    incoming_tool_name = incoming_params.get("name") if isinstance(incoming_params, dict) else None
+    is_connect_tool_call = _is_connect_tool_call(
+        registered_server,
+        incoming_method,
+        incoming_tool_name,
+    )
+
     # Per-user egress credential vault. When the feature is on, ask the
     # registry to vend this user's third-party token for the resolved server. The
     # registry re-verifies the signed proxy token, enforces per-user/upstream
@@ -7713,9 +10030,12 @@ async def mcp_proxy(
     if settings.egress_auth_enabled:
         internal_proxy_token = request.headers.get("X-Internal-Token", "")
         if internal_proxy_token:
-            server_first_segment = (server_name or "").split("/", 1)[0]
             try:
-                vend = await _vend_egress_token(internal_proxy_token, server_first_segment)
+                vend = await _vend_egress_token(
+                    internal_proxy_token,
+                    registered_server,
+                    include_pre_consent_tools=direct_route and incoming_method == "tools/list",
+                )
             except EgressVendUnavailable as exc:
                 # Transient vend failure: fail closed with a retryable signal
                 # rather than forwarding tokenless (-> silent upstream 401) or
@@ -7756,8 +10076,10 @@ async def mcp_proxy(
                 # rely solely on nginx forwarding the same header to both the
                 # auth_request subrequest and this hop, re-check that the raw
                 # subject token we are about to exchange belongs to the same
-                # principal the internal token authorized. Signature was already
-                # verified at /validate; here we only compare the `sub` claim.
+                # principal the internal token authorized. This compares claims
+                # only: on a cookie-authenticated request /validate never verified
+                # this header's signature (see the audit note below). The IdP
+                # verifies it during the exchange.
                 if not _obo_subject_matches_principal(subject_token, claims):
                     logger.warning(
                         "mcp_proxy: obo_exchange server=%s subject-token principal does not "
@@ -7777,37 +10099,82 @@ async def mcp_proxy(
                 obo_auth_method = str((claims or {}).get("auth_method") or "") or "unknown"
                 obo_target_audience = vend.get("obo_target_audience") or ""
                 obo_scopes = vend.get("obo_scopes") or []
-                # Human-readable identity for the audit record. The internal
-                # proxy claims carry only `sub`; the raw ingress JWT (already
-                # signature-verified at /validate) carries email/preferred_
-                # username, so decode it unverified here purely to surface a
-                # contactable identity. Falls back to the sub principal.
-                try:
-                    _obo_ingress_claims = jwt.decode(
-                        subject_token, options={"verify_signature": False}
+                # Human-readable identity + durable claims for the audit record,
+                # taken from the VERIFIED internal token's `audit_identity` claim
+                # (stamped by /validate from the claims it actually validated).
+                #
+                # This must NOT be read from `subject_token`: nginx forwards the
+                # client's raw Authorization/X-Authorization to this hop, but
+                # /validate authenticates a session cookie FIRST and only falls
+                # through to a bearer when there is no valid cookie -- so a
+                # cookie-authenticated request's bearer header is never
+                # signature-verified, and `_obo_subject_matches_principal` binds
+                # only `sub`. Deriving identity from that header let a caller
+                # choose the identity written to the audit trail (their own `sub`
+                # plus any `upn`/`email` they liked). The signed claim removes
+                # the choice.
+                #
+                # Absent claim (rolling deploy) -> the verified `sub` principal,
+                # never the ingress header: opaque but true.
+                obo_display, obo_identity_claims = _audit_identity_from_token(claims)
+                if not obo_display:
+                    # No signed claim: mid-rolling-deploy an in-flight token can
+                    # predate it. Logged at DEBUG because the fallback is silent
+                    # otherwise, and a replica that NEVER stamps the claim (a
+                    # marker-secret mismatch suppressing the mint, a stale task
+                    # definition) is then indistinguishable from normal operation.
+                    logger.debug(
+                        "mcp_proxy: no audit_identity claim on the hop token for server=%s; "
+                        "attributing the OBO mint to the verified sub principal",
+                        server_name,
                     )
-                except jwt.InvalidTokenError:
-                    _obo_ingress_claims = {}
-                # `username=obo_principal` makes the sub the fallback (ahead of
-                # the resolver's "anonymous"), so a token missing email/
-                # preferred_username still records the sub, not "anonymous".
-                obo_display = _audit_identity_display(
-                    {"data": _obo_ingress_claims, "username": obo_principal}
-                )
+                    # The record still lands, attributed to the opaque verified
+                    # `sub` -- count it so the degradation is rate-alertable and
+                    # not merely visible to whoever is reading DEBUG logs.
+                    audit_integrity_degraded_total.add(1, {"reason": "identity_hop_claim_missing"})
+                # `_audit_identity_display` resolves to the literal "anonymous"
+                # when no claim identified the caller. That string says strictly
+                # less than the verified principal, so it must not win over it --
+                # plain `or` chaining would keep it, because it is truthy.
+                if obo_display in ("", AUDIT_IDENTITY_ANONYMOUS):
+                    obo_display = obo_principal or AUDIT_IDENTITY_ANONYMOUS
+                # The /validate request_id signed as `rid`. This mint record needs
+                # its OWN unique request_id (the (request_id, log_type) index), so
+                # the shared id is recorded as the correlation_id -- that is what
+                # joins this token_mint record to the mcp_server_access record
+                # /validate wrote for the same request. None on a legacy token:
+                # the record is unjoined, exactly as before, never dropped.
+                obo_correlation_id = _audit_request_id_from_token(claims)
                 try:
-                    obo_token = await obo_exchange(
-                        get_auth_provider(),
-                        subject_token=subject_token,
-                        target_audience=obo_target_audience,
-                        scopes=obo_scopes,
-                    )
+                    if _obo_cache is not None and _obo_cache_subject_verified(
+                        subject_token, claims
+                    ):
+                        obo_result = await _obo_cache.get_or_exchange(
+                            idp_provider=get_auth_provider(),
+                            subject_token=subject_token,
+                            egress_user=str((claims or {}).get("egress_user") or ""),
+                            target_audience=obo_target_audience,
+                            scopes=obo_scopes,
+                        )
+                        obo_token, obo_from_cache = obo_result.access_token, obo_result.from_cache
+                    else:
+                        # Cache off, or the subject token is not the bearer /validate
+                        # verified with the IdP: exchange statelessly so the IdP
+                        # checks the assertion.
+                        obo_token, _ = await obo_exchange(
+                            get_auth_provider(),
+                            subject_token=subject_token,
+                            target_audience=obo_target_audience,
+                            scopes=obo_scopes,
+                        )
+                        obo_from_cache = False
                 except OboExchangeError as exc:
                     logger.warning(
                         "mcp_proxy: obo_exchange failed for server=%s: %s", server_name, exc
                     )
                     await _emit_token_mint_audit(
                         request_id=str(uuid.uuid4()),
-                        correlation_id=None,
+                        correlation_id=obo_correlation_id,
                         username=obo_principal,
                         display_username=obo_display,
                         auth_method=obo_auth_method,
@@ -7815,17 +10182,18 @@ async def mcp_proxy(
                         internal_caller="mcp-proxy",
                         token_kind=TokenKind.USER.value,
                         resource_type="server",
-                        resource_id=server_first_segment,
+                        resource_id=registered_server,
                         token_path="obo_exchange",  # nosec B106 - audit metadata label, not a credential
                         requested_scopes=list(obo_scopes),
                         expires_in_seconds=None,
                         outcome="failure",
                         failure_reason=_obo_failure_reason(exc),
+                        identity_claims=obo_identity_claims,
                     )
                     return _obo_error_response(req_id, str(exc))
                 await _emit_token_mint_audit(
                     request_id=str(uuid.uuid4()),
-                    correlation_id=None,
+                    correlation_id=obo_correlation_id,
                     username=obo_principal,
                     display_username=obo_display,
                     auth_method=obo_auth_method,
@@ -7833,11 +10201,14 @@ async def mcp_proxy(
                     internal_caller="mcp-proxy",
                     token_kind=TokenKind.USER.value,
                     resource_type="server",
-                    resource_id=server_first_segment,
-                    token_path="obo_exchange",  # nosec B106 - audit metadata label, not a credential
+                    resource_id=registered_server,
+                    # A cache hit minted nothing at the IdP; label it so the audit
+                    # trail lines up with IdP-side sign-in logs.
+                    token_path="obo_cache" if obo_from_cache else "obo_exchange",  # nosec B106 - audit metadata label, not a credential
                     requested_scopes=list(obo_scopes),
                     expires_in_seconds=None,
                     outcome="success",
+                    identity_claims=obo_identity_claims,
                 )
                 # Reuse the egress strip+inject: drop the user's gateway creds /
                 # internal identity headers before injecting the exchanged token.
@@ -7881,69 +10252,97 @@ async def mcp_proxy(
                 # terminal -- return the actionable "no PAT configured" message
                 # rather than forwarding stripped credentials to a 401ing upstream.
                 req_id = incoming_payload.get("id") if isinstance(incoming_payload, dict) else None
-                return _pat_missing_response(server_name, incoming_method, req_id)
-            elif vend and (vend.get("connect_url") or vend.get("authorize_url")):
+                # A pat server that opted in lists its stored tools on a direct
+                # tools/list; calling one returns this same PAT message (#1986).
+                stored_tools = await _stored_tools_before_consent(
+                    registered_server,
+                    user_scopes,
+                    vend,
+                    direct_route,
+                )
+                return _pat_missing_response(
+                    server_name,
+                    incoming_method,
+                    req_id,
+                    incoming_payload,
+                    listed_tools=stored_tools,
+                )
+            elif vend and vend.get("connect_url"):
                 # Egress is configured for this server but the user has no usable
                 # token, and the upstream is itself an OAuth resource server that
                 # 401s every call (including initialize). Break the handshake
                 # deadlock by handling the non-upstream methods at the gateway:
                 #
-                #   - initialize: answered LOCALLY (capability negotiation with the
-                #     client; the lifecycle spec does not require reaching the
-                #     upstream). Lets a legacy handshake-based client complete the
-                #     handshake instead of seeing the upstream's 401.
-                #   - notifications/*: acked locally (no response body expected).
-                #   - tools/list: answered LOCALLY with a single synthetic
-                #     "connect" tool. The real upstream list needs the token, and
-                #     erroring here dead-ends clients; the tools spec lets
-                #     tools/list return an auth-dependent (here: connect-only) set.
+                #   - initialize, notifications/*, ping and discovery lists are
+                #     answered locally by _pre_consent_local_response (the same
+                #     helper the PAT branch uses): initialize negotiates with the
+                #     client and carries a connect-instructions hint; lists are
+                #     marked consent-required so an aggregating virtual server
+                #     can publish the mapped tools.
+                #   - tools/list on a direct route returns one synthetic connect
+                #     tool (issue #1860). Chat clients only call tools they can
+                #     see, so an empty list left them no way to reach consent.
+                #     A server that opted in also lists its stored tools after
+                #     it (issue #1986), for clients that only call tools an
+                #     admin enabled ahead of time.
                 #   - tools/call (and prompts/get, resources/read): need the
                 #     third-party token, so we ask the user to connect via MCP
-                #     URL-mode elicitation. The gateway is the MCP server's OAuth
-                #     client to the provider; the token never transits the MCP
-                #     client, which performs no OAuth itself (it opens the connect
-                #     URL and retries). Spec:
+                #     URL-mode elicitation. A call to the connect tool lands here
+                #     too. The gateway is the MCP server's OAuth client to the
+                #     provider; the token never transits the MCP client, which
+                #     performs no OAuth itself (it opens the connect URL and
+                #     retries). Spec:
                 #     https://modelcontextprotocol.io/specification/draft/client/elicitation
                 req_id = incoming_payload.get("id") if isinstance(incoming_payload, dict) else None
-                if incoming_method == "initialize":
+                provider = vend.get("provider") or "the provider"
+                listed_tools: list[dict] | None = None
+                if direct_route:
+                    # The connect tool goes first, then any stored tools the
+                    # server opted in to list before consent (#1986).
+                    listed_tools = [_connect_tool_definition(registered_server, provider)]
+                    stored_tools = await _stored_tools_before_consent(
+                        registered_server,
+                        user_scopes,
+                        vend,
+                        direct_route,
+                    )
+                    if stored_tools:
+                        listed_tools.extend(stored_tools)
+                local = _pre_consent_local_response(
+                    incoming_method,
+                    req_id,
+                    incoming_payload,
+                    "oauth",
+                    connect_url=vend.get("connect_url") or "",
+                    provider=provider,
+                    listed_tools=listed_tools,
+                )
+                if local is not None:
                     logger.info(
-                        "mcp_proxy: egress server=%s has no token; answering "
-                        "initialize locally to complete the handshake",
+                        "mcp_proxy: egress server=%s has no token; answering %s locally "
+                        "(user connects via the connect tool or the Connected Accounts page)",
                         server_name,
+                        incoming_method,
                     )
-                    return _local_initialize_response(
-                        req_id,
-                        incoming_payload,
-                        connect_url=vend.get("connect_url") or vend.get("authorize_url") or "",
-                        provider=vend.get("provider") or "the provider",
-                    )
-                if incoming_method and incoming_method.startswith("notifications/"):
-                    # Notifications have no result; ack with 202 and no body.
-                    return Response(status_code=202)
-                if incoming_method == "tools/list":
-                    # No vaulted token yet: the upstream tool list needs the
-                    # token, and tools/list MUST NOT error (that dead-ends
-                    # clients). Return an EMPTY list. The user connects the
-                    # account out of band via the Registry "Connected Accounts"
-                    # page (the initialize `instructions` nudge points there);
-                    # once vaulted, the vend HITs and the real upstream tools are
-                    # proxied. A tools/call before connecting still gets the
-                    # consent nudge via _egress_consent_response below.
-                    logger.info(
-                        "mcp_proxy: egress server=%s has no token; returning EMPTY "
-                        "tools/list (connect via the Connected Accounts page)",
-                        server_name,
-                    )
-                    return JSONResponse(
-                        status_code=200,
-                        content={"jsonrpc": "2.0", "id": req_id, "result": {"tools": []}},
-                    )
+                    return local
                 return _egress_consent_response(
                     server_name=server_name,
                     incoming_method=incoming_method,
                     req_id=req_id,
                     vend=vend,
+                    is_connect_tool=is_connect_tool_call,
+                    incoming_payload=incoming_payload,
+                    consent_answer=consent_answer,
                 )
+
+    # The synthetic connect tool belongs to the gateway: answer it here on every
+    # path that would otherwise forward, so the narrower authorization it gets
+    # (see _scope_check_target) can never carry a credential upstream.
+    if is_connect_tool_call:
+        req_id = incoming_payload.get("id") if isinstance(incoming_payload, dict) else None
+        return _connect_tool_local_result(
+            server_name, req_id, egress_token_injected, incoming_payload
+        )
 
     logger.info(
         f"mcp_proxy: server={server_name} method={incoming_method} filter_enabled={filter_enabled} timeout={proxy_timeout}"
@@ -7957,33 +10356,80 @@ async def mcp_proxy(
     # traffic keeps the plain client (no injected credential to protect, and many
     # internal upstreams legitimately resolve to private addresses).
     from registry.exceptions import UrlValidationError
-    from registry.utils.url_guard import EGRESS_UPSTREAM_PROFILE, guarded_async_client
-
-    proxy_client = (
-        guarded_async_client(profile=EGRESS_UPSTREAM_PROFILE, timeout=proxy_timeout)
-        if egress_token_injected
-        else httpx.AsyncClient(timeout=proxy_timeout)
+    from registry.utils.url_guard import (
+        EGRESS_UPSTREAM_PROFILE,
+        shared_guarded_async_client,
     )
+
+    # egress-injected: pooled + SSRF-guarded (keep-alive reuse; this pooled client
+    # is process-lived and must NOT be closed per request). non-egress: no injected
+    # credential to protect and many internal upstreams are private, so keep the
+    # per-call plain client (closed in the finally). Timeout is passed per-request.
+    if egress_token_injected:
+        proxy_client = shared_guarded_async_client(profile=EGRESS_UPSTREAM_PROFILE)
+        close_proxy_client = False
+    else:
+        proxy_client = httpx.AsyncClient(timeout=proxy_timeout)
+        close_proxy_client = True
     try:
-        async with proxy_client as client:
-            async with client.stream(
+        # The httpx timeout applies to each read, not to the whole exchange. An
+        # upstream that keeps sending (SSE keep-alives) never trips it, so the
+        # overall deadline is what releases the connection (#1890). nginx's
+        # proxy_read_timeout is derived from the same value plus a buffer, so
+        # this hop still times out first.
+        async with (
+            asyncio.timeout(proxy_timeout),
+            proxy_client.stream(
                 "POST",
                 upstream_url,
                 content=request_body,
                 headers=forward_headers,
                 params=dict(request.query_params),
-            ) as upstream_response:
-                # Buffer with the same cap whether or not we filter, so a
-                # pathological upstream cannot DoS the proxy.
-                body_bytes = await _read_bounded(upstream_response, max_body_bytes)
-                status_code = upstream_response.status_code
-                content_type = upstream_response.headers.get("content-type", "application/json")
-                # Snapshot upstream headers BEFORE leaving the stream
-                # context. httpx releases response.headers when the
-                # async-with block exits; reading them afterwards returns
-                # an empty mapping and Mcp-Session-Id is silently lost.
-                # Capture MCP session headers before the response stream closes
-                upstream_headers = dict(upstream_response.headers)
+                timeout=proxy_timeout,
+            ) as upstream_response,
+        ):
+            # The content type decides whether a truncated stream is still
+            # usable, so read it before the body. httpx exposes headers while
+            # the body is still streaming.
+            content_type = upstream_response.headers.get("content-type", "application/json")
+            # Buffer with the same cap whether or not we filter, so a
+            # pathological upstream cannot DoS the proxy. An SSE stream gets
+            # the partial-on-truncation read: closing the connection is one
+            # way a server ends an event stream, and the events that did
+            # complete are a valid answer.
+            try:
+                body_bytes = await _read_bounded(
+                    upstream_response,
+                    max_body_bytes,
+                    partial_on_truncation=_is_sse_content_type(content_type),
+                )
+            except _UpstreamStreamTruncated as exc:
+                complete_bytes = _complete_events_only(exc.partial)
+                if not complete_bytes or not _has_jsonrpc_response(complete_bytes):
+                    logger.error(
+                        "mcp_proxy: upstream %s closed the SSE stream before a JSON-RPC "
+                        "response arrived (%d bytes buffered, %d in complete events)",
+                        redact_url(upstream_url),
+                        len(exc.partial),
+                        len(complete_bytes),
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Upstream MCP server error",
+                    ) from exc
+                logger.warning(
+                    "mcp_proxy: upstream %s closed the SSE stream early; delivering the "
+                    "%d bytes of complete events out of %d received",
+                    redact_url(upstream_url),
+                    len(complete_bytes),
+                    len(exc.partial),
+                )
+                body_bytes = complete_bytes
+            status_code = upstream_response.status_code
+            # Snapshot upstream headers BEFORE leaving the stream context. httpx
+            # releases response.headers when the async-with block exits; reading
+            # them afterwards returns an empty mapping and Mcp-Session-Id is lost.
+            upstream_headers = dict(upstream_response.headers)
     except HTTPException:
         raise
     except UrlValidationError as exc:
@@ -7992,7 +10438,7 @@ async def mcp_proxy(
         # closed -- never forward the credential.
         logger.error(
             "mcp_proxy: egress upstream %s blocked by egress SSRF guard: %s",
-            upstream_url,
+            redact_url(upstream_url),
             exc,
         )
         raise HTTPException(
@@ -8000,24 +10446,38 @@ async def mcp_proxy(
             detail="Upstream MCP server blocked by egress policy",
         ) from exc
     except httpx.TimeoutException as exc:
-        logger.error(f"mcp_proxy: upstream timeout for {upstream_url}: {exc}")
+        logger.error(f"mcp_proxy: upstream timeout for {redact_url(upstream_url)}: {exc}")
+        raise HTTPException(
+            status_code=504,
+            detail="Upstream MCP server timed out",
+        ) from exc
+    except TimeoutError as exc:
+        logger.error(
+            f"mcp_proxy: upstream response for {redact_url(upstream_url)} not complete "
+            f"after the {proxy_timeout}s overall deadline"
+        )
         raise HTTPException(
             status_code=504,
             detail="Upstream MCP server timed out",
         ) from exc
     except httpx.HTTPError as exc:
-        logger.error(f"mcp_proxy: upstream error for {upstream_url}: {exc}")
+        logger.error(f"mcp_proxy: upstream error for {redact_url(upstream_url)}: {exc}")
         raise HTTPException(
             status_code=502,
             detail="Upstream MCP server error",
         ) from exc
+    finally:
+        # The pooled (shared) client is process-lived and reused; only the
+        # per-call non-egress client is closed here.
+        if close_proxy_client:
+            await proxy_client.aclose()
 
-    # Only filter successful tools/list JSON responses.
-    should_filter = (
-        filter_enabled
-        and incoming_method == "tools/list"
-        and 200 <= status_code < 300
-        and "application/json" in content_type.lower()
+    is_sse_response = _is_sse_content_type(content_type)
+    should_filter = _should_filter_tools_list(
+        filter_enabled=filter_enabled,
+        incoming_method=incoming_method,
+        status_code=status_code,
+        content_type=content_type,
     )
 
     # Apply the response-header allowlist. Anything outside
@@ -8057,6 +10517,31 @@ async def mcp_proxy(
             headers=response_headers,
         )
 
+    if is_sse_response:
+        try:
+            sse_text = body_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            logger.error(
+                f"mcp_proxy: tools/list SSE body for server={server_name} is not UTF-8 "
+                f"({exc}); failing closed"
+            )
+            raise HTTPException(status_code=502, detail="Upstream MCP server error")
+        rewritten = await _filter_sse_tools_list_body(
+            sse_text,
+            registered_server,
+            user_scopes,
+        )
+        if rewritten is None:
+            # Could not inspect the payload. Forwarding it would leak the tools the
+            # filter exists to withhold, so refuse instead.
+            raise HTTPException(status_code=502, detail="Upstream MCP server error")
+        return Response(
+            content=rewritten.encode("utf-8"),
+            status_code=status_code,
+            media_type=content_type,
+            headers=response_headers,
+        )
+
     try:
         parsed = json.loads(body_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -8071,18 +10556,14 @@ async def mcp_proxy(
 
     result = parsed.get("result") if isinstance(parsed, dict) else None
     if isinstance(result, dict) and isinstance(result.get("tools"), list):
-        # server_name here is the proxy path (e.g. "myserver/mcp"). The scope
-        # allowlist is keyed on the registered name, and the access check
-        # earlier in this same request already stripped the transport suffix
-        # via _authorize_forwarded_mcp_body. Strip it identically, or the
-        # filter looks up a key that does not exist and drops every tool
-        # (issue #1647).
+        # Use the same signed registration as the forwarded-body scope check.
         filtered = await filter_tools_list_response(
-            _registered_server_from_proxy_path(server_name),
+            registered_server,
             user_scopes,
             result["tools"],
         )
         result["tools"] = filtered
+        _mark_filtered_list_private(result)
         parsed["result"] = result
 
     return JSONResponse(content=parsed, status_code=status_code, headers=response_headers)
@@ -8960,9 +11441,12 @@ async def generic_proxy(
             # transport resolves + validates + PINS the connection IP inside the
             # transport call for the request AND every redirect hop, so a hostname
             # that rebinds to a private/metadata IP between registration and fetch
-            # is blocked at connect time. PROXY_PROFILE shares the same egress
-            # policy (incl. gateway_proxy_allow_private_targets) the registration
-            # guard uses, so fetch-time and register-time decisions agree.
+            # is blocked at connect time. PROXY_PROFILE is the same policy the
+            # registration guard uses, but it is built from THIS process's
+            # settings: every deploy surface passes SSRF_ALLOWED_CIDRS here (#2018),
+            # while SSRF_ALLOWED_HOSTS and gateway_proxy_allow_private_targets reach
+            # the registry only. A target admitted at registration by hostname or by
+            # that flag is therefore refused here (fails closed, 502).
             # follow_redirects=False (second-SSRF guard): a 30x is returned to the
             # client verbatim (Location forwarded via the allowlist); the next hop
             # re-enters the gateway and is re-authorized. Auto-following would

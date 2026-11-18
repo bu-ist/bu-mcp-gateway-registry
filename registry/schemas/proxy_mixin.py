@@ -13,10 +13,11 @@ Security posture (this module wires the entity/proxy layer to the SSRF control):
   ``ValueError``) so a Pydantic field validator surfaces a clean 4xx. Registration
   and the fetch-time pinned transport therefore share ONE policy — the
   ``gateway_proxy_allow_private_targets`` bool plus ``ssrf_allowed_hosts`` /
-  ``ssrf_allowed_cidrs`` can relax only loopback/private/CGNAT targets;
-  cloud/workload credential endpoints (including Alibaba), link-local, reserved,
-  multicast, and unspecified destinations remain hard-denied, including scoped
-  and embedded/tunneled IPv6 forms.
+  ``ssrf_allowed_cidrs`` can relax only loopback/private/CGNAT targets, plus
+  reserved IPv4 inside a ``ssrf_allowed_cidrs`` range (never broadcast, never
+  reserved IPv6; #2018); cloud/workload credential endpoints (including Alibaba),
+  link-local, other reserved, multicast, and unspecified destinations remain
+  hard-denied, including scoped and embedded/tunneled IPv6 forms.
 - The static check is best-effort on literal-IP targets; hostnames pass it (no DNS
   in a validator). The authoritative rebind defense is the fetch-time pinned
   transport (``url_guard.guarded_async_client``, which resolves+validates+connects
@@ -127,11 +128,20 @@ def _target_identity(url: str | None) -> str:
         return f"invalid:{url}"
 
 
+# Stored upstream-header fields cleared by clear_upstream_headers_on_repoint.
+UPSTREAM_HEADER_FIELDS = (
+    "custom_headers_encrypted",
+    "custom_header_names",
+    "custom_header_overridable_names",
+    "custom_headers_updated_at",
+)
+
+
 def clear_upstream_headers_on_repoint(
     updates: dict[str, Any],
     existing_target: str | None,
     new_target: str | None,
-) -> None:
+) -> tuple[str, ...]:
     """Clear stored upstream custom headers when an update repoints the target.
 
     Credential-misdirection guard (shared by every entity update path). The
@@ -140,15 +150,18 @@ def clear_upstream_headers_on_repoint(
     repoint the credential to a different tenant/resource even on the same host,
     so every full-target identity change clears the stored headers.
 
-    No-op only when the normalized full URLs are identical (for example, host
-    case or an explicit default port differs) or when there is nothing to clear.
+    Returns the field names cleared, so a field-scoped caller can widen its
+    write scope. No-op (and empty return) only when the normalized full URLs
+    are identical (for example, host case or an explicit default port differs)
+    or when there is nothing to clear.
     """
     if _target_identity(existing_target) == _target_identity(new_target):
-        return
+        return ()
     updates["custom_headers_encrypted"] = None
     updates["custom_header_names"] = []
     updates["custom_header_overridable_names"] = []
     updates["custom_headers_updated_at"] = None
+    return UPSTREAM_HEADER_FIELDS
 
 
 class EgressPolicyError(ValueError):

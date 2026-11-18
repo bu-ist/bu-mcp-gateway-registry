@@ -295,7 +295,7 @@ if [ "$EMBEDDINGS_PROVIDER" = "sentence-transformers" ]; then
         echo "Embeddings model found at $EMBEDDINGS_MODEL_DIR"
     fi
 elif [ "$EMBEDDINGS_PROVIDER" = "litellm" ]; then
-    echo "Using LiteLLM provider - no local model download required"
+    echo "Using remote embeddings API provider - no local model download required"
     echo "Model: $EMBEDDINGS_MODEL_NAME"
     if [[ "$EMBEDDINGS_MODEL_NAME" == bedrock/* ]]; then
         echo "Bedrock model will use AWS credential chain for authentication"
@@ -332,6 +332,21 @@ RUM_JS_PATH="/app/frontend/build/rum.js"
 if [ -d "/app/frontend/build" ]; then
     /app/.venv/bin/python -m registry.utils.rum_snippet_writer "${RUM_JS_PATH}" \
         || echo "RUM: resolver failed unexpectedly; leaving existing/stub rum.js" >&2
+fi
+
+# --- Optional UI branding archive ---
+# UI_BRANDING_ARCHIVE_B64 holds a base64-encoded .tar.gz of the flat branding
+# folder (logos, favicon, manifest.json, theme.css). The writer validates every
+# member and extracts it into UI_BRANDING_DIR (default /app/branding), which the
+# registry serves at {ROOT_PATH}/branding/<name>. Unlike RUM this step is not
+# advisory: an archive that cannot be applied is a configuration error, so
+# startup fails with the writer's message. Both variables are read from the
+# environment by the writer, never passed on argv.
+if [ -n "${UI_BRANDING_ARCHIVE_B64}" ]; then
+    if ! /app/.venv/bin/python -m registry.utils.branding_writer; then
+        echo "ERROR: UI_BRANDING_ARCHIVE_B64 could not be applied (see the message above). Fix or unset it." >&2
+        exit 1
+    fi
 fi
 
 # --- Start Background Services ---
@@ -393,12 +408,14 @@ WAIT_TIME=0
 MAX_WAIT=120
 while [ $WAIT_TIME -lt $MAX_WAIT ]; do
     if [ -f "/etc/nginx/conf.d/nginx_rev_proxy.conf" ]; then
-        # Check if placeholders have been replaced
+        # Check if placeholders have been replaced. Keep this list in sync with
+        # _UNRENDERED_TEMPLATE_MARKERS in registry/core/nginx_service.py.
         if ! grep -q "{{ADDITIONAL_SERVER_NAMES}}" "/etc/nginx/conf.d/nginx_rev_proxy.conf" && \
            ! grep -q "{{ANTHROPIC_API_VERSION}}" "/etc/nginx/conf.d/nginx_rev_proxy.conf" && \
            ! grep -q "{{LOCATION_BLOCKS}}" "/etc/nginx/conf.d/nginx_rev_proxy.conf" && \
            ! grep -q "{{VIRTUAL_SERVER_BLOCKS}}" "/etc/nginx/conf.d/nginx_rev_proxy.conf" && \
-           ! grep -q "{{MCP_RESOURCE_METADATA_URL}}" "/etc/nginx/conf.d/nginx_rev_proxy.conf"; then
+           ! grep -q "{{MCP_RESOURCE_METADATA_URL}}" "/etc/nginx/conf.d/nginx_rev_proxy.conf" && \
+           ! grep -q "{{NGINX_MARKER_SECRET}}" "/etc/nginx/conf.d/nginx_rev_proxy.conf"; then
             echo "Nginx configuration generated successfully"
             break
         fi
@@ -409,6 +426,8 @@ done
 
 if [ $WAIT_TIME -ge $MAX_WAIT ]; then
     echo "WARNING: Timeout waiting for nginx configuration. Starting nginx anyway..."
+    echo "WARNING: The registry did not produce a rendered nginx config. If nginx -t rejected it,"
+    echo "WARNING: the registry log has the reason: search it for 'Rejected nginx config candidate'."
 fi
 
 # Resolve METRICS_SERVICE_URL hostname to IPv4 before nginx starts.

@@ -13,9 +13,14 @@ caller's auth context (``is_admin``, ``accessible_*`` scope lists,
 """
 
 import logging
+from collections.abc import Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..core.config import DeploymentMode, settings
+from ..exceptions import UrlValidationError
+from ..schemas.agent_models import AgentInterface
+from ..utils.url_guard import normalize_url_identity
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +99,47 @@ def redact_server_backend_fields(
     return server_dict
 
 
+def redact_oauth_config_for_non_owner(
+    server_dict: dict,
+    user_context: dict | None,
+) -> dict:
+    """Strip the backend-OAuth and discovery-identity config blocks in place unless
+    the caller owns the server (or is an admin).
+
+    ``backend_oauth`` and ``oauth_discovery`` describe the credentials the REGISTRY
+    uses for its own headless calls. Their dedicated endpoints
+    (``GET /servers/{path}/oauth-config``, ``GET /servers/{path}/oauth-discovery``)
+    are owner-or-admin, because ``modify_service`` alone is granted to anyone holding
+    an ``/execute`` scope. ``GET /server_details`` gates only on
+    ``user_can_access_server_path``, which is weaker still, so without this it is a
+    read-side bypass of those guards.
+
+    Secret ciphertext is already removed everywhere by the recursive projection in
+    ``utils.credential_encryption``; what leaks here is the non-secret-but-sensitive
+    remainder: ``token_url``, ``client_id``, the custom authorize/token endpoints, and
+    the designated principal's OIDC ``user_id``.
+
+    The blocks are dropped wholesale rather than field-filtered: no non-owner UI reads
+    them, and an allowlist here would silently start leaking any field added later.
+
+    Args:
+        server_dict: A server dict to redact in place.
+        user_context: Authenticated user context, or None if auth is absent.
+
+    Returns:
+        The same dict, with the OAuth config blocks removed for non-owners.
+    """
+    if user_context and user_context.get("is_admin"):
+        return server_dict
+    username = (user_context or {}).get("username")
+    # Fails closed: an absent username or registered_by cannot establish ownership.
+    if username and server_dict.get("registered_by") == username:
+        return server_dict
+    for field in ("backend_oauth", "oauth_discovery"):
+        server_dict.pop(field, None)
+    return server_dict
+
+
 # Agent card backend-URL fields to strip for non-admins in with-gateway mode.
 # In A2A reverse-proxy mode the registrant's real backend is stored in
 # proxy_pass_url (the advertised ``url`` is the gateway address), so proxy_pass_url
@@ -105,16 +151,113 @@ _AGENT_BACKEND_URL_FIELDS: tuple[str, ...] = (
 )
 
 
+# The agent nginx location forwards one HTTP backend path. It cannot translate
+# protocols or send a second binding to another path.
+_GATEWAY_AGENT_BINDINGS = frozenset({"JSONRPC", "HTTP+JSON"})
+
+
+def _gateway_backend_identity(url: str) -> tuple[str, str, str] | None:
+    """Compare HTTP targets, ignoring only a trailing path slash."""
+    try:
+        parsed = urlsplit(normalize_url_identity(url))
+    except UrlValidationError:
+        return None
+    if parsed.query:
+        return None
+    return parsed.scheme, parsed.netloc, parsed.path.rstrip("/") or "/"
+
+
+def gateway_routable_agent_interfaces(
+    interfaces: Sequence[AgentInterface | dict[str, Any]],
+    backend_url: str,
+) -> list[AgentInterface | dict[str, Any]]:
+    """Return declared HTTP bindings routed to this exact agent backend path."""
+    backend = _gateway_backend_identity(backend_url)
+    if backend is None:
+        return []
+    routable: list[AgentInterface | dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in interfaces:
+        if isinstance(entry, dict):
+            binding = entry.get("protocol_binding") or entry.get("protocolBinding")
+            url = entry.get("url")
+            version = entry.get("protocol_version") or entry.get("protocolVersion")
+        else:
+            binding, url, version = entry.protocol_binding, entry.url, entry.protocol_version
+        if (
+            binding in _GATEWAY_AGENT_BINDINGS
+            and binding not in seen
+            and isinstance(url, str)
+            and version
+            and _gateway_backend_identity(url) == backend
+        ):
+            routable.append(entry)
+            seen.add(binding)
+    return routable
+
+
+def _project_proxied_supported_interfaces(
+    agent_dict: dict,
+) -> None:
+    """Replace backend interfaces with the HTTP bindings this gateway routes.
+
+    A reverse-proxied card stores the backend in ``proxy_pass_url`` and its
+    gateway address in ``url``. Project only declared JSONRPC/HTTP+JSON entries
+    bound to that same backend path; neither a different path nor another
+    transport can be served by this agent's single nginx location.
+
+    Args:
+        agent_dict: An agent card dict, mutated in place.
+    """
+    if not (agent_dict.get("proxy_pass_url") or agent_dict.get("proxyPassUrl")):
+        return
+
+    camel = "supportedInterfaces" in agent_dict
+    key = "supportedInterfaces" if camel else "supported_interfaces"
+    interfaces = agent_dict.get(key)
+    if not isinstance(interfaces, list):
+        return
+
+    gateway_url = agent_dict.get("url")
+    if not gateway_url:
+        return
+
+    binding_key = "protocolBinding" if camel else "protocol_binding"
+    version_key = "protocolVersion" if camel else "protocol_version"
+
+    projected: list[dict] = []
+    for entry in gateway_routable_agent_interfaces(
+        interfaces,
+        agent_dict.get("proxy_pass_url") or agent_dict["proxyPassUrl"],
+    ):
+        if not isinstance(entry, dict):
+            continue
+        binding = entry.get("protocol_binding") or entry.get("protocolBinding")
+        version = entry.get("protocol_version") or entry.get("protocolVersion")
+        if not version:
+            continue
+        projected_entry = {"url": gateway_url, binding_key: binding, version_key: version}
+        if entry.get("tenant") is not None:
+            projected_entry["tenant"] = entry["tenant"]
+        projected.append(projected_entry)
+    agent_dict[key] = projected
+    # Drop the other-cased spelling if both somehow coexist, so the backend
+    # interfaces cannot survive under the alternate key.
+    agent_dict.pop("supported_interfaces" if camel else "supportedInterfaces", None)
+
+
 def redact_agent_backend_fields(
     agent_dict: dict,
 ) -> dict:
     """Strip internal backend URL fields from an agent card dict in place.
 
     Removes ``proxy_pass_url`` (both snake_case and camelCase spellings) so a
-    non-admin caller sees only the gateway-facing ``url``. Callers MUST gate this
-    behind :func:`should_redact_backend_urls`; this function performs no
-    authorization decision of its own. Mirrors
-    :func:`redact_server_backend_fields`.
+    non-admin caller sees only the gateway-facing ``url``, and projects a
+    reverse-proxied agent's ``supported_interfaces`` onto the gateway (whose
+    per-entry urls would otherwise be backend addresses the top-level rewrite
+    does not reach). Callers MUST gate this behind
+    :func:`should_redact_backend_urls`; this function performs no authorization
+    decision of its own. Mirrors :func:`redact_server_backend_fields`.
 
     Args:
         agent_dict: An agent card dict to redact in place.
@@ -122,6 +265,8 @@ def redact_agent_backend_fields(
     Returns:
         The same dict, with backend URL fields removed.
     """
+    # Before stripping proxy_pass_url, since that field is the signal for it.
+    _project_proxied_supported_interfaces(agent_dict)
     for field in _AGENT_BACKEND_URL_FIELDS:
         agent_dict.pop(field, None)
     return agent_dict
@@ -205,9 +350,10 @@ async def user_can_access_server(
         logger.debug("Unable to validate server path via service for %s", path, exc_info=True)
 
     technical_name = path.strip("/")
-    return technical_name in accessible_servers or (
-        bool(server_name) and server_name in accessible_servers
-    )
+    return any(
+        isinstance(grant, str) and grant.strip("/") == technical_name
+        for grant in accessible_servers
+    ) or (bool(server_name) and server_name in accessible_servers)
 
 
 def user_can_access_server_from_doc(
@@ -234,9 +380,10 @@ def user_can_access_server_from_doc(
         return False
 
     technical_name = path.strip("/")
-    return technical_name in accessible_servers or (
-        bool(server_name) and server_name in accessible_servers
-    )
+    return any(
+        isinstance(grant, str) and grant.strip("/") == technical_name
+        for grant in accessible_servers
+    ) or (bool(server_name) and server_name in accessible_servers)
 
 
 async def user_can_access_agent(

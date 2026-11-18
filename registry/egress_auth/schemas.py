@@ -17,6 +17,8 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from registry.secrets import keys
+
 
 class EgressAuthMode(str, Enum):
     """How the gateway authenticates to the upstream MCP server on egress.
@@ -107,10 +109,9 @@ class StoredToken(BaseModel):
     )
     bound_upstreams: list[str] = Field(
         default_factory=list,
-        description="Upstream base URLs (scheme://host[:port]) registered for the "
-        "server when this credential was written; the vend requires the request's "
-        "destination to be a member, so repointing proxy_pass_url forces re-consent "
-        "instead of shipping the credential to a new destination.",
+        description="Exact outbound URLs registered when the user approved this "
+        "credential. The vend requires the request's destination to be one of them; "
+        "adding a version at a new URL or repointing an endpoint forces re-consent.",
     )
     bound_token_url: str | None = Field(
         default=None,
@@ -164,3 +165,28 @@ class OAuthState(BaseModel):
     pkce_verifier: str | None = None
     nonce: str
     issued_at: str
+    # Consent purpose: "egress" (the user's own runtime credential) or "discovery" (the
+    # identity the registry borrows for its headless calls). This selects BOTH the server
+    # config the callback resolves -- `oauth_discovery.oauth` for discovery, `egress_oauth`
+    # otherwise -- and the vault ADDRESS SPACE the resulting token is written to, so the
+    # two never share an entry. It does NOT affect the feature gate: both purposes require
+    # EGRESS_AUTH_ENABLED, since both use the per-user vault.
+    # Default-valued so pre-existing state blobs decode as "egress".
+    purpose: str = keys.EGRESS_PURPOSE
+    # What the user is approving, snapshot when consent BEGINS. The callback binds the
+    # credential to these, never to the server record as it stands when the provider
+    # redirects back: a version added or an endpoint repointed in between was never
+    # shown to the user. Empty in a blob that is not a consent state (the MRTR
+    # request_state reuses this model); the callback refuses such a blob.
+    approved_upstreams: list[str] = Field(default_factory=list)
+    token_url: str = ""
+    # RFC 9207: the issuer the server's config named when consent BEGAN. The
+    # callback compares the reply's iss with this snapshot, never with the live
+    # config. None (not configured, or an older blob) skips the check.
+    expected_issuer: str | None = None
+    # SHA-256 hex of the consent cookie set in the browser that started the
+    # consent (see registry/egress_auth/browser_binding.py). The callback refuses
+    # unless the completing browser presents a cookie with this digest. Empty in a
+    # state minted before the binding existed; the callback refuses such a state,
+    # which the state TTL makes a one-time effect of the upgrade.
+    browser_binding: str = ""

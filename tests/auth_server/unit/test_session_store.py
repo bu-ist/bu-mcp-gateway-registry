@@ -123,6 +123,7 @@ class TestCreateSession:
             provider="entra",
             auth_method="oauth2",
             max_age_seconds=60,
+            egress_user="sub-alice",
         )
         assert isinstance(sid, str)
         assert len(sid) == 64  # 32 bytes hex
@@ -131,6 +132,25 @@ class TestCreateSession:
         assert doc["groups"] == ["g1", "g2"]
         assert doc["provider"] == "entra"
         assert "id_token_encrypted" not in doc
+
+    @pytest.mark.asyncio
+    async def test_graph_confirmed_empty_membership_persists_authority(self, fake_collection):
+        sid = await session_store.create_session(
+            username="alice",
+            email=None,
+            name=None,
+            groups=[],
+            provider="entra",
+            auth_method="oauth2",
+            max_age_seconds=60,
+            egress_user="sub-alice",
+            entra_graph_groups_resolved=True,
+        )
+
+        assert fake_collection[sid]["entra_graph_groups_resolved"] is True
+        resolved = await session_store.resolve_session(sid)
+        assert resolved["groups"] == []
+        assert resolved["entra_graph_groups_resolved"] is True
 
     @pytest.mark.asyncio
     async def test_create_with_id_token_stores_encrypted_blob(self, fake_collection):
@@ -142,6 +162,7 @@ class TestCreateSession:
             provider="keycloak",
             auth_method="oauth2",
             max_age_seconds=60,
+            egress_user="sub-bob",
             id_token="header.payload.signature",
         )
         doc = fake_collection[sid]
@@ -163,6 +184,7 @@ class TestCreateSession:
                 provider="keycloak",
                 auth_method="oauth2",
                 max_age_seconds=60,
+                egress_user="sub-u",
             )
             sids.add(sid)
         assert len(sids) == 50
@@ -179,6 +201,7 @@ class TestResolveSession:
             provider="entra",
             auth_method="oauth2",
             max_age_seconds=60,
+            egress_user="sub-alice",
             id_token="id.token.value",
         )
         result = await session_store.resolve_session(sid)
@@ -208,6 +231,7 @@ class TestResolveSession:
             provider="keycloak",
             auth_method="oauth2",
             max_age_seconds=60,
+            egress_user="sub-charlie",
         )
         # Force the record's expires_at into the past.
         fake_collection[sid]["expires_at"] = datetime.now(UTC) - timedelta(seconds=1)
@@ -224,6 +248,7 @@ class TestResolveSession:
             provider="keycloak",
             auth_method="oauth2",
             max_age_seconds=60,
+            egress_user="sub-dora",
         )
         # Replace expires_at with a naive datetime well in the future.
         fake_collection[sid]["expires_at"] = (datetime.now(UTC) + timedelta(hours=1)).replace(
@@ -253,6 +278,7 @@ class TestResolveSession:
             provider="keycloak",
             auth_method="oauth2",
             max_age_seconds=60,
+            egress_user="sub-emi",
             id_token="originally.valid.token",
         )
         # Corrupt the stored ciphertext so decryption fails.
@@ -276,6 +302,7 @@ class TestDeleteSession:
             provider="entra",
             auth_method="oauth2",
             max_age_seconds=60,
+            egress_user="sub-alice",
         )
         assert await session_store.delete_session(sid) is True
         assert sid not in fake_collection
